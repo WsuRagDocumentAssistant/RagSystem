@@ -2,8 +2,8 @@ from ragmodul import RagController
 from taskcontroller import work_regist
 
 
-UNPACKED = "C:/Users/user/Desktop/RagSystem/unpacked"
-HWPX_FILE_PATH = "C:/Users/user/Desktop/RagSystem/test_file/2주기(2023년) 2022 ~ 2024 대학혁신지원사업 성과평가보고서.hwpx"
+UNPACKED = ""
+HWPX_FILE_PATH = ""
 ctr = RagController(unpack_dir=UNPACKED)
 
 

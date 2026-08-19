@@ -16,7 +16,7 @@ from ragmodul import RagController
 
 tasks.update({
     "test_task1": ["test1", "test2"],
-    "rag_test" : ["parser", "chunk", "embedded"]
+    "rag_test" : ["parser_funtion", "chunk_funtion", "embedded_funtion"]
 })
 
 
@@ -32,7 +32,7 @@ if __name__ == "__main__":
 
 
     taskexecutor = TaskExecutor()
-    taskcontroller = TaskController(taskexecutor.task_queue)
+    taskcontroller = TaskController(taskexecutor.get_task_queue())
 
     taskexecutor.start()
     taskcontroller.start()
