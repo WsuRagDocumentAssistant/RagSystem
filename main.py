@@ -7,14 +7,16 @@ from multiprocessing import Queue
 from msvcrt import getch
 
 from taskcontroller import work_lst, TaskController,tasks
-from taskexecutor import TaskExecutorProcess
-
+from taskexecutor import TaskExecutor
 import functions
+
+from ragmodul import RagController
 
 #────────────────────────────────────────────────
 
 tasks.update({
     "test_task1": ["test1", "test2"],
+    "rag_test" : ["parser", "chunk", "embedded"]
 })
 
 
@@ -26,7 +28,10 @@ if __name__ == "__main__":
     print(work_lst)
     print("\n------------------------------------------------------")
 
-    taskexecutor = TaskExecutorProcess(Queue())
+
+
+
+    taskexecutor = TaskExecutor()
     taskcontroller = TaskController(taskexecutor.task_queue)
 
     taskexecutor.start()
