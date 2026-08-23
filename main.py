@@ -9,15 +9,14 @@ from msvcrt import getch
 from taskcontroller import work_lst, TaskController,tasks
 from taskexecutor import TaskExecutor
 #import functions
-#import session_functions
-
-#from ragmodul import RagController
+import session_functions
+import rag_functions
 
 #────────────────────────────────────────────────
 
 tasks.update({
     "test_task1": ["test1", "test2"],
-    "rag_test" : ["parser_funtion", "chunk_funtion", "embedded_funtion"]
+    "rag_test" : ["parse_function", "chunk_function"]
 })
 
 def print_task():
