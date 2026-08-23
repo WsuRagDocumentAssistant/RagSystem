@@ -16,7 +16,9 @@ from embedded.hf_utils import download_model
 
 tasks.update({
     "test_task1": ["test1", "test2"],
-    "rag_test" : ["parser_funtion", "chunk_funtion", "embedded_funtion"]
+    "레그실행" : ["parse_function", "chunk_function", "embed_function", "save_function"],
+    "레그청킹" : ["parse_function", "chunk_function"] ,  # 모델·DB 없이 확인용
+    "레그검색" : ["embed_query_function", "hybrid_search_function", "build_context_function", "rerank_function"],
 })
 
 def print_task():
