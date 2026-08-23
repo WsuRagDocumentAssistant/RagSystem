@@ -16,6 +16,9 @@ import functions.document_functions as document_functions
 import functions.rag_functions
 
 #────────────────────────────────────────────────
+from embedded.hf_utils import download_model
+
+download_model("BAAI/bge-reranker-v2-m3", "models/bge-reranker-v2-m3")
 
 tasks.update({
     "test_task1": ["test1", "test2"],
