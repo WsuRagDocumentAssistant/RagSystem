@@ -9,16 +9,17 @@ from msvcrt import getch
 from taskcontroller import work_lst, TaskController,tasks
 from taskexecutor import TaskExecutor
 #import functions
-import data_functions
+#import session_functions
 import rag_functions
-
+from embedded.hf_utils import download_model
 #────────────────────────────────────────────────
+from embedded.hf_utils import download_model
+
+download_model("BAAI/bge-reranker-v2-m3", "models/bge-reranker-v2-m3")
 
 tasks.update({
     "test_task1": ["test1", "test2"],
-    "레그실행" : ["parse_function", "chunk_function", "embed_function", "save_function"],
-    "레그청킹" : ["parse_function", "chunk_function"] ,  # 모델·DB 없이 확인용
-    "레그검색" : ["embed_query_function", "hybrid_search_function", "build_context_function", "rerank_function"],
+    "rag_test" : ["parser_funtion", "chunk_funtion", "embedded_funtion"]
 })
 
 def print_task():
@@ -27,7 +28,6 @@ def print_task():
 
 
 if __name__ == "__main__":
-
 
     print_task()
     print("\n------------------------------------------------------")
