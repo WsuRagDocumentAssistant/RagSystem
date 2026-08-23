@@ -43,9 +43,7 @@ TOP_K_FINAL = int(os.environ.get("RAG_TOP_K_FINAL", "5"))        # LLM 에 실�
 
 #────────────────────────────────────────────────
 
-tasks["레그 실행"] = ["parse_function", "chunk_function", "embed_function", "save_function"]
-tasks["레그 청킹"] = ["parse_function", "chunk_function"]   # 모델·DB 없이 확인용
-tasks["레그 검색"] = ["embed_query_function", "hybrid_search_function", "build_context_function", "rerank_function"]
+
 
 #------------------------------------------------┌> 지연 생성
 
