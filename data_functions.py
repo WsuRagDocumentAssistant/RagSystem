@@ -22,7 +22,21 @@ SERVICE_KEY = os.getenv("DATA_GO_KR_SERVICE_KEY", "")
 SURVEY_YEAR = None  # None이면 데이터가 있는 최신 조사연도를 자동으로 고른다
 
 dbmanager = db_manager.DBManager()
-dbmanager.init()
+_inited = False
+
+
+def db():
+    """DB를 쓰는 프로세스에서 첫 호출 때 한 번만 연결한다.
+
+    init()을 모듈 최상단에서 부르면 spawn 방식이라 부모·컨트롤러·워커가 각자
+    main을 재import 하면서 커넥션 풀을 세 개 연다. 실제로 work를 실행하는 건
+    워커뿐이고, DB가 꺼져 있으면 DB와 무관한 태스크까지 시작이 느려진다.
+    """
+    global _inited
+    if not _inited:
+        dbmanager.init()
+        _inited = True
+    return dbmanager
 
 #────────────────────────────────────────────────
 
@@ -62,8 +76,8 @@ def test_session_data(*args, **kwargs):
 @work_regist("create_session")
 def create_session_data(*args,**kwargs):
     #session_id가 들어왔다 가정
-    messages = dbmanager.call("get_recent_messages", session_id=args[0])
-    context = dbmanager.call("get_session_context", session_id=args[0])
+    messages = db().call("get_recent_messages", session_id=args[0])
+    context = db().call("get_session_context", session_id=args[0])
     return build_session(messages, context["current_topic"], context["overall_summary"])
 
 #------------------------------------------------┌> session save func
@@ -80,9 +94,9 @@ def get_session_data(*args, **kwargs):
 # DB에 저장
 @work_regist("insert_db_session_data")
 def insert_db_session_data(*args, **kwargs):
-    inserted_message = dbmanager.call("insert_message", session_id=args[0].session_id, user_query=args[0].session.recent_conversations[-1]["user_query"], ai_response=args[0].session.recent_conversations[-1]["ai_response"])
-    updated_topic = dbmanager.call("update_current_topic", session_id=args[0].session_id, topic=args[0].session.current_topic)
-    updated_summary = dbmanager.call("update_overall_summary", session_id=args[0].session_id, summary=args[0].session.summary)
+    inserted_message = db().call("insert_message", session_id=args[0].session_id, user_query=args[0].session.recent_conversations[-1]["user_query"], ai_response=args[0].session.recent_conversations[-1]["ai_response"])
+    updated_topic = db().call("update_current_topic", session_id=args[0].session_id, topic=args[0].session.current_topic)
+    updated_summary = db().call("update_overall_summary", session_id=args[0].session_id, summary=args[0].session.summary)
     return inserted_message, updated_topic, updated_summary
 
 #-----------------------------------------------┌> api func
@@ -95,5 +109,5 @@ def api_data(*args, **kwargs) -> ApiEntity:
 # DB에 저장
 @work_regist("insert_db_api_data")
 def insert_db_api_data(*args, **kwargs):
-    inserted_api_data = dbmanager.call("insert_api_data", metadata=args[0].metadata, json=args[0].json)
+    inserted_api_data = db().call("insert_api_data", metadata=args[0].metadata, json=args[0].json)
     return inserted_api_data

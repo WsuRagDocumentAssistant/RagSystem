@@ -34,7 +34,7 @@ RERANKER_MODEL_PATH = os.environ.get("RAG_RERANKER_MODEL", "models/bge-reranker-
 DEVICE = os.environ.get("RAG_DEVICE") or None
 
 UNPACK_DIR = os.environ.get("RAG_UNPACK_DIR", "unpacked")
-HWPX_FILE_PATH = os.environ.get("RAG_HWPX_FILE", "")
+HWPX_FILE_PATH = os.environ.get("RAG_HWPX_FILE", "C:/Users/aaa/Desktop/RagSystem/RagSystem/2주기(2023년) 2022 ~ 2024 대학혁신지원사업 성과평가보고서 (2).hwpx")
 
 
 TOP_K_SEARCH = int(os.environ.get("RAG_TOP_K_SEARCH", "40"))     # 조각. 넉넉히 뽑는다
@@ -73,7 +73,7 @@ def get_controller() -> RagController:
 @work_regist("parse_function")
 def parse_function(*args, **kwargs):
     """hwpx -> DocumentModel. 체인의 첫 단계라 경로를 상수에서 받는다."""
-    file_path = args[0]
+    file_path = HWPX_FILE_PATH
     if not file_path:
         raise ValueError(
             "문서 경로가 비어 있습니다. RAG_HWPX_FILE 환경변수나 "
