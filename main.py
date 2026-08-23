@@ -10,9 +10,8 @@ from taskcontroller import work_lst, TaskController,tasks
 from taskexecutor import TaskExecutor
 #import functions
 #import session_functions
-
-#from ragmodul import RagController
-
+import rag_functions
+from embedded.hf_utils import download_model
 #────────────────────────────────────────────────
 
 tasks.update({
@@ -26,7 +25,7 @@ def print_task():
 
 
 if __name__ == "__main__":
-
+    download_model
     print_task()
     print("\n------------------------------------------------------")
 
