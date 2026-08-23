@@ -108,6 +108,11 @@ def create_session_data(*args,**kwargs):
 # 새 세션의 대한 가공은 이전에 이미 되어있다 가정
 
 # 세션 객체 획득
+#------------------------------------------------┌> session save func
+
+# 새 세션의 대한 가공은 이전에 이미 되어있다 가정
+
+# 세션 객체 획득
 @work_regist("get_session")
 def get_session_data(*args, **kwargs):
     #session_id, session
