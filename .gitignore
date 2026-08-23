@@ -4,3 +4,8 @@ __pycache__/
 .vscode
 unpacked/
 test_file/
+.env
+config.json
+
+*.hwpx
+images/
