@@ -1,4 +1,4 @@
-from ragmodul import RagController
+from ra import RagController
 from taskcontroller import work_regist
 
 

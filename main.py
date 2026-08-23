@@ -8,10 +8,10 @@ from msvcrt import getch
 
 from taskcontroller import work_lst, TaskController,tasks
 from taskexecutor import TaskExecutor
-import functions
-import session_functions
+#import functions
+#import session_functions
 
-from ragmodul import RagController
+#from ragmodul import RagController
 
 #────────────────────────────────────────────────
 
@@ -20,13 +20,14 @@ tasks.update({
     "rag_test" : ["parser_funtion", "chunk_funtion", "embedded_funtion"]
 })
 
+def print_task():
+    for idx, task in enumerate(tasks):
+        print(f"[{idx}] {task}", end="\n")
+
 
 if __name__ == "__main__":
 
-    print(tasks)
-    print("\n------------------------------------------------------")
-
-    print(work_lst)
+    print_task()
     print("\n------------------------------------------------------")
 
 
