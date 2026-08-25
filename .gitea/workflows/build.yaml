@@ -1,0 +1,35 @@
+name: Build and Push
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t 117.16.166.23:80/wsu/rag-server:${{ gitea.sha }} .
+
+      - name: Login to Gitea Registry
+        run: echo "${{ secrets.REGISTRY_TOKEN }}" | docker login 117.16.166.23:80 -u gitea_admin --password-stdin
+
+      - name: Push image
+        run: docker push 117.16.166.23:80/wsu/rag-server:${{ gitea.sha }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Deploy to cluster
+        run: |
+          echo "${{ secrets.CD_KUBE_CONFIG_B64 }}" | base64 -d > kubeconfig.yaml
+          export KUBECONFIG=kubeconfig.yaml
+          curl -LO "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl && mv kubectl /usr/local/bin/
+          curl -sL https://get.helm.sh/helm-v3.15.0-linux-amd64.tar.gz | tar xz
+          ./linux-amd64/helm upgrade rag-server k8s -n rag-system --reuse-values --set-string image.tag=${{ gitea.sha }}

@@ -1,0 +1,27 @@
+{
+  "server": {
+    "log_level": "INFO"
+  },
+  "local_llm": {
+    "base_url": "http://117.16.166.22/v1",
+    "model": "gemma-4-12B-it",
+    "timeout": 60.0,
+    "headers": { "x-user-id": "npark-01" }
+  },
+  "database": {
+    "host": "rag-postgres.rag-system.svc.cluster.local",
+    "port": 5432,
+    "name": "ragdb",
+    "pool_min": 2,
+    "pool_max": 10,
+    "auto_connect": true
+  },
+  "llm_api": {
+    "timeout": 60.0,
+    "default_models": {
+      "gpt": "gpt-5.5",
+      "claude": "claude-sonnet-5-0",
+      "gemini": "gemini-3.5-flash"
+    }
+  }
+}
