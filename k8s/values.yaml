@@ -15,6 +15,7 @@ env:
   LOG_LEVEL: info
   DB_HOST: rag-postgres.rag-system.svc.cluster.local
   DB_PORT: "5432"
+  TZ: "Asia/Seoul"
 
 envFromSecrets:
   - rag-postgres-secret
