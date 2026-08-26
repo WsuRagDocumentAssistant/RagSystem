@@ -32,4 +32,4 @@ jobs:
           curl -LO "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
           chmod +x kubectl && mv kubectl /usr/local/bin/
           curl -sL https://get.helm.sh/helm-v3.15.0-linux-amd64.tar.gz | tar xz
-          ./linux-amd64/helm upgrade rag-server k8s -n rag-system --reuse-values --set-string image.tag=${{ gitea.sha }}
+          ./linux-amd64/helm upgrade rag-server k8s -n rag-system -f k8s/values.yaml --set-string image.tag=${{ gitea.sha }}
