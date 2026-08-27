@@ -4,7 +4,6 @@
 #================================================
 
 from multiprocessing import Queue
-from msvcrt import getch
 
 from taskcontroller import work_lst, TaskController,tasks
 from taskexecutor import TaskExecutor
@@ -27,9 +26,6 @@ if __name__ == "__main__":
     print_task()
     print("\n------------------------------------------------------")
 
-
-
-
     taskexecutor = TaskExecutor()
     taskcontroller = TaskController(taskexecutor.get_task_queue())
 
@@ -39,16 +35,15 @@ if __name__ == "__main__":
     while True:
         print("[q] 종료")
         print("[w] task 입력")
-        print("메뉴 입력 : ", end="")
         
-        key = getch()
+        key = input("메뉴 입력: ")
 
         match key:
-            case b"q":
+            case "q":
                 break
 
-            case b"w":
-                task_name = input("이름 입력")
+            case "w":
+                task_name = input("이름 입력: ")
                 taskcontroller.task_queue.put(task_name)
                 result = taskexecutor.get_task_result()
                 print(f"결과 : {result}")
