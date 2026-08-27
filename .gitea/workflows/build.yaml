@@ -10,11 +10,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build image
-        run: docker build -t 117.16.166.23:80/wsu/rag-server:${{ gitea.sha }} .
-
       - name: Login to Gitea Registry
         run: echo "${{ secrets.REGISTRY_TOKEN }}" | docker login 117.16.166.23:80 -u gitea_admin --password-stdin
+
+      - name: Build image
+        run: docker build -t 117.16.166.23:80/wsu/rag-server:${{ gitea.sha }} .
 
       - name: Push image
         run: docker push 117.16.166.23:80/wsu/rag-server:${{ gitea.sha }}
