@@ -4,6 +4,7 @@
 #================================================
 
 import asyncio
+import logging
 import os
 from types import SimpleNamespace
 
@@ -13,13 +14,19 @@ from taskcontroller import work_regist, tasks
 from session_data import build_session, Session
 from api_data import collect, ApiEntity
 import db_manager
+from exception_functions import safe_call
 
 load_dotenv()   # .env를 os.environ에 올린다 (없으면 조용히 넘어감)
 
-# 인증키는 .env의 DATA_GO_KR_SERVICE_KEY에서 읽는다.
-# 비어 있으면 XmlApiService가 "인증키(service_key)가 필요합니다"로 알려준다.
-SERVICE_KEY = os.getenv("DATA_GO_KR_SERVICE_KEY", "")
-SURVEY_YEAR = None  # None이면 데이터가 있는 최신 조사연도를 자동으로 고른다
+# 워커가 basicConfig(level=INFO) 로 루트 로거를 열기 때문에 httpx 가 요청마다
+# url 을 통째로 찍는다. url 에 인증키가 들어 있어 콘솔에 그대로 노출된다.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# 호출할 api 정보 하나. collect() 는 request.url 을 GET 만 하므로 인증키는 url 안에 있어야 한다.
+API_TITLE  = os.environ["API_TITLE"]
+API_SOURCE = os.environ["API_SOURCE"]
+API_KEY    = os.environ["API_KEY"]   # 비밀값
+API_URL    = os.environ["API_URL"]   # 인증키가 들어 있어 이것도 비밀값
 
 dbmanager = db_manager.DBManager()
 _inited = False
@@ -36,7 +43,12 @@ def db():
     if not _inited:
         dbmanager.init()
         _inited = True
-    return dbmanager
+    return dbmanager 
+
+
+def db_call(task_name, **kwargs):
+    """DB 작업 호출. 실패하면 한 줄 찍고 None 을 돌려준다."""
+    return safe_call(db().call, task_name, **kwargs)
 
 #────────────────────────────────────────────────
 
@@ -45,15 +57,26 @@ def db():
 tasks["session_insert"] = ["test_session_id", "create_session"]
 # session save
 tasks["session_save"] = ["test_session_data", "get_session", "insert_db_session_data"]
+# session title
+tasks["update_session_title"] = ["test_session_title_input", "update_db_session_title"]
+# session 확보 / 목록
+tasks["get_or_create_session"] = ["test_user_id", "get_or_create_db_session"]
+tasks["list_sessions"] = ["test_user_id", "list_db_sessions"]
 
 # api-data
-tasks["api_save"] = ["create_api_data", "insert_db_api_data"]
-
+# api insert
+tasks["api_insert"] = ["create_api_data", "insert_db_api_data"]
+# api all update
+tasks["api_all_update"] = ["select_all_db_api_data", "update_api_data", "update_db_api_data"]
+# api delete
+tasks["api_delete"] = ["test_api_url", "delete_db_api_data"]
 
 #------------------------------------------------┌> dummy function
 
 # 통신모듈 붙기 전까지 첫 work 에 입력을 넣어주는 자리
-TEST_SESSION_ID = "8606be9d-1955-4c57-a95d-06ecc72c268c"
+TEST_SESSION_ID = "7ba0535a-eb7d-40d0-813d-fa7f9c1c09b1"
+TEST_SESSION_TITLE = "과일 재배 문의"
+TEST_USER_ID = "0049c7f8-d327-4b87-878d-20f6f0f8c444"
 
 # session_id 하나
 @work_regist("test_session_id")
@@ -76,8 +99,8 @@ def test_session_data(*args, **kwargs):
 @work_regist("create_session")
 def create_session_data(*args,**kwargs):
     #session_id가 들어왔다 가정
-    messages = db().call("get_recent_messages", session_id=args[0])
-    context = db().call("get_session_context", session_id=args[0])
+    messages = db_call("get_recent_messages", session_id=args[0])
+    context = db_call("get_session_context", session_id=args[0])
     return build_session(messages, context["current_topic"], context["overall_summary"])
 
 #------------------------------------------------┌> session save func
@@ -94,9 +117,9 @@ def get_session_data(*args, **kwargs):
 # DB에 저장
 @work_regist("insert_db_session_data")
 def insert_db_session_data(*args, **kwargs):
-    inserted_message = db().call("insert_message", session_id=args[0].session_id, user_query=args[0].session.recent_conversations[-1]["user_query"], ai_response=args[0].session.recent_conversations[-1]["ai_response"])
-    updated_topic = db().call("update_current_topic", session_id=args[0].session_id, topic=args[0].session.current_topic)
-    updated_summary = db().call("update_overall_summary", session_id=args[0].session_id, summary=args[0].session.summary)
+    inserted_message = db_call("insert_message", session_id=args[0].session_id, user_query=args[0].session.recent_conversations[-1]["user_query"], ai_response=args[0].session.recent_conversations[-1]["ai_response"])
+    updated_topic = db_call("update_current_topic", session_id=args[0].session_id, topic=args[0].session.current_topic)
+    updated_summary = db_call("update_overall_summary", session_id=args[0].session_id, summary=args[0].session.summary)
     return inserted_message, updated_topic, updated_summary
 
 #-----------------------------------------------┌> api func
@@ -104,10 +127,84 @@ def insert_db_session_data(*args, **kwargs):
 # api 실제 데이터로 객체 생성
 @work_regist("create_api_data")
 def api_data(*args, **kwargs) -> ApiEntity:
-    return asyncio.run(collect(SERVICE_KEY, SURVEY_YEAR))
+    request = ApiEntity(title=API_TITLE, url=API_URL, source=API_SOURCE, key=API_KEY)
+    return asyncio.run(collect(request))
 
-# DB에 저장
+# DB에 저장, API 결과 리스트 반환
 @work_regist("insert_db_api_data")
 def insert_db_api_data(*args, **kwargs):
-    inserted_api_data = db().call("insert_api_data", metadata=args[0].metadata, json=args[0].json)
+    inserted_api_data = db_call("insert_api_data", title=args[0].title, url=args[0].url, source=args[0].source, key=args[0].key, data=args[0].data, data_type=args[0].data_type)
     return inserted_api_data
+
+#-----------------------------------------------┌> api all update
+
+# 기존 API 전체 조회
+@work_regist("select_all_db_api_data")
+def select_all_db_api_data(*args, **kwargs):
+    return db_call("select_all_api_data")
+
+# 행마다 api 재호출
+@work_regist("update_api_data")
+def update_api_data(*args, **kwargs):
+    updated_entities = []
+    for row in args[0]:
+        entity = safe_call(lambda: asyncio.run(collect(ApiEntity(title=row["title"], url=row["url"], source=row["source"], key=row["key"]))), label=row.get("title", "api 수집"))
+        if entity is not None:
+            updated_entities.append(entity)
+    return updated_entities
+
+# 갱신된 data 를 url 기준으로 저장
+@work_regist("update_db_api_data")
+def update_db_api_data(*args, **kwargs):
+    updated_api_data = [db_call("update_api_data_date", url=entity.url, data=entity.data) for entity in args[0]]
+    return updated_api_data
+
+#-----------------------------------------------┌>  api timer all update
+
+
+
+#-----------------------------------------------┌> api delete
+
+# 삭제할 url (통신모듈 붙기 전까지 .env 의 API_URL 을 그대로 쓴다)
+@work_regist("test_api_url")
+def test_api_url(*args, **kwargs):
+    return API_URL
+
+# url 단건 삭제
+@work_regist("delete_db_api_data")
+def delete_db_api_data(*args, **kwargs):
+    deleted_api_data = db_call("delete_api_data", url=args[0])
+    return deleted_api_data
+
+#-----------------------------------------------┌> session title func
+
+# session_id, title
+@work_regist("test_session_title_input")
+def test_session_title_input(*args, **kwargs):
+    return TEST_SESSION_ID, TEST_SESSION_TITLE
+
+# 세션 제목 갱신. 갱신된 세션 row 를 돌려준다
+@work_regist("update_db_session_title")
+def update_db_session_title(*args, **kwargs):
+    session_id, title = args[0]
+    updated_title = db_call("update_session_title", session_id=session_id, title=title)
+    return updated_title
+
+#-----------------------------------------------┌> session user func
+
+# user_id 하나
+@work_regist("test_user_id")
+def test_user_id(*args, **kwargs):
+    return TEST_USER_ID
+
+# 세션 확보. 없거나 타임아웃이면 새로 만든다
+@work_regist("get_or_create_db_session")
+def get_or_create_db_session(*args, **kwargs):
+    session = db_call("get_or_create_session", user_id=args[0])
+    return session["session_id"]
+
+# 세션 목록. 최근 활동순
+@work_regist("list_db_sessions")
+def list_db_sessions(*args, **kwargs):
+    session_list = db_call("list_sessions", user_id=args[0])
+    return session_list
