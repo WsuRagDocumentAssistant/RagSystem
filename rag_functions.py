@@ -22,6 +22,7 @@ import os
 
 from taskcontroller import work_regist, tasks
 from ragmodul import RagController, chunk, parse
+from ragmodul.util import pack_texts
 
 #────────────────────────────────────────────────
 
@@ -132,13 +133,14 @@ def chunk_function(*args, **kwargs):
 @work_regist("vocab_function")
 def extract_vocab_function(*args, **kwargs):
     document = args[0]
-    text = "\n\n".join(parent.content for parent in document.parents)
-    pairs = get_controller().extract_vocab(text, provider=VOCAB_PROVIDER)
-    print(f"[vocab_function] {len(text):,}자 -> {len(pairs)}짝")
+    parents = [parent.content for parent in document.parents]
+    chunks = pack_texts(parents)
+    pairs = get_controller().extract_vocab_all(chunks, provider=VOCAB_PROVIDER,)
+    print(f"[vocab_function] {len(chunks):,}자 -> {len(pairs)}짝")
     return pairs, document
 
 
-
+#---------------------------------------------------------------┌> 이거 일단 쓰지마
 @work_regist("filter_vocab_function")
 def filter_vocab_function(*args, **kwargs):
     """못 쓸 짝을 걸러낸다. 모델도 DB도 안 쓴다."""
@@ -160,6 +162,7 @@ def embed_function(*args, **kwargs):
 
 @work_regist("save_vocab_function")
 def save_vocab_function(*args, **kwargs):
+    #dbmanager로 변경 필요
     data = args[0]
     saved = get_controller().save_vocab(data[0])
     print(f"[save_vocab_function] 저장 종료: vocab {saved}개")
@@ -167,6 +170,7 @@ def save_vocab_function(*args, **kwargs):
 
 @work_regist("save_document_with_vector_function")
 def save_document_with_vector_function(*args, **kwargs):
+    #dbmanager로 변경 필요
     """DB 저장. 저장한 child 수를 돌려준다."""
     saved = get_controller().save_to_vector_db(args[0])
     print(f"[save_document_with_vector_function] 저장 종료: child {saved}개w")
@@ -177,13 +181,14 @@ def save_document_with_vector_function(*args, **kwargs):
 
 @work_regist("embed_query_function")
 def embed_query_function(*args, **kwargs):
+    #dbmanager로 변경 필요
     """질의 -> (dense 벡터, sparse 가중치). 체인의 첫 단계라 질의를 상수에서 받는다.
 
     다음 단계가 질의 문자열도 필요하므로(리랭킹) 함께 실어 보낸다.
     """
     query = QUERY
     rag = get_controller()
-    vocab = rag.load_vocab()
+    vocab = rag.load_vocab() # -> db 변경 필요
     vector, weights = rag.embed_query(query, vocab)
     print(f"[embed_query_function] 사전 {len(vocab)}개 적용")
     return query, vector, weights
@@ -191,6 +196,7 @@ def embed_query_function(*args, **kwargs):
 
 @work_regist("hybrid_search_function")
 def hybrid_search_function(*args, **kwargs):
+    #dbmanager로 변경 필요
     query, vector, weights = args[0]
     hits = get_controller().hybrid_search(vector, weights, top_k=TOP_K_SEARCH)
     print(f"[hybrid_search_function] 조각 {len(hits)}개")
