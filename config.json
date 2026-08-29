@@ -1,0 +1,23 @@
+{
+  "server": {
+    "log_level": "INFO"
+  },
+  "local_llm": {
+    "host": "10.101.96.71",
+    "port": 8001,
+    "timeout": 30.0
+  },
+  "database": {
+    "host": "203.234.10.119",
+    "port": 5432,
+    "name": "rag_session_db",
+    "pool_min": 2,
+    "pool_max": 10,
+    "auto_connect": true
+  },
+  "llm_api": {
+    "default_models": {
+      "gpt": "gpt-5.5"
+    }
+  }
+}

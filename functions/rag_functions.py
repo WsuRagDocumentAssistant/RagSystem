@@ -41,11 +41,13 @@ TOP_K_SEARCH = int(os.environ.get("RAG_TOP_K_SEARCH", "40"))     # 조각. 넉�
 TOP_K_CONTEXT = int(os.environ.get("RAG_TOP_K_CONTEXT", "10"))   # 리랭커에 넘길 후보
 TOP_K_FINAL = int(os.environ.get("RAG_TOP_K_FINAL", "5"))        # LLM 에 실을 최종 개수
 
-#────────────────────────────────────────────────
+#────────────────────────────────────────────────┌> test task 등록
 
-tasks["레그 실행"] = ["parse_function", "chunk_function", "embed_function", "save_function"]
-tasks["레그 청킹"] = ["parse_function", "chunk_function"]   # 모델·DB 없이 확인용
-tasks["레그 검색"] = ["embed_query_function", "hybrid_search_function", "build_context_function", "rerank_function"]
+tasks.update({
+    "test_레그실행" : ["parse_function", "chunk_function", "embed_function", "save_function"],
+    "test_레그청킹" : ["parse_function", "chunk_function"] ,  # 모델·DB 없이 확인용
+    "test_레그검색" : ["embed_query_function", "hybrid_search_function", "build_context_function", "rerank_function"],
+})
 
 #------------------------------------------------┌> 지연 생성
 
