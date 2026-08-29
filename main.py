@@ -17,7 +17,6 @@ import functions.rag_functions
 
 #────────────────────────────────────────────────
 
-
 tasks.update({
     "test_task1": ["test1", "test2"],
     "rag_test" : ["parse_function", "chunk_function"]
@@ -85,5 +84,3 @@ if __name__ == "__main__":
 
     taskcontroller.terminate()
     taskcontroller.join()
-
-
