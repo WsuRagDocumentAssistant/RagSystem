@@ -61,16 +61,15 @@ if __name__ == "__main__":
         print("\n------------------------------------------------------")
         print("[q] 종료")
         print("[w] task 입력")
-        print("메뉴 입력 : ", end="")
         
-        key = getch()
+        key = input("메뉴 입력: ")
 
         match key:
-            case b"q":
+            case "q":
                 break
 
-            case b"w":
-                task_name = input("이름 입력")
+            case "w":
+                task_name = input("이름 입력: ")
                 taskcontroller.task_queue.put(task_name)
                 result = taskexecutor.get_task_result()
                 print(f"결과 : {result}")
@@ -83,7 +82,7 @@ if __name__ == "__main__":
     taskexecutor.stop()
     taskexecutor.join()
 
-    taskcontroller.terminate()   # TaskController에는 정상 종료 신호가 없어 강제 종료
+    taskcontroller.terminate()
     taskcontroller.join()
 
 

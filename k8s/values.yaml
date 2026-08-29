@@ -1,0 +1,36 @@
+image:
+  repository: 117.16.166.23:80/wsu/rag-server
+  tag: v0.0.1
+  pullPolicy: IfNotPresent
+  pullSecretName: rag-registry-secret
+
+replicaCount: 1
+
+service:
+  port: 8000
+
+env:
+  HOST: "0.0.0.0"
+  PORT: "8000"
+  LOG_LEVEL: info
+  DB_HOST: rag-postgres.rag-system.svc.cluster.local
+  DB_PORT: "5432"
+  TZ: "Asia/Seoul"
+
+envFromSecrets:
+  - rag-postgres-secret
+  - rag-app-secret
+
+gpu:
+  enabled: true
+  count: 1
+
+gateway:
+  enabled: true
+  existingGatewayName: rag-gateway
+  existingGatewaySectionName: http
+
+logs:
+  enabled: true
+  pvcName: rag-logs-pvc
+  mountPath: /app/logs
