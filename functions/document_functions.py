@@ -4,7 +4,7 @@
 #================================================
 
 from taskcontroller import work_regist, tasks
-from data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
+from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
 
 # 통신모듈 붙기 전까지 첫 work 에 입력을 넣어주는 자리
 TEST_DOCUMENT_ID     = 14
@@ -38,9 +38,9 @@ tasks["get_report_type_options"]       = ["get_report_type_options"]
 def test_document_input(*args, **kwargs):
     return {
         "production_year": TEST_PRODUCTION_YEAR,
-        "file_path": TEST_FILE_PATH,
+        "source_path": TEST_FILE_PATH,
         "work_category": TEST_WORK_CATEGORY,
-        "p_task_name": TEST_TASK_NAME,      # task_name 이 아니라 p_task_name 이다
+        "task": TEST_TASK_NAME,             # task_name 이 아니라 task 다
         "department": TEST_DEPARTMENT,
         "report_type": TEST_REPORT_TYPE,
     }

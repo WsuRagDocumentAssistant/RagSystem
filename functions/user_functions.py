@@ -8,7 +8,7 @@ import os
 from dotenv import load_dotenv
 
 from taskcontroller import work_regist, tasks
-from data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
+from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
 
 load_dotenv()
 
