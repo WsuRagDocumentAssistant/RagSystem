@@ -14,7 +14,7 @@ from taskcontroller import work_regist, tasks
 from session_data import build_session, Session
 from api_data import collect, ApiEntity
 import db_manager
-from exception_functions import safe_call
+from functions.exception_functions import safe_call
 
 load_dotenv()   # .env를 os.environ에 올린다 (없으면 조용히 넘어감)
 

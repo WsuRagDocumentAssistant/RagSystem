@@ -10,10 +10,10 @@ import threading
 from taskcontroller import work_lst, TaskController,tasks, Task
 from taskexecutor import TaskExecutor
 #import functions
-import data_functions
-import user_functions
-import document_functions
-import rag_functions
+import functions.data_functions
+import functions.user_functions as user_functions
+import functions.document_functions as document_functions
+import functions.rag_functions
 
 #────────────────────────────────────────────────
 
