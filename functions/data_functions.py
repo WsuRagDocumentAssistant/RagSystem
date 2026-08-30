@@ -374,7 +374,16 @@ def dictionary_list_output(*args, **kwargs):
     if isinstance(value, tuple):
         search, rows = value
     elif isinstance(value, dict):
-        search, rows = "", (value.get("entries") or [])
+        entries = value.get("entries")
+        if isinstance(entries, dict):
+            # load_vocab 은 {축약어: [확장어, ...]} 를 준다. 화면은 확장어를 한 줄로
+            # 본다(synonyms 가 문자열이다).
+            rows = [{"word": term,
+                     "replacement": ", ".join(exp) if isinstance(exp, list) else str(exp)}
+                    for term, exp in entries.items()]
+        else:
+            rows = entries or []
+        search = ""
     else:
         search, rows = "", (value or [])
     entries = []

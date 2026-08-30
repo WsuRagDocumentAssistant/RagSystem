@@ -270,7 +270,17 @@ def file_upload_register(*args, **kwargs):
 
 @work_regist("get_vocab")
 def list_all_words(*args, **kwargs):
-        vocab =db_call("list_all_words")
-        print(f"[list_all_words] DB 단어 추출 — {(vocab)}")
-        return {"entries": vocab}
+    """검색어 사전을 읽는다.
+
+    list_all_words(word_dictionary 테이블)가 아니라 load_vocab(vocab 테이블)을 본다.
+    문서를 올릴 때 뽑은 축약어는 save_vocab_pairs 로 vocab 에 들어가고, 질의 확장도
+    그걸 쓴다. word_dictionary 는 아무도 채우지 않아서 화면이 늘 비어 있었다.
+
+    load_vocab 은 {축약어: [확장어, ...]} 를 준다(jsonb 라 문자열로 올 수도 있다).
+    """
+    from functions.rag_functions import load_vocab
+
+    vocab = load_vocab() or {}
+    print(f"[get_vocab] 사전 {len(vocab)}개")
+    return {"entries": vocab}
 
