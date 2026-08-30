@@ -14,7 +14,7 @@ hwpx @ git+https://github.com/WsuRagDocumentAssistant/HwpxParser_sub.git
 
 # DB / 세션 / 외부 API / LLM 호출
 db-manager @ git+https://github.com/WsuRagDocumentAssistant/DBManager.git
-session-data @ git+https://github.com/WsuRagDocumentAssistant/SessionData
+session-data @ git+https://github.com/WsuRagDocumentAssistant/SessionData.git
 api-data @ git+https://github.com/WsuRagDocumentAssistant/ApiData.git
 ai-rag-comm @ git+https://github.com/WsuRagDocumentAssistant/ServerCommunication.git
 
