@@ -10,3 +10,5 @@ test_file/
 images/
 
 rag-app-secret.yaml
+
+models/
