@@ -183,11 +183,6 @@ def update_db_api_data(*args, **kwargs):
 
 #-----------------------------------------------┌> api delete
 
-# 삭제할 url (통신모듈 붙기 전까지 .env 의 API_URL 을 그대로 쓴다)
-@work_regist("test_api_url")
-def test_api_url(*args, **kwargs):
-    return API_URL
-
 # url 단건 삭제
 @work_regist("delete_db_api_data")
 def delete_db_api_data(*args, **kwargs):
