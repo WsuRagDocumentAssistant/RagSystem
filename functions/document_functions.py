@@ -253,8 +253,17 @@ def file_upload_register(*args, **kwargs):
     검색된다 — 분류값이 비어 있을 뿐이라 나중에 수정 화면에서 채우면 된다.
     """
     document_id, meta, chunks = args[0]
+
+    # register_document 는 source_path 로 색인된 문서를 찾는다. 그런데 색인이 저장하는
+    # source_path 는 우리가 넘긴 업로드 경로가 아니라 hwpx 문서 내부의 제목이다
+    # (ragmodul/util.py: file.filename or file.title). 그대로 넘기면 "임베딩된 문서를
+    # 찾을 수 없습니다" 로 거절당한다 — 그래서 방금 색인한 행에서 실제 값을 읽어 쓴다.
+    row = db_call("get_document", id=document_id) or {}
+    source_path = row.get("source_path") or meta.get("source_path")
+    meta = {**meta, "source_path": source_path}
+
     if not db_call("register_document", **meta):
-        print("[file_upload_register] 분류값 등록 실패 — 색인은 완료됨")
+        print(f"[file_upload_register] 분류값 등록 실패(source_path={source_path!r}) — 색인은 완료됨")
     return {"fileId": str(document_id), "status": "ready", "chunks": chunks}
 
 

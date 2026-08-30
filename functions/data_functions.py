@@ -4,6 +4,7 @@
 #================================================
 
 import asyncio
+import uuid
 import logging
 import os
 from types import SimpleNamespace
@@ -219,6 +220,9 @@ def get_or_create_db_session(*args, **kwargs):
 # 세션 목록. 최근 활동순
 @work_regist("list_db_sessions")
 def list_db_sessions(*args, **kwargs):
+    # user_id 가 없으면(토큰이 UUID 가 아니면) 조회하지 않는다.
+    if not args or args[0] is None:
+        return []
     session_list = db_call("list_sessions", user_id=args[0])
     return session_list
 
@@ -259,6 +263,16 @@ def chat_session_list_input(*args, **kwargs):
     user_id = req.get("token") or TEST_USER_ID
     if not user_id:
         raise ValueError("사용자를 알 수 없습니다. Authorization 헤더가 필요합니다.")
+
+    # 토큰이 곧 user_id 인 임시 구조라, 클라이언트가 더미 계정으로 로그인하면
+    # "dummy-token-1" 같은 값이 그대로 넘어온다. 그대로 DB 에 던지면 프로시저가
+    # invalid UUID 로 거절한다 — 여기서 먼저 걸러 로그를 깨끗하게 유지한다.
+    try:
+        uuid.UUID(str(user_id))
+    except (ValueError, AttributeError, TypeError):
+        print(f"[chat_session_list_input] user_id 가 아닌 토큰({user_id!r}) — 빈 목록으로 처리")
+        return None
+
     return user_id
 
 
