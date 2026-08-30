@@ -71,3 +71,64 @@ def update_user_role(*args, **kwargs):
     admin_user_id, target_user_id, new_role = args[0]
     updated_role = db_call("update_user_role", admin_user_id=admin_user_id, target_user_id=target_user_id, new_role=new_role)
     return updated_role
+
+#────────────────────────────────────────────────┌> 통신부 task (명세 task_type)
+#
+# 클라이언트가 보내는 payload 를 각 work 이 읽는 모양으로 바꾼다. 위쪽 test_*_input 이
+# "통신모듈 붙기 전까지 입력을 넣어주는 자리" 였고, 이제 그 자리를 payload 가 채운다.
+# 이름은 클라이언트(src/config/TaskType.js)가 보내는 그대로 쓴다.
+
+tasks["LOGIN"]    = ["login_input", "login_user", "login_output"]
+tasks["REGISTER"] = ["register_input", "create_account"]
+
+
+@work_regist("login_input")
+def login_input(*args, **kwargs):
+    """요청 {payload, session_id, token} -> login_user 가 읽는 (login_id, password)"""
+    payload = args[0].get("payload") or {}
+    return payload["email"], payload["password"]
+
+
+@work_regist("register_input")
+def register_input(*args, **kwargs):
+    """payload {email, password, name} -> create_account 가 읽는 (name, login_id, password, role)
+
+    명세에 role 이 없다. 회원가입은 항상 일반 사용자로 만들고, 권한 승격은
+    USER_SET_ROLE 로만 하게 둔다 — payload 로 role 을 받으면 아무나 admin 으로
+    가입할 수 있다.
+    """
+    payload = args[0].get("payload") or {}
+    return payload["name"], payload["email"], payload["password"], "user"
+
+
+@work_regist("login_output")
+def login_output(*args, **kwargs):
+    """login_user 의 DB 행 -> 클라이언트가 읽는 {access_token, user}.
+
+    AppState.login 이 data.access_token 과 data.user 를 바로 꺼내 쓴다. 둘 중 하나가
+    없으면 예외도 안 나고 user 가 undefined 로 남아서, 로그인 화면에서 조용히
+    되돌아온다(실제로 겪었다).
+
+    실패는 예외로 올린다. 성공 status 에 null 을 실어 보내면 클라이언트가 그걸
+    더미 계정 로그인으로 흘려버려서, 비밀번호가 틀렸는데 들어가진 것처럼 보인다.
+
+    [임시] access_token 에 user_id 를 그대로 쓴다. 토큰 발급이 정해지기 전까지의
+    자리표시자다. 남의 user_id 를 Authorization 헤더에 넣으면 그 사람으로 행세할 수
+    있으므로, 토큰을 검증하는 work 이 생기기 전에 배포되면 안 된다.
+    """
+    row = args[0]
+    if not row:
+        raise ValueError("이메일 또는 비밀번호가 올바르지 않습니다.")
+
+    user_id = str(row["user_id"])
+    return {
+        "access_token": user_id,
+        "user": {
+            "id": user_id,
+            "email": row.get("login_id"),
+            "name": row.get("name"),
+            "role": row.get("role"),
+            "provider": "local",
+            "created_at": None,
+        },
+    }

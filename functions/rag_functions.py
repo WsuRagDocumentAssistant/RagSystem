@@ -131,8 +131,12 @@ def warmup_function(*args, **kwargs):
 
 @work_regist("parse_function")
 def parse_function(*args, **kwargs):
-    """hwpx -> DocumentModel. 체인의 첫 단계라 경로를 상수에서 받는다."""
-    file_path = HWPX_FILE_PATH
+    """hwpx -> DocumentModel.
+
+    FILE_UPLOAD 는 앞 work 이 방금 저장한 경로를 넘겨준다. 메뉴로 돌리는 test_ 태스크는
+    params 가 None 이라 args 가 비고, 그때는 상수로 떨어진다. 문자열만 경로로 인정한다.
+    """
+    file_path = args[0] if args and isinstance(args[0], str) and args[0] else HWPX_FILE_PATH
     if not file_path:
         raise ValueError(
             "문서 경로가 비어 있습니다. RAG_HWPX_FILE 환경변수나 "
@@ -266,13 +270,18 @@ def embed_query_function(*args, **kwargs):
 
     다음 단계가 질의 문자열도 필요하므로(리랭킹) 함께 실어 보낸다.
     """
-    if not QUERY:
-        raise ValueError("질의가 비어 있습니다. RAG_QUERY 환경변수를 지정하세요.")
+    # 통신부가 붙으면 앞 work 이 질의를 넘겨준다. 메뉴에서 부를 때는 params 가
+    # None 이라 상수로 떨어진다. 문자열만 질의로 인정한다 — 숫자 같은 게 들어오면
+    # 그대로 임베딩되어 조용히 엉뚱한 검색이 된다.
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    query = (req.get("payload") or {}).get("query") or QUERY
+    if not query or not query.strip():
+        raise ValueError("질의가 비어 있습니다. payload.query 를 보내주세요.")
 
     vocab = load_vocab()
-    vector, weights = get_controller().embed_query(QUERY, vocab)
-    print(f"[embed_query_function] 사전 {len(vocab)}개 적용")
-    return QUERY, vector, weights
+    vector, weights = get_controller().embed_query(query, vocab)
+    print(f"[embed_query_function] 사전 {len(vocab)}개 적용 / 질의 {query[:40]!r}")
+    return req, query, vector, weights
 
 
 @work_regist("hybrid_search_function")
@@ -282,7 +291,7 @@ def hybrid_search_function(*args, **kwargs):
     두 점수를 더하지 않고 순위로 합친다 — dense 는 코사인이라 0~1 인데 sparse 는
     가중치 내적이라 상한이 없어서, 그냥 더하면 sparse 가 결과를 지배한다.
     """
-    query, vector, weights = args[0]
+    req, query, vector, weights = args[0]
     rag = get_controller()
     hits = db_call(
         "search_documents_hybrid",
@@ -292,7 +301,7 @@ def hybrid_search_function(*args, **kwargs):
         top_k=TOP_K_SEARCH,
     ) or []
     print(f"[hybrid_search_function] 조각 {len(hits)}개")
-    return query, hits
+    return req, query, hits
 
 
 @work_regist("rerank_function")
@@ -313,7 +322,7 @@ def rerank_function(*args, **kwargs):
     재정렬: 한 부모의 조각이 최종 자리를 독점하지 못하게 개수를 제한한다. 조각들이
     표 머리글을 공유해서 LLM 이 거의 같은 글을 여러 번 보게 된다.
     """
-    query, hits = args[0]
+    req, query, hits = args[0]
     rag = get_controller()
 
     contexts = rag.build_contexts(hits)
@@ -324,7 +333,7 @@ def rerank_function(*args, **kwargs):
     for rank, context in enumerate(ordered, 1):
         print(f"[rerank_function] {rank}. score={context.rerank_score:.4f} "
               f"merged={context.merged} {context.breadcrumb[:60]}")
-    return query, ordered
+    return req, query, ordered
 
 #------------------------------------------------┌> 답변
 
@@ -341,20 +350,23 @@ def answer_function(*args, **kwargs):
     순차로 넘기면 앞 모델의 판단이 굳어져 뒷 모델이 손댈 여지가 줄어든다.
     걸리는 시간도 합이 아니라 가장 느린 하나가 된다.
     """
-    query, contexts, refs  = args[0]
+    req, query, contexts, refs = args[0]
     rag = get_controller()
 
     draft = rag.answer(query, contexts, provider=DRAFT_PROVIDER, external=refs)
     print(f"[answer_function] 초안 {DRAFT_PROVIDER} {len(draft):,}자 (내부용)")
 
-    answers = rag.refine_all(query, contexts, draft, ANSWER_PROVIDERS, external=refs)
-    for name in ANSWER_PROVIDERS:
+    # 클라이언트가 고른 모델. 없으면 설정값으로 떨어진다(통신부 없이 돌리는 test_ 태스크).
+    providers = [p] if (p := (req.get("payload") or {}).get("provider")) else ANSWER_PROVIDERS
+
+    answers = rag.refine_all(query, contexts, draft, providers, external=refs)
+    for name in providers:
         mark = f"{len(answers[name]):,}자" if name in answers else "실패"
         print(f"[answer_function] 다듬기 {name} {mark}")
 
     if not answers:
-        raise RuntimeError(f"다듬기가 전부 실패했습니다: {ANSWER_PROVIDERS}")
-    return [{"provider": name, "answer": text} for name, text in answers.items()]
+        raise RuntimeError(f"다듬기가 전부 실패했습니다: {providers}")
+    return req, [{"provider": name, "answer": text} for name, text in answers.items()]
 
 
 @work_regist("merge_function")
@@ -365,11 +377,25 @@ def merge_function(*args, **kwargs):
     둘씩 접어 올리면 나중 것이 '이미 합쳐진 것' 과 1:1 로 겨루게 되어 앞선 답변의
     근거가 묽어진다.
     """
-    answers = args[0]
-    merged = get_controller().merge(
-        QUERY, [a["answer"] for a in answers], provider=MERGE_WITH)
-    print(f"[merge_function] {MERGE_WITH} 병합 {len(merged):,}자")
-    return {"provider": MERGE_WITH, "answer": merged}
+    value = args[0] if args else None
+    if isinstance(value, tuple):                      # 질의 체인 뒤에 붙었을 때
+        req, answers = value
+    else:                                             # MERGE_RESULTS 로 단독 호출
+        req = value if isinstance(value, dict) else {}
+        # 명세는 content, 이쪽은 answer 로 읽는다. 여기서 맞춘다.
+        answers = [{"provider": a.get("provider"),
+                    "answer": a.get("content") or a.get("answer") or ""}
+                   for a in (req.get("payload") or {}).get("answers") or []]
+    if not answers:
+        raise ValueError("합칠 답변이 없습니다. payload.answers 를 보내주세요.")
+
+    payload = req.get("payload") or {}
+    query = payload.get("query") or QUERY
+    provider = payload.get("provider") or MERGE_WITH
+
+    merged = get_controller().merge(query, [a["answer"] for a in answers], provider=provider)
+    print(f"[merge_function] {provider} 병합 {len(merged):,}자")
+    return {"provider": provider, "answer": merged}
 
 
 #------------------------------------------------┌> 외부 데이터
@@ -383,7 +409,7 @@ def search_api_function(*args, **kwargs):
     실패해도 답변을 막지 않는다. 이건 부가 정보라 없으면 없는 대로 답하면 된다 —
     외부 데이터 테이블이 비었다는 이유로 질의 전체가 죽으면 안 된다.
     """
-    query, contexts = args[0]
+    req, query, contexts = args[0]
 
     refs = []
     try:
@@ -401,43 +427,88 @@ def search_api_function(*args, **kwargs):
               f"({ref['source']}) sim={ref['similarity']:.4f}")
     if not refs:
         print("[search_api_function] 관련 외부 데이터 없음")
-    return query, contexts, refs
-
+    return req, query, contexts, refs
 
 @work_regist("embed_api_function")
 def embed_api_function(*args, **kwargs):
-    """등록된 외부 API 목록을 임베딩해서 api_data_vectors 에 넣는다. 저장한 개수.
+    """방금 등록된 외부 API 를 임베딩해 api_data_vectors 에 넣는다. url 또는 None.
+
+    api_insert 체인에서 insert_db_api_data 다음에 붙는다. 앞 단계가 방금 넣은 행
+    하나를 준다 — title, url, source, key, data, data_type, date.
 
     임베딩 대상은 title 과 source 뿐이다. data 는 API 응답 원문이라 길고 자주 바뀌고,
-    key 는 인증키다 — 둘 다 벡터에 들어가면 안 된다.
+    key 는 인증키다 — 둘 다 벡터에 들어가면 안 된다. 그래서 update_api_data_date 로
+    data 만 갱신될 때는 이 work 가 다시 돌 필요가 없다. 삭제도 마찬가지다 —
+    url FK 에 ON DELETE CASCADE 가 걸려 있어 delete_api_data 가 벡터까지 지운다.
+    결국 벡터가 새로 필요한 순간은 등록 하나뿐이다.
 
-    문서 색인과 달리 sparse 를 만들지 않는다. api_data_vectors 는 embedding
-    vector(1024) 한 컬럼뿐이라 넣을 자리가 없다. title 은 30~60자로 짧아서 어휘가
-    겹칠 일이 적고, 그런 짧은 문자열은 sparse 가 잘 못 잡는다.
+    sparse 를 만들지 않는다. api_data_vectors 는 embedding vector(1024) 한 컬럼뿐이라
+    넣을 자리가 없다. title 은 30~60자로 짧아 어휘가 겹칠 일이 적고, 그런 짧은
+    문자열은 sparse 가 잘 못 잡는다.
 
-    매번 전체를 다시 임베딩한다. 어떤 url 에 벡터가 이미 있는지 물어볼 task 가
-    db_manager 에 없기 때문이다. save_api_data_vector 가 UPSERT 라 덮어써도 문제는
-    없고, 목록이 수십 건 규모라 한 번의 forward 로 끝난다. 수천 건이 되면 그때
-    '벡터 없는 것만' 을 돌려주는 프로시저를 요청하는 게 맞다.
-
-    체인의 첫 단계로도 쓰므로 args 가 비어 있어도 돈다.
+    임베딩이 실패해도 등록 자체를 되돌리지 않는다. 행은 이미 들어갔고, 벡터가 없으면
+    유사도 검색에 안 잡힐 뿐이다 — 그것 때문에 등록을 실패로 만들 이유가 없다.
     """
-    inserted_api_data = args[0]
-    if not inserted_api_data:
-        print("[embed_api_function] 등록된 외부 API 가 없습니다")
-        return 0
+    row = args[0] if args else None
+    if not row or not row.get("url"):
+        print("[embed_api_function] 등록된 행이 없어 건너뜁니다")
+        return None
 
-    texts = [f"{inserted_api_data['title']} · {inserted_api_data['source']}"]
-    vectors = get_controller().embed_texts(texts)
+    text = f"{row['title']} · {row['source']}"
+    vector = get_controller().embed_texts([text])[0]
+    db_call("save_api_data_vector", url=row["url"], embedding=vector)
+
+    print(f"[embed_api_function] 벡터 저장: {text}")
+    return row["url"]
+
+#────────────────────────────────────────────────┌> 통신부 task (명세 task_type)
+#
+# 이름은 클라이언트(src/config/TaskType.js)가 보내는 그대로 쓴다. 기존 test_ 태스크는
+# 손대지 않는다 — 통신부 없이 체인만 돌려보는 통로가 그대로 남아 있어야 한다.
+
+tasks["USER_QUERY"]    = QUERY_CHAIN + ["search_api_function", "answer_function",
+                                        "user_query_output"]
+tasks["MERGE_RESULTS"] = ["merge_function", "merge_output"]
 
 
-    try:
-        db_call("save_api_data_vector", url=inserted_api_data["url"], embedding=vectors[0])
+@work_regist("user_query_output")
+def user_query_output(*args, **kwargs):
+    """(req, 답변들) -> 클라이언트가 읽는 {reply, sessionId, sources}.
 
-    except Exception as e:
-            # url 하나가 실패해도 나머지는 넣는다. FK 위반(api_datas 에서 지워진 url)이
-            # 대부분이라, 하나 때문에 전체를 되돌릴 이유가 없다.
-            print(f"[embed_api_function] 실패 {inserted_api_data['url']}: {type(e).__name__} - {e}")
+    sessionId 는 받은 것을 그대로 돌려준다. 클라이언트가 다음 요청에 그대로 실어
+    보내기 때문에(ChatService.sendMessage), 여기서 비우면 대화가 매번 끊긴다.
+    세션 work 이 붙으면 새로 만든 id 로 바뀐다.
 
-    print(f"[embed_api_function] 저장 {len(inserted_api_data)}개")
-    return len(inserted_api_data)
+    answers 는 명세에 없지만 provider 를 여러 개 쓸 때 비교 화면에 필요하다.
+    """
+    req, answers = args[0]
+    return {
+        "reply": answers[0]["answer"] if answers else "",
+        "answers": answers,
+        "sessionId": req.get("session_id"),
+        "sources": [],
+    }
+
+
+@work_regist("merge_output")
+def merge_output(*args, **kwargs):
+    """merge_function 의 {provider, answer} -> 클라이언트가 읽는 {reply}."""
+    merged = args[0]
+    return {"reply": merged.get("answer", ""), "provider": merged.get("provider")}
+
+
+@work_regist("file_upload_index")
+def file_upload_index(*args, **kwargs):
+    """업로드된 파일을 색인한다. (document_id, meta, chunk 수) 를 돌려준다.
+
+    register_document 는 '이미 임베딩된 문서' 에만 분류값을 붙일 수 있다 — 없으면
+    프로시저가 거절한다. 그래서 색인이 먼저다.
+
+    기존 work 을 그대로 불러 쓴다. 여기서 파싱·청킹을 다시 구현하면 색인 경로가 둘로
+    갈려서 한쪽만 고쳐지고 조용히 어긋난다.
+    """
+    meta = args[0]
+    document = chunk_function(parse_function(meta["source_path"]))
+    embed_function(document)
+    document_id = save_function(document)
+    return document_id, meta, len(document.children())
