@@ -22,11 +22,6 @@ load_dotenv()   # .env를 os.environ에 올린다 (없으면 조용히 넘어감
 # url 을 통째로 찍는다. url 에 인증키가 들어 있어 콘솔에 그대로 노출된다.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# 호출할 api 정보 하나. collect() 는 request.url 을 GET 만 하므로 인증키는 url 안에 있어야 한다.
-API_TITLE  = os.environ["API_TITLE"]
-API_SOURCE = os.environ["API_SOURCE"]
-API_KEY    = os.environ["API_KEY"]   # 비밀값
-API_URL    = os.environ["API_URL"]   # 인증키가 들어 있어 이것도 비밀값
 
 dbmanager = db_manager.DBManager()
 _inited = False
@@ -134,7 +129,23 @@ def insert_db_session_data(*args, **kwargs):
 # api 실제 데이터로 객체 생성
 @work_regist("create_api_data")
 def api_data(*args, **kwargs) -> ApiEntity:
-    request = ApiEntity(title=API_TITLE, url=API_URL, source=API_SOURCE, key=API_KEY)
+    """요청 payload 로 외부 API 를 한 건 수집한다.
+
+    통신부(EXTERNAL_API_SAVE)가 클라이언트에서 받은 값을 넘겨준다. 인자가 없으면
+    (메뉴로 직접 실행) .env 의 상수로 떨어진다 — 통신부 붙기 전 통로를 남겨둔다.
+
+    클라이언트는 apiKey 로 보내고 ApiEntity 는 key 로 받는다. 여기서 맞춘다.
+    """
+    payload = (args[0].get("payload") or {}) if args and isinstance(args[0], dict) else {}
+    request = ApiEntity(
+        title=payload.get("title") ,
+        url=payload.get("url") ,
+        source=payload.get("source") ,
+        key=payload.get("apiKey") or payload.get("key"),
+    )
+    if not request.url:
+        raise ValueError("payload 에 url 이 없습니다.")
+    print(f"[create_api_data] 수집: {request.title} ({request.url[:60]})")
     return asyncio.run(collect(request))
 
 # DB에 저장, API 결과 리스트 반환
@@ -283,6 +294,8 @@ tasks["DICTIONARY_LIST"]       = ["list_all_db_words", "dictionary_list_output"]
 tasks["DICTIONARY_SAVE"]       = ["dictionary_save_input", "save_db_words",
                                   "dictionary_save_output"]
 tasks["EXTERNAL_API_LIST"]     = ["select_all_db_api_data", "external_api_list_output"]
+tasks["EXTERNAL_API_SAVE"]     = ["create_api_data", "insert_db_api_data",
+                                  "embed_api_function", "external_api_save_output"]
 tasks["EXTERNAL_API_DELETE"]   = ["api_id_input", "delete_db_api_data_by_id",
                                   "external_api_delete_output"]
 
@@ -455,3 +468,30 @@ def save_db_words(*args, **kwargs):
 def dictionary_save_output(*args, **kwargs):
     """클라이언트가 result 를 읽지 않는다. 명세대로 빈 객체."""
     return {}
+
+
+@work_regist("external_api_save_output")
+def external_api_save_output(*args, **kwargs):
+    """등록된 외부 API -> 클라이언트가 읽는 {api: {...}}.
+
+    앞 단계(embed_api_function)가 url 또는 None 을 준다. 그걸로 방금 넣은 행을
+    목록에서 찾아 돌려준다 — insert 반환값을 그대로 쓰면 컬럼 이름이 DB 쪽이라
+    클라이언트가 못 읽는다.
+
+    refreshIntervalMinutes 는 api_datas 에 컬럼이 없어 비워 보낸다.
+    """
+    url = args[0] if args and isinstance(args[0], str) else None
+    rows = db_call("select_all_api_data") or []
+    row = next((r for r in rows if r.get("url") == url), None) if url else None
+    if row is None:
+        raise ValueError("등록된 외부 API 를 찾지 못했습니다.")
+
+    return {"api": {
+        "id": row.get("url"),               # url 이 PK 다
+        "title": row.get("title"),
+        "url": row.get("url"),
+        "source": row.get("source"),
+        "apiKey": row.get("key") or row.get("api_key"),
+        "fetchedAt": str(row.get("date") or row.get("fetched_at") or "") or None,
+        "refreshIntervalMinutes": None,
+    }}
