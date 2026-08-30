@@ -23,6 +23,16 @@ api-data @ git+https://github.com/WsuRagDocumentAssistant/ApiData.git
 # openai 는 기본 의존성이라 따로 안 적어도 된다.
 ai-rag-comm[db,claude,gemini] @ git+https://github.com/WsuRagDocumentAssistant/ServerCommunication.git
 
+# anthropic SDK 는 httpx2 를 필수로 쓰고(httpx2<3,>=2.0.0), httpx2 2.12 의 brotli
+# 디코더는 brotli.Decompressor.process(data, output_buffer_limit=...) 를 부른다.
+# 그 키워드는 brotli 1.2.0 에서 생겼는데 베이스 이미지에 1.1.0 이 들어 있어서,
+# 응답을 200 으로 받고도 압축을 푸는 단계에서 TypeError 가 나고 SDK 가 그걸
+# APIConnectionError 로 감싸 재시도하다 실패한다(배포에서 실제로 겪었다).
+#
+# httpx2 는 brotli 를 extra 로만 선언해서(brotli>=1.2.0; extra == 'brotli')
+# 자동으로 안 올라간다. 그래서 여기서 직접 올린다.
+brotli>=1.2.0
+
 # rag-router 가 python-dotenv==1.2.2 를 못박아 둔다. 여기서 다른 버전을 요구하면
 # pip 이 해결하지 못하고 빌드가 멈춘다(실제로 겪었다).
 python-dotenv==1.2.2

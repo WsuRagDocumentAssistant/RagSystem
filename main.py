@@ -146,9 +146,15 @@ def bridge_collect_loop(executor, stop_event):
         job_id = params.get("job_id")
 
         with _pending_lock:
-            if job_id is None and len(_pending) == 1:
-                # job_id 를 못 실어온 결과. 대기 중인 요청이 하나뿐이면 그것이다.
+            if job_id is None and _pending:
+                # job_id 를 못 실어온 결과. 실행부의 실패 갈래가 아직 (task, result) 가
+                # 아니라 TaskExecutionError 만 보내서 그렇다.
+                #
+                # 워커가 하나면 실행 순서가 곧 도착 순서라, 가장 먼저 넣은 요청이 그것이다
+                # (dict 는 넣은 순서를 지킨다). 워커를 늘리면 이 가정이 깨지므로,
+                # 실행부가 실패 때도 task 를 실어 보내도록 고치는 게 맞다.
                 job_id = next(iter(_pending))
+                logger.warning("job_id 없는 결과 — 가장 오래된 요청(%s)으로 본다", job_id)
             task = _pending.pop(job_id, None)
 
         if task is None:
