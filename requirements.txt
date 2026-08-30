@@ -1,5 +1,5 @@
-hwpx @ git+https://github.com/WsuRagDocumentAssistant/HwpxParser_sub.git@8056258068dbef1afd46b657f824df6eabda5a7a
-ragmodul @ git+https://github.com/WsuRagDocumentAssistant/RagModuls.git@6403a1a500b06b60811059e2d8ceece2402ef784
-task-controller @ git+https://github.com/WsuRagDocumentAssistant/TaskController.git@ffd6a8dc40db4c31e92d1d7d89ddf34aa206d2e0
-task-executor @ git+https://github.com/WsuRagDocumentAssistant/TaskExecutor.git@2549fb0333289432630a4ce56333cbd95fbae9dd
+hwpx @ git+https://github.com/WsuRagDocumentAssistant/HwpxParser_sub.git
+ragmodul @ git+https://github.com/WsuRagDocumentAssistant/RagModuls.git
+task-controller @ git+https://github.com/WsuRagDocumentAssistant/TaskController.git
+task-executor @ git+https://github.com/WsuRagDocumentAssistant/TaskExecutor.git
 python-dotenv==1.0.1
