@@ -16,7 +16,12 @@ hwpx @ git+https://github.com/WsuRagDocumentAssistant/HwpxParser_sub.git
 db-manager @ git+https://github.com/WsuRagDocumentAssistant/DBManager.git
 session-data @ git+https://github.com/WsuRagDocumentAssistant/SessionData.git
 api-data @ git+https://github.com/WsuRagDocumentAssistant/ApiData.git
-ai-rag-comm @ git+https://github.com/WsuRagDocumentAssistant/ServerCommunication.git
+# db / claude / gemini 는 선택 의존성이라 그냥 설치하면 안 깔린다.
+#   db     -> asyncpg      (DatabaseService. 없으면 DB 연결이 통째로 안 된다)
+#   claude -> anthropic    (ClaudeService)
+#   gemini -> google-genai (GeminiService)
+# openai 는 기본 의존성이라 따로 안 적어도 된다.
+ai-rag-comm[db,claude,gemini] @ git+https://github.com/WsuRagDocumentAssistant/ServerCommunication.git
 
 # rag-router 가 python-dotenv==1.2.2 를 못박아 둔다. 여기서 다른 버전을 요구하면
 # pip 이 해결하지 못하고 빌드가 멈춘다(실제로 겪었다).
