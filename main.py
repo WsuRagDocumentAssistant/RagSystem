@@ -33,7 +33,7 @@ def timer_loop(executor, stop_event):
     결과를 받은 뒤에 다음 주기를 세므로 실행이 주기보다 길어도 겹치지 않는다.
     """
     while not stop_event.is_set():
-        executor.task_queue.put(Task(tasks["api_all_update"]))
+        executor.task_queue.put(Task(tasks["api_all_update"], None))
         print()
         print("[타이머] api_all_update 결과 :", executor.get_task_result())
         stop_event.wait(TIMER_INTERVAL)
@@ -71,7 +71,7 @@ if __name__ == "__main__":
 
             case "w":
                 task_name = input("이름 입력: ")
-                taskcontroller.task_queue.put(task_name)
+                taskcontroller.task_queue.put((task_name, None))
                 result = taskexecutor.get_task_result()
                 print(f"결과 : {result}")
 

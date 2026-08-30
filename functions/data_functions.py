@@ -65,7 +65,7 @@ tasks["list_sessions"] = ["test_user_id", "list_db_sessions"]
 
 # api-data
 # api insert
-tasks["api_insert"] = ["create_api_data", "insert_db_api_data"]
+tasks["api_insert"] = ["create_api_data", "insert_db_api_data", "embed_api_function"]
 # api all update
 tasks["api_all_update"] = ["select_all_db_api_data", "update_api_data", "update_db_api_data"]
 # api delete
@@ -133,6 +133,7 @@ def insert_db_session_data(*args, **kwargs):
 @work_regist("create_api_data")
 def api_data(*args, **kwargs) -> ApiEntity:
     request = ApiEntity(title=API_TITLE, url=API_URL, source=API_SOURCE, key=API_KEY)
+    print(f"안되?? {request}")
     return asyncio.run(collect(request))
 
 # DB에 저장, API 결과 리스트 반환

@@ -61,6 +61,11 @@ MERGE_WITH = os.environ.get("RAG_MERGE_WITH") or "gpt"
 # 사전 추출은 문서를 통째로 넘긴다. 로컬은 컨텍스트가 8192 토큰이라 안 들어간다.
 VOCAB_PROVIDER = os.environ.get("RAG_VOCAB_PROVIDER", "gpt")
 
+
+# 외부 API 검색 개수. 1 이다 — 이건 근거가 아니라 "이런 것도 받아올 수 있다" 는
+# 안내라서, 여러 개를 늘어놓으면 답변 끝이 목록이 된다.
+TOP_K_API = int(os.environ.get("RAG_TOP_K_API", "1"))
+
 #────────────────────────────────────────────────┌> test task 등록
 
 # 질의 검색은 세 task 가 공유한다. 세 번 적으면 한 곳만 고치고 어긋난다.
@@ -73,9 +78,9 @@ tasks.update({
                     "vocab_function", "filter_vocab_function", "save_vocab_function",
                     "embed_function", "save_function"],
     "test_레그검색": QUERY_CHAIN,          
-    "test_레그질의": QUERY_CHAIN + ["answer_function"],
-    "test_레그질의병합": QUERY_CHAIN + ["answer_function", "merge_function"],
-    "RAG_Search": QUERY_CHAIN + ["answer_function"],
+    "test_레그질의": QUERY_CHAIN + ["search_api_function", "answer_function"],
+    "test_레그질의병합": QUERY_CHAIN + ["search_api_function", "answer_function", "merge_function"],
+    "RAG_Search": QUERY_CHAIN + ["search_api_function", "answer_function"],
     "Merge": ["merge_function"],
 })
 
@@ -336,13 +341,13 @@ def answer_function(*args, **kwargs):
     순차로 넘기면 앞 모델의 판단이 굳어져 뒷 모델이 손댈 여지가 줄어든다.
     걸리는 시간도 합이 아니라 가장 느린 하나가 된다.
     """
-    query, contexts = args[0]
+    query, contexts, refs  = args[0]
     rag = get_controller()
 
-    draft = rag.answer(query, contexts, provider=DRAFT_PROVIDER)
+    draft = rag.answer(query, contexts, provider=DRAFT_PROVIDER, external=refs)
     print(f"[answer_function] 초안 {DRAFT_PROVIDER} {len(draft):,}자 (내부용)")
 
-    answers = rag.refine_all(query, contexts, draft, ANSWER_PROVIDERS)
+    answers = rag.refine_all(query, contexts, draft, ANSWER_PROVIDERS, external=refs)
     for name in ANSWER_PROVIDERS:
         mark = f"{len(answers[name]):,}자" if name in answers else "실패"
         print(f"[answer_function] 다듬기 {name} {mark}")
@@ -365,3 +370,74 @@ def merge_function(*args, **kwargs):
         QUERY, [a["answer"] for a in answers], provider=MERGE_WITH)
     print(f"[merge_function] {MERGE_WITH} 병합 {len(merged):,}자")
     return {"provider": MERGE_WITH, "answer": merged}
+
+
+#------------------------------------------------┌> 외부 데이터
+@work_regist("search_api_function")
+def search_api_function(*args, **kwargs):
+    """질의와 비슷한 외부 API 를 찾는다. (query, contexts, api_refs).
+
+    질의 벡터를 다시 만든다. 앞 단계가 이미 만들었지만 rerank 까지 오면서 버려졌고,
+    가져오려면 체인 중간 두 함수의 반환값을 바꿔야 한다. 질의 한 문장이라 수십 ms 다.
+
+    실패해도 답변을 막지 않는다. 이건 부가 정보라 없으면 없는 대로 답하면 된다 —
+    외부 데이터 테이블이 비었다는 이유로 질의 전체가 죽으면 안 된다.
+    """
+    query, contexts = args[0]
+
+    refs = []
+    try:
+        vector, _ = get_controller().embed_query(query)
+        refs = db_call(
+            "search_api_data_vector",
+            query_vector=to_plain_vector(vector),
+            top_k=TOP_K_API,
+        ) or []
+    except Exception as e:
+        print(f"[search_api_function] 건너뜀: {type(e).__name__} - {e}")
+
+    for ref in refs:
+        print(f"[search_api_function] {ref['title']} "
+              f"({ref['source']}) sim={ref['similarity']:.4f}")
+    if not refs:
+        print("[search_api_function] 관련 외부 데이터 없음")
+    return query, contexts, refs
+
+
+@work_regist("embed_api_function")
+def embed_api_function(*args, **kwargs):
+    """등록된 외부 API 목록을 임베딩해서 api_data_vectors 에 넣는다. 저장한 개수.
+
+    임베딩 대상은 title 과 source 뿐이다. data 는 API 응답 원문이라 길고 자주 바뀌고,
+    key 는 인증키다 — 둘 다 벡터에 들어가면 안 된다.
+
+    문서 색인과 달리 sparse 를 만들지 않는다. api_data_vectors 는 embedding
+    vector(1024) 한 컬럼뿐이라 넣을 자리가 없다. title 은 30~60자로 짧아서 어휘가
+    겹칠 일이 적고, 그런 짧은 문자열은 sparse 가 잘 못 잡는다.
+
+    매번 전체를 다시 임베딩한다. 어떤 url 에 벡터가 이미 있는지 물어볼 task 가
+    db_manager 에 없기 때문이다. save_api_data_vector 가 UPSERT 라 덮어써도 문제는
+    없고, 목록이 수십 건 규모라 한 번의 forward 로 끝난다. 수천 건이 되면 그때
+    '벡터 없는 것만' 을 돌려주는 프로시저를 요청하는 게 맞다.
+
+    체인의 첫 단계로도 쓰므로 args 가 비어 있어도 돈다.
+    """
+    inserted_api_data = args[0]
+    if not inserted_api_data:
+        print("[embed_api_function] 등록된 외부 API 가 없습니다")
+        return 0
+
+    texts = [f"{inserted_api_data['title']} · {inserted_api_data['source']}"]
+    vectors = get_controller().embed_texts(texts)
+
+
+    try:
+        db_call("save_api_data_vector", url=inserted_api_data["url"], embedding=vectors[0])
+
+    except Exception as e:
+            # url 하나가 실패해도 나머지는 넣는다. FK 위반(api_datas 에서 지워진 url)이
+            # 대부분이라, 하나 때문에 전체를 되돌릴 이유가 없다.
+            print(f"[embed_api_function] 실패 {inserted_api_data['url']}: {type(e).__name__} - {e}")
+
+    print(f"[embed_api_function] 저장 {len(inserted_api_data)}개")
+    return len(inserted_api_data)
