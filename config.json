@@ -3,9 +3,10 @@
     "log_level": "INFO"
   },
   "local_llm": {
-    "host": "10.101.96.71",
-    "port": 8001,
-    "timeout": 30.0
+    "base_url": "http://117.16.166.22/v1",
+    "model": "gemma-4-12B-it",
+    "timeout": 60.0,
+    "headers": { "x-user-id": "npark-01" }
   },
   "database": {
     "host": "203.234.10.119",
@@ -16,8 +17,11 @@
     "auto_connect": true
   },
   "llm_api": {
+    "timeout": 300.0,
     "default_models": {
-      "gpt": "gpt-5.5"
+      "gpt": "gpt-5.5",
+      "claude": "claude-sonnet-5",
+      "gemini": "gemini-3.5-flash"
     }
   }
 }
