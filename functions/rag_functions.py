@@ -69,12 +69,12 @@ QUERY_CHAIN = ["embed_query_function", "hybrid_search_function", "rerank_functio
 tasks.update({
     "test_레그준비": ["warmup_function"],                          # 모델 미리 올리기
     "test_레그청킹": ["parse_function", "chunk_function"],          # 모델·DB 없이 확인용
-    "test_레그실행": ["parse_function", "chunk_function",
+    "RAG": ["parse_function", "chunk_function",
                     "vocab_function", "filter_vocab_function", "save_vocab_function",
                     "embed_function", "save_function"],
     "test_레그검색": QUERY_CHAIN,                                   # 맥락까지. LLM 안 씀
-    "test_레그답변": QUERY_CHAIN + ["answer_function"],
-    "test_레그병합": QUERY_CHAIN + ["answer_function", "merge_function"],
+    "RAG_Search": QUERY_CHAIN + ["answer_function"],
+    "Merge": QUERY_CHAIN + ["answer_function", "merge_function"],
 })
 
 #------------------------------------------------┌> 지연 생성
