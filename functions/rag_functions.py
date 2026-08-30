@@ -41,7 +41,9 @@ DEVICE = os.environ.get("RAG_DEVICE") or None
 
 UNPACK_DIR = os.environ.get("RAG_UNPACK_DIR", "unpacked")
 HWPX_FILE_PATH = os.environ.get("RAG_HWPX_FILE", "C:/Users/user/Desktop/RagSystem/test_file/2주기(2023년) 2022 ~ 2024 대학혁신지원사업 성과평가보고서.hwpx")
-IMAGE_PATH = "images/"
+# 정적 서빙(main.py 의 IMAGE_DIR)과 같은 환경변수를 본다. 어긋나면 저장한 곳과
+# 내보내는 곳이 달라져서 이미지가 안 뜬다.
+IMAGE_PATH = os.environ.get("RAG_IMAGE_DIR", "images")
 
 QUERY = os.environ.get("RAG_QUERY", "솔드림에 대해 설명해줘")
 
@@ -509,6 +511,17 @@ def file_upload_index(*args, **kwargs):
     """
     meta = args[0]
     document = chunk_function(parse_function(meta["source_path"]))
+
+    # 축약어 사전. RAG 태스크와 같은 단계를 거친다 — 여기서 빠뜨리면 업로드한 문서는
+    # 사전에 한 줄도 안 들어가고, 나중에 그 축약어로 검색해도 확장이 안 걸린다.
+    #
+    # 실패해도 업로드를 실패로 만들지 않는다. 문서 전체를 LLM 에 넘기는 단계라
+    # 외부 API 사정으로 깨질 수 있는데, 사전이 비었다고 색인까지 되돌릴 이유는 없다.
+    try:
+        document = save_vocab_function(filter_vocab_function(vocab_function(document)))
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[file_upload_index] 사전 추출 실패, 건너뜀: {type(e).__name__} - {e}")
+
     embed_function(document)
     document_id = save_function(document)
     return document_id, meta, len(document.children())

@@ -4,7 +4,7 @@
 #================================================
 
 from taskcontroller import work_regist, tasks
-from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
+from functions.data_functions import db_call, _to_millis   # DB 호출은 예외처리까지 묶여 있다
 
 # 통신모듈 붙기 전까지 첫 work 에 입력을 넣어주는 자리
 TEST_DOCUMENT_ID     = 14
@@ -160,6 +160,10 @@ def file_list_output(*args, **kwargs):
             "department": row.get("department"),
             "reportType": row.get("report_type"),
             "productionYear": row.get("production_year"),
+            # 클라이언트는 숫자 timestamp 로 읽는다. status/size/mimeType 은 documents
+            # 테이블에 컬럼이 없어 못 채운다 — status 는 명세상 선택이라 없으면
+            # 클라이언트가 ready 로 본다.
+            "uploadedAt": _to_millis(row.get("registered_at")),
         }
         for row in rows
     ]
@@ -187,7 +191,9 @@ DOCUMENT_DIR = os.environ.get("RAG_DOCUMENT_DIR", "documents")
 
 # 색인이 먼저다. register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
 tasks["FILE_UPLOAD"] = ["file_upload_input", "file_upload_index", "file_upload_register"]
-tasks["DICTIONARY_LIST"] = ["get_vocab"]
+# get_vocab 은 DB 원본(word/replacement)을 그대로 준다. 클라이언트는 term/synonyms 로
+# 읽으므로 변환 단계를 뒤에 붙인다(data_functions 의 dictionary_list_output).
+tasks["DICTIONARY_LIST"] = ["get_vocab", "dictionary_list_output"]
 
 def _safe_name(name: str) -> str:
     """경로 구분자와 상위 이동을 걷어낸다.

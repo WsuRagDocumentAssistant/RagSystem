@@ -79,7 +79,6 @@ def update_user_role(*args, **kwargs):
 # 이름은 클라이언트(src/config/TaskType.js)가 보내는 그대로 쓴다.
 
 tasks["LOGIN"]    = ["login_input", "login_user", "login_output"]
-tasks["REGISTER"] = ["register_input", "create_account"]
 
 
 @work_regist("login_input")
@@ -132,3 +131,22 @@ def login_output(*args, **kwargs):
             "created_at": None,
         },
     }
+
+
+# 회원가입/로그아웃은 클라이언트가 result 를 읽지 않는다. status 만 본다.
+tasks["REGISTER"] = ["register_input", "create_account", "register_output"]
+tasks["LOGOUT"]   = ["logout_output"]
+
+
+@work_regist("register_output")
+def register_output(*args, **kwargs):
+    """생성된 계정 행 -> {}. 실패면 예외로 올린다."""
+    if not args[0]:
+        raise ValueError("계정 생성에 실패했습니다. 이미 있는 이메일인지 확인하세요.")
+    return {}
+
+
+@work_regist("logout_output")
+def logout_output(*args, **kwargs):
+    """서버에 지울 세션 상태가 없다. 토큰은 클라이언트가 localStorage 에서 지운다."""
+    return {}

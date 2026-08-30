@@ -5,6 +5,7 @@
 
 from multiprocessing import Queue
 import logging
+import os
 import queue
 import sys
 import threading
@@ -38,29 +39,56 @@ def timer_loop(executor, stop_event):
     while not stop_event.is_set():
         executor.task_queue.put(Task(tasks["api_all_update"], None))
         print()
-        print("[타이머] api_all_update 결과 :", executor.get_task_result())
+        # 실행부가 (task, result) 로 돌려준다
+        print("[타이머] api_all_update 결과 :", _unwrap(executor.get_task_result()))
         stop_event.wait(TIMER_INTERVAL)
 
 GATEWAY_TIMEOUT = 600   # 초. 라우터 기본값 60 은 색인에 턱없이 모자란다
-BRIDGE_TIMEOUT = 1800   # 초. GATEWAY_TIMEOUT 보다 길게 잡는다
+
+# 통신부 워커 수. 기본 1 이다.
+#
+# 늘리면 요청을 동시에 처리하지만, TaskExecutor 는 스레드가 아니라 프로세스라
+# 메모리가 따로다. rag_functions 의 모델 싱글턴(_controller)도 프로세스마다 하나씩
+# 생기므로, 워커 둘이 각각 RAG 작업을 잡으면 임베딩·리랭커가 두 벌 올라간다.
+# GPU 가 한 장이면 두 벌을 올려도 서로 기다릴 뿐이라 이득도 없다.
+#
+# 동시 처리가 필요하면 워커를 늘리는 대신 레인을 나누는 게 맞다 — 모델을 쓰지 않는
+# 작업(로그인·목록 조회 등)은 get_controller() 를 아예 부르지 않으므로, 그쪽 전용
+# 워커를 따로 두면 모델은 한 벌만 유지하면서 무거운 작업에 막히지 않는다.
+GATEWAY_WORKERS = int(os.environ.get("RAG_GATEWAY_WORKERS", "1"))
+
+# 정적으로 내보낼 폴더. rag_functions / document_functions 가 파일을 떨구는 곳과 같다.
+IMAGE_DIR = os.environ.get("RAG_IMAGE_DIR", "images")
+DOCUMENT_DIR = os.environ.get("RAG_DOCUMENT_DIR", "documents")
 
 logger = logging.getLogger("bridge")
 
 
-def bridge_loop(controller, executor, stop_event):
-    """라우터 큐와 작업 큐를 잇는다. Gateway 와 같은 프로세스의 스레드로 돈다.
+def _unwrap(outcome):
+    """실행부가 돌려주는 (task, result) 에서 결과만 꺼낸다.
 
-    라우터의 큐는 queue.Queue 라 프로세스 경계를 못 넘는다(_thread.lock 은 pickle
-    이 안 된다). 그래서 여기서 꺼내 mp 큐로 옮기고, 결과를 다시 라우터 큐에 넣는다.
+    실패 갈래는 아직 결과만 오는 경우가 있어 두 모양을 다 받는다.
+    """
+    if isinstance(outcome, tuple) and len(outcome) == 2:
+        return outcome[1]
+    return outcome
 
-    한 번에 요청 하나만 처리한다. 결과 큐에는 job_id 가 없어 FIFO 로만 짝을 맞출
-    수 있기 때문이다. 동시 처리를 하려면 실행부가 결과에 job_id 를 실어 줘야 한다.
+# 실행부에 넘긴 요청들. job_id -> 라우터 Task.
+_pending: dict = {}
+_pending_lock = threading.Lock()
+
+
+def bridge_submit_loop(controller, stop_event):
+    """라우터 큐에서 꺼내 컨트롤러로 넘긴다. 결과를 기다리지 않는다.
+
+    기다리지 않으므로 요청이 실행부에 여러 개 쌓일 수 있다. 짝은 collect 쪽이
+    job_id 로 맞춘다.
     """
     from rag_router.shared_queues import SharedQueues
     from rag_router.task.task_result import TaskResult
 
     task_queue, result_queue = SharedQueues.get_queues()
-    logger.info("브릿지 시작 (직렬, 타임아웃 %d초)", BRIDGE_TIMEOUT)
+    logger.info("브릿지 submit 시작")
 
     while not stop_event.is_set():
         try:
@@ -68,42 +96,76 @@ def bridge_loop(controller, executor, stop_event):
         except queue.Empty:
             continue
 
+        # 없는 이름은 여기서 막는다. 컨트롤러는 예외를 잡아 print 만 하므로 그대로
+        # 넘기면 결과가 영영 안 오고 요청이 타임아웃까지 매달린다.
+        if task.task_type not in tasks:
+            logger.warning("등록되지 않은 task_type: %s", task.task_type)
+            result_queue.put(TaskResult(
+                task.job_id, False,
+                error=f"아직 지원하지 않는 task_type 입니다: {task.task_type}"))
+            continue
+
         logger.info("수신 job_id=%s task_type=%s", task.job_id, task.task_type)
-        result_queue.put(_run_one(task, controller, executor, TaskResult))
+        with _pending_lock:
+            _pending[task.job_id] = task
 
-
-def _run_one(task, controller, executor, TaskResult):
-    # 없는 이름은 여기서 막는다. 컨트롤러는 예외를 잡아 print 만 하므로 그대로
-    # 넘기면 결과가 영영 안 오고 요청이 타임아웃까지 매달린다.
-    if task.task_type not in tasks:
-        logger.warning("등록되지 않은 task_type: %s", task.task_type)
-        return TaskResult(task.job_id, False,
-                          error=f"아직 지원하지 않는 task_type 입니다: {task.task_type}")
-
-    try:
         # payload 만 보내면 session_id 와 token 을 되찾을 방법이 없다. 요청을 통째로
         # 넘기고, 체인이 그걸 흘려보내며 필요한 단계에서 꺼내 쓴다.
+        # job_id 는 결과가 돌아올 때 짝을 맞추는 열쇠다.
         controller.task_queue.put((task.task_type, {
+            "job_id": task.job_id,
             "payload": task.payload or {},
             "session_id": task.session_id,
             "token": task.token,
         }))
-        result = executor.get_task_result(timeout=BRIDGE_TIMEOUT)
-    except queue.Empty:
-        logger.error("job_id=%s 결과 없음(%d초). 이후 응답이 어긋날 수 있음",
-                     task.job_id, BRIDGE_TIMEOUT)
-        return TaskResult(task.job_id, False, error=f"{BRIDGE_TIMEOUT}초 내에 끝나지 않았습니다.")
-    except Exception as e:                        # noqa: BLE001
-        logger.exception("job_id=%s 브릿지 오류", task.job_id)
-        return TaskResult(task.job_id, False, error=f"{type(e).__name__}: {e}")
 
+
+def bridge_collect_loop(executor, stop_event):
+    """실행부 결과를 job_id 로 짝지어 라우터 큐에 돌려준다."""
+    from rag_router.shared_queues import SharedQueues
+    from rag_router.task.task_result import TaskResult
+
+    _, result_queue = SharedQueues.get_queues()
+    logger.info("브릿지 collect 시작")
+
+    while not stop_event.is_set():
+        try:
+            outcome = executor.get_task_result(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        # 실행부가 (task, result) 로 보낸다. 실패 갈래는 아직 결과만 오는 경우가
+        # 있어서 두 모양을 다 받는다.
+        if isinstance(outcome, tuple) and len(outcome) == 2:
+            done_task, result = outcome
+        else:
+            done_task, result = None, outcome
+
+        params = getattr(done_task, "params", None) or {}
+        job_id = params.get("job_id")
+
+        with _pending_lock:
+            if job_id is None and len(_pending) == 1:
+                # job_id 를 못 실어온 결과. 대기 중인 요청이 하나뿐이면 그것이다.
+                job_id = next(iter(_pending))
+            task = _pending.pop(job_id, None)
+
+        if task is None:
+            logger.error("짝을 못 찾은 결과 (job_id=%s). 버린다: %r", job_id, result)
+            continue
+
+        result_queue.put(_to_task_result(task, result, TaskResult))
+
+
+def _to_task_result(task, result, TaskResult):
     if isinstance(result, TaskExecutionError):
         # traceback 은 로그로만. HTTP 응답에 실으면 내부 구조가 샌다.
-        logger.error("job_id=%s 작업 실패\n%s", task.job_id, result.tb)
-        return TaskResult(task.job_id, False, error=f"작업 실행에 실패했습니다: {task.task_type}")
+        logger.error("job_id=%s 작업 실패: %s", task.job_id, result.tb)
+        return TaskResult(task.job_id, False,
+                          error=f"작업 실행에 실패했습니다: {task.task_type}")
 
     # 응답 모양은 각 task 의 마지막 work 이 맞춘다(user_query_output 등). 여기서는
-    # 손대지 않는다. dict 이 아닌 값을 돌려주면 TaskResponse 가 거부하므로, 그건
+    # 손대지 않는다. dict/list 가 아닌 값을 돌려주면 TaskResponse 가 거부하므로, 그건
     # 그 task 에 출력 work 이 빠졌다는 뜻이다.
     logger.info("완료 job_id=%s", task.job_id)
     return TaskResult(task.job_id, True, data=result)
@@ -138,7 +200,7 @@ def menu_loop(taskcontroller, taskexecutor, stop_event):
             case "w":
                 task_name = input("이름 입력: ")
                 taskcontroller.task_queue.put((task_name, None))
-                result = taskexecutor.get_task_result()
+                result = _unwrap(taskexecutor.get_task_result())
                 print(f"결과 : {result}")
 
 
@@ -149,14 +211,25 @@ if __name__ == "__main__":
 
     # ── 통신부(HTTP) 전용 ─────────────────────────────
     # 배포는 이 파일이 진입점이다(Dockerfile CMD, containerPort 8000).
-    gwexecutor = TaskExecutor()
-    gwcontroller = TaskController(gwexecutor.get_task_queue())
-    gwexecutor.start()
+    # 워커 여러 개가 같은 큐를 본다. TaskExecutor 는 생성자에서 자기 큐를 만들지만,
+    # start() 전에 바꿔 끼우면 그 큐가 자식 프로세스로 함께 넘어간다.
+    gwexecutors = [TaskExecutor() for _ in range(GATEWAY_WORKERS)]
+    shared_task_queue = gwexecutors[0].get_task_queue()
+    shared_result_queue = gwexecutors[0].get_result_queue()
+    for ex in gwexecutors[1:]:
+        ex.task_queue = shared_task_queue
+        ex.result_queue = shared_result_queue
+    for ex in gwexecutors:
+        ex.start()
+
+    gwcontroller = TaskController(shared_task_queue)
     gwcontroller.start()
+
     stop_bridge = threading.Event()
-    threading.Thread(target=bridge_loop,
-                     args=(gwcontroller, gwexecutor, stop_bridge),
-                     daemon=True).start()
+    threading.Thread(target=bridge_submit_loop,
+                     args=(gwcontroller, stop_bridge), daemon=True).start()
+    threading.Thread(target=bridge_collect_loop,
+                     args=(gwexecutors[0], stop_bridge), daemon=True).start()
 
     # ── 타이머 전용 ───────────────────────────────────
     timerexecutor = TaskExecutor()
@@ -183,6 +256,16 @@ if __name__ == "__main__":
         # 걸린다. 그대로 두면 작업은 계속 도는데 응답만 timeout 으로 나간다.
         gateway.TIMEOUT_SEC = GATEWAY_TIMEOUT
 
+        # 이미지와 원본 문서를 브라우저가 열 수 있게 내보낸다. 라우터는 /api/task 하나만
+        # 갖고 있어서 파일을 줄 통로가 없다 — 라우터 패키지를 고치는 대신 여기서
+        # 그쪽 FastAPI 앱에 정적 경로만 얹는다.
+        from fastapi.staticfiles import StaticFiles
+
+        for url_path, directory in (("/images", IMAGE_DIR), ("/documents", DOCUMENT_DIR)):
+            os.makedirs(directory, exist_ok=True)
+            gateway.app.mount(url_path, StaticFiles(directory=directory), name=url_path.strip("/"))
+        logger.info("정적 경로 연결: /images -> %s, /documents -> %s", IMAGE_DIR, DOCUMENT_DIR)
+
         gateway.run()          # uvicorn. 블로킹이다
     finally:
         stop_bridge.set()
@@ -193,15 +276,23 @@ if __name__ == "__main__":
         timerexecutor.collect()   # 결과 큐를 비워야 자식이 join 에서 멈추지 않는다
         timerexecutor.join()
 
-        gwexecutor.stop()
-        gwexecutor.collect()
-        gwexecutor.join()
+        for ex in gwexecutors:
+            ex.stop()             # 워커 하나당 종료 신호 하나가 필요하다
+        # collect 스레드가 멈춘 뒤라 남은 결과를 아무도 안 꺼낸다. 비우지 않으면
+        # 자식이 큐 버퍼를 flush 하지 못해 join 에서 멈춘다.
+        while any(ex.is_alive() for ex in gwexecutors):
+            try:
+                gwexecutors[0].get_task_result(timeout=0.1)
+            except queue.Empty:
+                pass
+        for ex in gwexecutors:
+            ex.join()
         gwcontroller.terminate()  # TaskController 에는 정상 종료 신호가 없다
         gwcontroller.join()
 
         if taskexecutor is not None:
             taskexecutor.stop()
-            taskexecutor.collect()
+            taskexecutor.collect()   # 결과 큐를 비워야 자식이 join 에서 멈추지 않는다
             taskexecutor.join()
             taskcontroller.terminate()
             taskcontroller.join()
