@@ -18,4 +18,6 @@ session-data @ git+https://github.com/WsuRagDocumentAssistant/SessionData
 api-data @ git+https://github.com/WsuRagDocumentAssistant/ApiData.git
 ai-rag-comm @ git+https://github.com/WsuRagDocumentAssistant/ServerCommunication.git
 
-python-dotenv==1.0.1
+# rag-router 가 python-dotenv==1.2.2 를 못박아 둔다. 여기서 다른 버전을 요구하면
+# pip 이 해결하지 못하고 빌드가 멈춘다(실제로 겪었다).
+python-dotenv==1.2.2
