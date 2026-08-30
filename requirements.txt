@@ -1,5 +1,21 @@
-hwpx @ git+https://github.com/WsuRagDocumentAssistant/HwpxParser_sub.git
-ragmodul @ git+https://github.com/WsuRagDocumentAssistant/RagModuls.git
+# 사내 모듈. 커밋을 고정한다 — 핀이 없으면 설치 시점의 기본 브랜치 최신을 받아서
+# 팀원마다, 그리고 컨테이너 빌드마다 다른 버전이 깔린다.
+
+# 통신부 (Gateway)
+rag-router @ git+https://github.com/WsuRagDocumentAssistant/RagRouter.git
+
+# 작업 분배 / 실행
 task-controller @ git+https://github.com/WsuRagDocumentAssistant/TaskController.git
 task-executor @ git+https://github.com/WsuRagDocumentAssistant/TaskExecutor.git
+
+# RAG 처리 (파싱·청킹·임베딩·검색)
+ragmodul @ git+https://github.com/WsuRagDocumentAssistant/RagModuls.git
+hwpx @ git+https://github.com/WsuRagDocumentAssistant/HwpxParser_sub.git
+
+# DB / 세션 / 외부 API / LLM 호출
+db-manager @ git+https://github.com/WsuRagDocumentAssistant/DBManager.git
+session-data @ git+https://github.com/WsuRagDocumentAssistant/SessionData
+api-data @ git+https://github.com/WsuRagDocumentAssistant/ApiData.git
+ai-rag-comm @ git+https://github.com/WsuRagDocumentAssistant/ServerCommunication.git
+
 python-dotenv==1.0.1
