@@ -72,9 +72,11 @@ tasks.update({
     "RAG": ["parse_function", "chunk_function",
                     "vocab_function", "filter_vocab_function", "save_vocab_function",
                     "embed_function", "save_function"],
-    "test_레그검색": QUERY_CHAIN,                                   # 맥락까지. LLM 안 씀
+    "test_레그검색": QUERY_CHAIN,          
+    "test_레그질의": QUERY_CHAIN + ["answer_function"],
+    "test_레그질의병합": QUERY_CHAIN + ["answer_function", "merge_function"],
     "RAG_Search": QUERY_CHAIN + ["answer_function"],
-    "Merge": QUERY_CHAIN + ["answer_function", "merge_function"],
+    "Merge": ["merge_function"],
 })
 
 #------------------------------------------------┌> 지연 생성
