@@ -65,11 +65,13 @@ tasks["list_sessions"] = ["test_user_id", "list_db_sessions"]
 
 # api-data
 # api insert
-tasks["api_insert"] = ["create_api_data", "insert_db_api_data"]
+tasks["api_insert"] = ["create_api_data", "insert_db_api_data", "embed_api_function"]
 # api all update
 tasks["api_all_update"] = ["select_all_db_api_data", "update_api_data", "update_db_api_data"]
 # api delete
 tasks["api_delete"] = ["test_api_url", "delete_db_api_data"]
+
+
 
 #------------------------------------------------┌> dummy function
 
@@ -213,3 +215,57 @@ def get_or_create_db_session(*args, **kwargs):
 def list_db_sessions(*args, **kwargs):
     session_list = db_call("list_sessions", user_id=args[0])
     return session_list
+
+
+#────────────────────────────────────────────────┌> 통신부 task (명세 task_type)
+
+tasks["CHAT_SESSION_LIST"] = ["chat_session_list_input", "list_db_sessions",
+                              "chat_session_list_output"]
+
+
+def _to_millis(value):
+    """클라이언트가 createdAt 을 숫자 timestamp(ms)로 읽는다. DB 는 datetime 을 준다."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    to_timestamp = getattr(value, "timestamp", None)
+    if to_timestamp is not None:            # datetime
+        return int(to_timestamp() * 1000)
+    return None                             # date 등 시각이 없는 값은 비워 둔다
+
+
+@work_regist("chat_session_list_input")
+def chat_session_list_input(*args, **kwargs):
+    """요청 -> user_id.
+
+    명세상 payload 가 없고 Authorization 토큰으로 사용자를 식별한다. login_output 이
+    지금 user_id 를 토큰으로 내보내고 있어서 그대로 쓸 수 있다 — 토큰 발급 방식이
+    바뀌면 여기서 토큰을 user_id 로 바꾸는 단계가 필요하다.
+
+    인자가 없으면(메뉴로 직접 실행) TEST_USER_ID 로 떨어진다.
+    """
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    user_id = req.get("token") or TEST_USER_ID
+    if not user_id:
+        raise ValueError("사용자를 알 수 없습니다. Authorization 헤더가 필요합니다.")
+    return user_id
+
+
+@work_regist("chat_session_list_output")
+def chat_session_list_output(*args, **kwargs):
+    """세션 행 목록 -> 클라이언트가 읽는 {sessions:[{sessionId, title, createdAt}]}.
+
+    title 컬럼이 없으면 요약이나 현재 토픽을 대신 쓴다. 그것도 없으면 클라이언트가
+    기본값으로 쓰는 문구를 그대로 넣는다.
+    """
+    rows = args[0] or []
+    return {"sessions": [
+        {
+            "sessionId": str(row.get("session_id")),
+            "title": (row.get("title") or row.get("current_topic")
+                      or row.get("overall_summary") or "새 대화"),
+            "createdAt": _to_millis(row.get("created_at")),
+        }
+        for row in rows
+    ]}

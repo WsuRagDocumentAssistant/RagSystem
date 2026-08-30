@@ -122,3 +122,140 @@ def get_department_options(*args, **kwargs):
 @work_regist("get_report_type_options")
 def get_report_type_options(*args, **kwargs):
     return db_call("get_report_type_options")
+
+#────────────────────────────────────────────────┌> 통신부 task (명세 task_type)
+
+tasks["FILE_LIST"]     = ["list_documents", "file_list_output"]   # payload 없음
+tasks["FILE_DELETE"]   = ["file_id_input", "delete_document", "file_delete_output"]
+tasks["FILE_DOWNLOAD"] = ["file_id_input", "get_document"]
+
+
+@work_regist("file_id_input")
+def file_id_input(*args, **kwargs):
+    """payload {fileId} -> 문서 id.
+
+    삭제·다운로드가 받는 모양이 같아서 하나로 쓴다. 서로 달라지면 그때 나눈다.
+
+    명세는 fileId 를 문자열로 보내는데 DB 는 정수 id 다. 문자열 그대로 넘기면
+    프로시저가 에러 없이 null 을 돌려준다(실측). 그래서 숫자면 정수로 바꾼다.
+    """
+    file_id = (args[0].get("payload") or {})["fileId"]
+    return int(file_id) if str(file_id).isdigit() else file_id
+
+
+@work_regist("file_list_output")
+def file_list_output(*args, **kwargs):
+    """DB 행 목록 -> 클라이언트가 읽는 모양.
+
+    다른 _LIST 와 달리 배열 그 자체를 돌려준다. 클라이언트가 result 를 그대로
+    files 상태에 넣고 map 을 돌린다(AppState.fetchFiles).
+    """
+    rows = args[0] or []
+    return [
+        {
+            "id": str(row.get("id")),
+            "name": row.get("filename") or row.get("source_path") or "",
+            "workCategory": row.get("work_category"),
+            "task": row.get("task_name"),
+            "department": row.get("department"),
+            "reportType": row.get("report_type"),
+            "productionYear": row.get("production_year"),
+        }
+        for row in rows
+    ]
+
+
+@work_regist("file_delete_output")
+def file_delete_output(*args, **kwargs):
+    """삭제된 id -> {}.
+
+    클라이언트는 이 결과를 읽지 않는다(FileService.deleteFile 이 반환값을 버린다).
+    그래도 dict 을 돌려주는 이유는 TaskResponse.result 가 dict 만 받기 때문이다 —
+    id 를 그대로 내보내면 pydantic 이 거부해서 응답이 500 으로 터진다.
+    """
+    return {}
+
+
+#────────────────────────────────────────────────┌> 파일 업로드
+
+import base64
+import os
+import re
+
+# 업로드된 원본이 쌓이는 곳. TEST_FILE_PATH 가 가리키던 자리와 같다.
+DOCUMENT_DIR = os.environ.get("RAG_DOCUMENT_DIR", "documents")
+
+# 색인이 먼저다. register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
+tasks["FILE_UPLOAD"] = ["file_upload_input", "file_upload_index", "file_upload_register"]
+tasks["DICTIONARY_LIST"] = ["get_vocab"]
+
+def _safe_name(name: str) -> str:
+    """경로 구분자와 상위 이동을 걷어낸다.
+
+    이름은 클라이언트가 보내는 값이라 그대로 믿고 열면 "../../" 로 아무 데나 쓸 수
+    있다. 파일명만 남기고 남은 위험한 문자도 지운다.
+    """
+    name = os.path.basename(name or "").replace("\\", "/").split("/")[-1]
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', "", name).strip(". ")
+    if not name:
+        raise ValueError("파일 이름이 비어 있습니다.")
+    return name
+
+
+@work_regist("file_upload_input")
+def file_upload_input(*args, **kwargs):
+    """payload 의 base64 를 파일로 떨구고, register_document 가 받는 dict 을 만든다.
+
+    색인(파싱·임베딩)은 여기서 하지 않는다. 클라이언트 XHR 타임아웃이 60초인데
+    임베딩만 수백 초라 반드시 실패한다. 등록을 먼저 해두면 나중에 같은 source_path
+    로 색인할 때 프로시저가 그 행의 RAG 컬럼만 채우고 분류값은 보존한다.
+    """
+    payload = args[0].get("payload") or {}
+    name = _safe_name(payload.get("name"))
+    content = payload.get("content")
+    if not content:
+        raise ValueError("파일 내용(content)이 비어 있습니다.")
+
+    os.makedirs(DOCUMENT_DIR, exist_ok=True)
+    path = os.path.join(DOCUMENT_DIR, name)
+    raw = base64.b64decode(content)
+    with open(path, "wb") as f:
+        f.write(raw)
+    print(f"[file_upload_input] 저장: {path} ({len(raw):,} bytes)")
+
+    # register_document 가 **kwargs 로 받는 키 이름에 맞춘다(클라이언트는 camelCase).
+    # production_year 는 프로시저가 정수로 받는다. 클라이언트는 문자열로 보내는데
+    # 그대로 넘기면 db_call 이 예외를 삼키고 None 을 돌려줘 조용히 등록이 안 된다.
+    year = payload.get("productionYear")
+    year = int(year) if year not in (None, "") and str(year).isdigit() else None
+
+    return {
+        "production_year": year,
+        "source_path": path.replace("\\", "/"),
+        "work_category": payload.get("workCategory"),
+        "task": payload.get("task"),
+        "department": payload.get("department"),
+        "report_type": payload.get("reportType"),
+    }
+
+
+@work_regist("file_upload_register")
+def file_upload_register(*args, **kwargs):
+    """색인된 문서에 업무 분류값을 붙이고, 클라이언트가 읽는 {fileId, status, chunks} 로 만든다.
+
+    분류값 등록이 실패해도 업로드를 실패로 만들지 않는다. 색인은 이미 끝났고 문서는
+    검색된다 — 분류값이 비어 있을 뿐이라 나중에 수정 화면에서 채우면 된다.
+    """
+    document_id, meta, chunks = args[0]
+    if not db_call("register_document", **meta):
+        print("[file_upload_register] 분류값 등록 실패 — 색인은 완료됨")
+    return {"fileId": str(document_id), "status": "ready", "chunks": chunks}
+
+
+
+@work_regist("get_vocab")
+def list_all_words(*args, **kwargs):
+        vocab =db_call("list_all_words")
+        print(f"[list_all_words] DB 단어 추출 — {(vocab)}")
+        return {"entries": vocab}
+
