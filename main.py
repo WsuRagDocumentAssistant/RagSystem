@@ -4,6 +4,7 @@
 #================================================
 
 from multiprocessing import Queue
+import multiprocessing
 import logging
 import os
 import queue
@@ -205,6 +206,15 @@ def menu_loop(taskcontroller, taskexecutor, stop_event):
 
 
 if __name__ == "__main__":
+
+    # CUDA 는 fork 된 프로세스에서 다시 초기화될 수 없다. 리눅스의 기본 시작 방식이
+    # fork 라, 부모가 CUDA 를 건드린 뒤 워커를 띄우면 리랭커 로딩에서 이렇게 죽는다:
+    #   RuntimeError: Cannot re-initialize CUDA in forked subprocess
+    # Windows 는 원래 spawn 이라 개발 중에는 드러나지 않고 배포에서만 터진다.
+    #
+    # 프로세스를 하나라도 만들기 전에 불러야 한다. TaskExecutor / TaskController 는
+    # 기본 컨텍스트를 쓰므로 여기서 바꾸면 그대로 따라온다 — 라이브러리는 손댈 필요 없다.
+    multiprocessing.set_start_method("spawn", force=True)
 
     logging.basicConfig(level=logging.INFO,
                         format="[%(name)s] %(levelname)s %(message)s")
