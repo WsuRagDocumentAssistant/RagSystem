@@ -37,7 +37,24 @@ RERANKER_MODEL_PATH = os.environ.get("RAG_RERANKER_MODEL", "models/bge-reranker-
 
 # None 이면 라이브러리 자동 감지. GPU 가 있으면 "cuda" 를 명시하는 편이 낫다
 # (안 주면 가중치가 CPU 에 남아 배치마다 복사된다).
-DEVICE = os.environ.get("RAG_DEVICE") or None
+def _default_device() -> str | None:
+    """GPU 가 있으면 "cuda", 없으면 None(=라이브러리 자동 감지).
+
+    device 를 안 넘기면 가중치가 CPU 에 남고 연산할 때만 GPU 로 복사된다 —
+    ragmodul 이 실측으로 확인해 문서에 적어둔 동작이다. 매 배치마다 복사가 일어나서
+    GPU 를 붙여놓고도 제 속도가 안 나온다. 그래서 있으면 명시해 올려둔다.
+
+    torch import 는 여기서 한다. 모듈을 읽는 것만으로 무거운 import 를 하지 않도록.
+    """
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else None
+    except Exception:                      # torch 가 없거나 깨져 있어도 죽지 않는다
+        return None
+
+
+# RAG_DEVICE 로 강제할 수 있다("cuda" / "cuda:1" / "cpu"). 없으면 위 규칙을 따른다.
+DEVICE = os.environ.get("RAG_DEVICE") or _default_device()
 
 UNPACK_DIR = os.environ.get("RAG_UNPACK_DIR", "unpacked")
 HWPX_FILE_PATH = os.environ.get("RAG_HWPX_FILE", "C:/Users/user/Desktop/RagSystem/test_file/2주기(2023년) 2022 ~ 2024 대학혁신지원사업 성과평가보고서.hwpx")

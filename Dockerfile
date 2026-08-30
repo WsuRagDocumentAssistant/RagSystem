@@ -1,4 +1,4 @@
-FROM 117.16.166.23:80/wsu/rag-model-base:v1
+FROM 117.16.166.23:80/wsu/rag-model-base:v2
 WORKDIR /app
 
 # 1) 의존성 레이어
