@@ -551,11 +551,10 @@ def ensure_session(*args, **kwargs):
         print(f"[ensure_session] user_id 가 아닌 토큰({user_id!r}) — 세션 없이 진행")
         return req
 
-    # timeout_minutes=0 으로 강제 생성한다. 기본값(30분)이면 같은 사용자가 30분 안에
-    # 새 대화를 열어도 기존 세션을 그대로 돌려줘서, 방을 둘 만들어도 새로고침하면
-    # 하나로 합쳐진다(실제로 겪었다). 세션 생성 전용 함수가 db_manager 에 없어서
-    # 타임아웃을 0 으로 줘 우회한다.
-    created = db_call("get_or_create_session", user_id=user_id, timeout_minutes=0)
+    # create_new_session 은 "새채팅" 전용이라 시간과 무관하게 항상 새로 만든다.
+    # get_or_create_session 을 쓰면 30분 안에 연 대화가 기존 세션으로 합쳐진다
+    # (방을 둘 만들어도 새로고침하면 하나가 됐다).
+    created = db_call("create_new_session", user_id=user_id)
     session_id = created.get("session_id") if isinstance(created, dict) else created
     if not session_id:
         print("[ensure_session] 세션 생성 실패 — 세션 없이 진행")
@@ -568,12 +567,25 @@ def ensure_session(*args, **kwargs):
 
 @work_regist("delete_session")
 def delete_session(*args, **kwargs):
-    req = args[0]
-    session_id = req.get("payload", {}).get("sessionId")
-    print(f"[delete_session] 섹션 삭제 {session_id}")
-    count = db_call("delete_session", session_id=session_id)
-    print(f"[delete_session] 섹션 삭제 {count}개")
-    return count
+    """대화 하나를 지운다. 명세대로 빈 객체를 돌려준다.
+
+    session_repo.delete 는 bool 을 준다. 그대로 내보내면 TaskResponse.result 가
+    dict 만 받아서 pydantic 이 거부한다.
+
+    실패를 성공으로 넘기지 않는다 — 사용자는 지워진 줄 알고 새로고침에서 다시
+    보게 된다. messages.session_id 에 ON DELETE CASCADE 가 없으면 대화가 남은
+    세션은 FK 제약으로 삭제되지 않는다.
+    """
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    session_id = (req.get("payload") or {}).get("sessionId")
+    if not _is_uuid(session_id):
+        raise ValueError(f"올바른 sessionId 가 아닙니다: {session_id!r}")
+
+    deleted = db_call("delete_session", session_id=session_id)
+    print(f"[delete_session] {session_id} 삭제 결과: {deleted}")
+    if not deleted:
+        raise ValueError("대화를 삭제하지 못했습니다. 이미 삭제됐거나 메시지가 남아 있습니다.")
+    return {}
 
 @work_regist("save_conversation")
 def save_conversation(*args, **kwargs):
@@ -636,3 +648,5 @@ def external_api_sync_output(*args, **kwargs):
     row = args[0] or {}
     fetched = row.get("date") or row.get("fetched_at")
     return {"fetchedAt": str(fetched) if fetched else None}
+
+
