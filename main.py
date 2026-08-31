@@ -168,14 +168,27 @@ def _to_task_result(task, result, TaskResult):
     if isinstance(result, TaskExecutionError):
         # traceback 은 로그로만. HTTP 응답에 실으면 내부 구조가 샌다.
         logger.error("job_id=%s 작업 실패: %s", task.job_id, result.tb)
-        return TaskResult(task.job_id, False,
-                          error=f"작업 실행에 실패했습니다: {task.task_type}")
+        return TaskResult(task.job_id, False, error=_error_message(result, task))
 
     # 응답 모양은 각 task 의 마지막 work 이 맞춘다(user_query_output 등). 여기서는
     # 손대지 않는다. dict/list 가 아닌 값을 돌려주면 TaskResponse 가 거부하므로, 그건
     # 그 task 에 출력 work 이 빠졌다는 뜻이다.
     logger.info("완료 job_id=%s", task.job_id)
     return TaskResult(task.job_id, True, data=result)
+
+
+def _error_message(failure, task) -> str:
+    """실패를 클라이언트에게 알릴 문장으로 바꾼다.
+
+    work 이 던진 ValueError 는 "payload 에 query 가 없습니다" 처럼 사용자에게
+    보여줄 목적으로 쓴 메시지다. 그것까지 뭉뚱그리면 무엇이 잘못됐는지 알 수 없다.
+    그 밖의 예외는 내부 사정이라 한 문장으로 덮는다.
+    """
+    last = (failure.tb or "").strip().splitlines()[-1:] or [""]
+    head, _, detail = last[0].partition(": ")
+    if head.strip() == "ValueError" and detail:
+        return detail.strip()
+    return f"작업 실행에 실패했습니다: {task.task_type}"
 
 
 def print_task():
