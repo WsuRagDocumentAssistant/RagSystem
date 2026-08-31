@@ -275,9 +275,13 @@ if __name__ == "__main__":
         # 이미지와 원본 문서를 브라우저가 열 수 있게 내보낸다. 라우터는 /api/task 하나만
         # 갖고 있어서 파일을 줄 통로가 없다 — 라우터 패키지를 고치는 대신 여기서
         # 그쪽 FastAPI 앱에 정적 경로만 얹는다.
+        #
+        # /api 아래에 둔다. 게이트웨이가 /api 프리픽스만 이 서버로 보내기 때문에,
+        # 그 밖의 경로로 두면 요청이 프론트엔드로 흘러가 index.html 이 내려온다
+        # (다운로드가 .html 로 받아진다).
         from fastapi.staticfiles import StaticFiles
 
-        for url_path, directory in (("/images", IMAGE_DIR), ("/documents", DOCUMENT_DIR)):
+        for url_path, directory in (("/api/images", IMAGE_DIR), ("/api/documents", DOCUMENT_DIR)):
             os.makedirs(directory, exist_ok=True)
             gateway.app.mount(url_path, StaticFiles(directory=directory), name=url_path.strip("/"))
         logger.info("정적 경로 연결: /images -> %s, /documents -> %s", IMAGE_DIR, DOCUMENT_DIR)

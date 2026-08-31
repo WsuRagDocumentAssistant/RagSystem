@@ -423,6 +423,18 @@ def answer_function(*args, **kwargs):
 
     if not answers:
         raise RuntimeError(f"다듬기가 전부 실패했습니다: {providers}")
+    # 출처를 요청에 담아 흘려보낸다. 체인은 값 하나만 넘기는데 마지막 단계
+    # (user_query_output)가 sources 를 채워야 하고, contexts 는 여기서 끊긴다.
+    seen, sources = set(), []
+    for context in contexts:
+        key = context.document_id
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        sources.append({"id": str(key), "name": context.document_title or ""})
+    req["_sources"] = sources
+    print(f"[answer_function] 출처 {len(sources)}건")
+
     return req, [{"provider": name, "answer": text} for name, text in answers.items()]
 
 
@@ -546,7 +558,7 @@ def user_query_output(*args, **kwargs):
         "reply": answers[0]["answer"] if answers else "",
         "answers": answers,
         "sessionId": req.get("session_id"),
-        "sources": [],
+        "sources": req.get("_sources") or [],
     }
 
 

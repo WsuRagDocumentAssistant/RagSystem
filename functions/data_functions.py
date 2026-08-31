@@ -551,7 +551,11 @@ def ensure_session(*args, **kwargs):
         print(f"[ensure_session] user_id 가 아닌 토큰({user_id!r}) — 세션 없이 진행")
         return req
 
-    created = db_call("get_or_create_session", user_id=user_id)
+    # timeout_minutes=0 으로 강제 생성한다. 기본값(30분)이면 같은 사용자가 30분 안에
+    # 새 대화를 열어도 기존 세션을 그대로 돌려줘서, 방을 둘 만들어도 새로고침하면
+    # 하나로 합쳐진다(실제로 겪었다). 세션 생성 전용 함수가 db_manager 에 없어서
+    # 타임아웃을 0 으로 줘 우회한다.
+    created = db_call("get_or_create_session", user_id=user_id, timeout_minutes=0)
     session_id = created.get("session_id") if isinstance(created, dict) else created
     if not session_id:
         print("[ensure_session] 세션 생성 실패 — 세션 없이 진행")

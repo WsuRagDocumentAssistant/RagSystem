@@ -142,7 +142,16 @@ def file_id_input(*args, **kwargs):
     프로시저가 에러 없이 null 을 돌려준다(실측). 그래서 숫자면 정수로 바꾼다.
     """
     file_id = (args[0].get("payload") or {})["fileId"]
-    return int(file_id) if str(file_id).isdigit() else file_id
+
+    # 문서 id 는 정수다. 클라이언트가 업로드 응답을 못 받으면 자기가 만든 임시 id
+    # ("tmp-1788139009759-ptze")를 그대로 보내는데, 그걸 통과시키면 DB 가 거절하고
+    # 우리는 success 에 빈 값을 실어 보내게 된다 — 클라이언트는 성공인 줄 안다.
+    # 여기서 막아 무엇이 잘못됐는지 알려준다.
+    if not str(file_id).isdigit():
+        raise ValueError(
+            f"올바른 문서 id 가 아닙니다: {file_id!r}. "
+            "업로드 응답을 받지 못해 임시 id 를 보내고 있는지 확인하세요.")
+    return int(file_id)
 
 
 @work_regist("file_list_output")
@@ -360,7 +369,7 @@ def file_download_output(*args, **kwargs):
         print(f"[file_download_output] 원본 파일 없음: {row.get('source_path')!r}")
         return {"url": None}
 
-    return {"url": _static_url(str(path), DOCUMENT_DIR, "/documents")}
+    return {"url": _static_url(str(path), DOCUMENT_DIR, "/api/documents")}
 
 
 @work_regist("file_image_list_output")
@@ -387,7 +396,7 @@ def file_image_list_output(*args, **kwargs):
         images.append({
             "id": str(r.get("id")),
             "index": index,
-            "imageUrl": _static_url(r.get("image_path") or "", IMAGE_DIR, "/images"),
+            "imageUrl": _static_url(r.get("image_path") or "", IMAGE_DIR, "/api/images"),
             "caption": None,
             "majorTitle": None,
             "midTitle": None,
