@@ -21,6 +21,12 @@ envFromSecrets:
   - rag-postgres-secret
   - rag-app-secret
 
+storage:
+  enabled: true
+  pvcName: rag-storage-pvc
+  documentMountPath: /app/documents
+  imageMountPath: /app/images
+
 gpu:
   enabled: true
   count: 1

@@ -42,10 +42,19 @@ spec:
           volumeMounts:
             - name: logs
               mountPath: {{ .Values.logs.mountPath }}
+            - name: storage
+              mountPath: {{ .Values.storage.documentMountPath }}
+              subPath: documents
+            - name: storage
+              mountPath: {{ .Values.storage.imageMountPath }}
+              subPath: images
           {{- end }}
       {{- if .Values.logs.enabled }}
       volumes:
         - name: logs
           persistentVolumeClaim:
             claimName: {{ .Values.logs.pvcName }}
+        - name: storage
+          persistentVolumeClaim:
+            claimName: {{ .Values.storage.pvcName }}
       {{- end }}
