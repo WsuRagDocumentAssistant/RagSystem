@@ -162,10 +162,16 @@ def file_list_output(*args, **kwargs):
     files 상태에 넣고 map 을 돌린다(AppState.fetchFiles).
     """
     rows = args[0] or []
+
+    # DB 의 filename 은 hwpx 내부 이름이라 확장자가 없다(실측). 그대로 내보내면
+    # 클라이언트가 그 이름으로 파일을 저장해 확장자 없는 파일이 떨어진다.
+    # documents/ 에 원본이 있으면 실제 파일명(확장자 포함)을 쓴다.
+    disk = _document_files_by_stem()
+
     return [
         {
             "id": str(row.get("id")),
-            "name": row.get("filename") or row.get("source_path") or "",
+            "name": _display_name(row, disk),
             "workCategory": row.get("work_category"),
             "task": row.get("task_name"),
             "department": row.get("department"),
@@ -309,6 +315,25 @@ def list_all_words(*args, **kwargs):
 #────────────────────────────────────────────────┌> 다운로드 / 이미지
 
 IMAGE_DIR = os.environ.get("RAG_IMAGE_DIR", "images")
+
+
+def _document_files_by_stem() -> dict:
+    """documents/ 의 파일을 {확장자 뺀 이름: 실제 파일명} 으로 모은다.
+
+    행마다 폴더를 훑지 않도록 한 번만 읽는다.
+    """
+    from pathlib import Path
+
+    folder = Path(DOCUMENT_DIR)
+    if not folder.is_dir():
+        return {}
+    return {p.stem: p.name for p in folder.iterdir() if p.is_file()}
+
+
+def _display_name(row: dict, disk: dict) -> str:
+    """클라이언트에 보여줄(그리고 저장될) 파일 이름."""
+    stem = row.get("filename") or row.get("source_path") or ""
+    return disk.get(stem, stem)
 
 
 def _static_url(path: str, root: str, prefix: str) -> str | None:
