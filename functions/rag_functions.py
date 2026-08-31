@@ -23,6 +23,7 @@ DB 는 RagController 를 거치지 않는다(use_db=False). 저장 프로시저�
 
 import json
 import os
+import typing
 
 from taskcontroller import work_regist, tasks
 from ragmodul import RagController, chunk, parse
@@ -103,6 +104,35 @@ tasks.update({
     "Merge": ["merge_function"],
 })
 
+#------------------------------------------------┌> 업로드 체인이 나르는 것
+
+
+class UploadStep(typing.NamedTuple):
+    """업로드 체인이 단계 사이로 넘기는 값.
+
+    체인은 값 하나만 넘기는데 마지막 단계(register_document)가 업무 분류값(meta)을
+    필요로 한다. 그래서 meta 를 값과 함께 묶어 끝까지 들고 간다.
+
+    RAG 태스크와 메뉴는 값 하나만 넘기므로 각 work 은 두 모양을 다 받는다 —
+    _step_in 이 그걸 흡수하고 _step_out 이 원래 모양대로 돌려준다.
+    """
+    meta: dict
+    value: typing.Any
+
+
+def _step_in(args):
+    """(meta, 값) 또는 값 단독 -> (meta 또는 None, 값)."""
+    value = args[0] if args else None
+    if isinstance(value, UploadStep):
+        return value.meta, value.value
+    return None, value
+
+
+def _step_out(meta, value):
+    """meta 가 있으면 다시 묶고, 없으면 값만 돌려준다."""
+    return UploadStep(meta, value) if meta is not None else value
+
+
 #------------------------------------------------┌> 지연 생성
 
 _controller: RagController | None = None
@@ -155,7 +185,8 @@ def parse_function(*args, **kwargs):
     FILE_UPLOAD 는 앞 work 이 방금 저장한 경로를 넘겨준다. 메뉴로 돌리는 test_ 태스크는
     params 가 None 이라 args 가 비고, 그때는 상수로 떨어진다. 문자열만 경로로 인정한다.
     """
-    file_path = args[0] if args and isinstance(args[0], str) and args[0] else HWPX_FILE_PATH
+    meta, value = _step_in(args)
+    file_path = value if isinstance(value, str) and value else HWPX_FILE_PATH
     if not file_path:
         raise ValueError(
             "문서 경로가 비어 있습니다. RAG_HWPX_FILE 환경변수나 "
@@ -164,16 +195,17 @@ def parse_function(*args, **kwargs):
     print(f"[parse_function] 파싱 시작: {file_path}")
     parsed = parse(file_path, unpack_dir=UNPACK_DIR, image_dir=IMAGE_PATH)
     print(f"[parse_function] 파싱 종료: block {len(parsed.blocks)}개")
-    return parsed
+    return _step_out(meta, parsed)
 
 
 @work_regist("chunk_function")
 def chunk_function(*args, **kwargs):
     """DocumentModel -> ChunkedDocument (parent/child)."""
-    document = chunk(args[0])
+    meta, parsed = _step_in(args)
+    document = chunk(parsed)
     print(f"[chunk_function] 청킹 종료: parent {len(document.parents)}, "
           f"child {len(document.children())}")
-    return document
+    return _step_out(meta, document)
 
 
 @work_regist("embed_function")
@@ -183,9 +215,10 @@ def embed_function(*args, **kwargs):
     forward 를 한 번만 돌린다. 예전에는 dense 와 sparse 를 따로 불러서 같은 텍스트를
     두 번 추론했다 — 실측(child 374개) 530초에서 265초로 줄었다.
     """
-    document = get_controller().embed_bge_m3(args[0])
+    meta, parsed = _step_in(args)
+    document = get_controller().embed_bge_m3(parsed)
     print(f"[embed_function] 임베딩 종료: child {len(document.children())}개")
-    return document
+    return _step_out(meta, document)
 
 
 @work_regist("save_function")
@@ -199,7 +232,7 @@ def save_function(*args, **kwargs):
     같은 source_path 면 프로시저가 RAG 컬럼만 갱신하고 업무 분류값(production_year,
     work_category 등)은 보존한다.
     """
-    document = args[0]
+    meta, document = _step_in(args)
     rag = get_controller()
     document_id = db_call(
         "index_document",
@@ -208,7 +241,9 @@ def save_function(*args, **kwargs):
     )
     print(f"[save_function] 저장 종료: document_id={document_id}, "
           f"child {len(document.children())}개")
-    return document_id
+    # 업로드 체인은 다음 단계(register_images)가 document 를 봐야 해서 함께 넘긴다.
+    # RAG 태스크와 메뉴는 예전처럼 document_id 하나만 받는다.
+    return _step_out(meta, (document_id, document)) if meta is not None else document_id
 
 #------------------------------------------------┌> 축약어 사전
 
@@ -223,11 +258,14 @@ def vocab_function(*args, **kwargs):
 
     다음 단계들이 문서도 필요하므로 함께 실어 보낸다.
     """
-    document = args[0]
+    meta, document = _step_in(args)
     text = "/n/n".join(parent.content for parent in document.parents)
+    # 실패를 삼키지 않는다. 이 단계는 색인 저장(save_function)보다 앞이라, 여기서
+    # 멈추면 DB 에 아무것도 안 들어간다 — 어중간한 상태가 남지 않는다.
+    # 사전 없이 색인된 문서를 만드는 것보다 실패를 알리고 다시 올리게 하는 편이 낫다.
     pairs = get_controller().extract_vocab(text, provider=VOCAB_PROVIDER)
     print(f"[vocab_function] {len(text):,}자 -> {len(pairs)}짝")
-    return pairs, document
+    return _step_out(meta, (pairs, document))
 
 
 @work_regist("filter_vocab_function")
@@ -238,13 +276,13 @@ def filter_vocab_function(*args, **kwargs):
     프롬프트를 바꿨을 때의 안전망이다. 버린 것도 이유와 함께 찍어서 규칙이 정상
     항목을 오탐하면 보이게 한다.
     """
-    pairs, document = args[0]
+    meta, (pairs, document) = _step_in(args)
     kept, dropped = get_controller().filter_vocab(pairs)
     for pair in kept:
         print(f"[filter_vocab_function] {pair.term} -> {pair.expansion}")
     for pair, reason in dropped:
         print(f"[filter_vocab_function] 버림({reason}) {pair.term}")
-    return kept, document
+    return _step_out(meta, (kept, document))
 
 
 @work_regist("save_vocab_function")
@@ -253,13 +291,13 @@ def save_vocab_function(*args, **kwargs):
 
     다음 단계(임베딩)가 문서를 받아야 하므로 문서를 돌려준다.
     """
-    kept, document = args[0]
+    meta, (kept, document) = _step_in(args)
     added = db_call(
         "save_vocab_pairs",
         pairs=[{"term": p.term, "expansion": p.expansion} for p in kept],
     )
     print(f"[save_vocab_function] 확장어 {added}개 추가")
-    return document
+    return _step_out(meta, document)
 
 
 def load_vocab() -> dict:
@@ -519,33 +557,16 @@ def merge_output(*args, **kwargs):
     return {"reply": merged.get("answer", ""), "provider": merged.get("provider")}
 
 
-@work_regist("file_upload_index")
-def file_upload_index(*args, **kwargs):
-    """업로드된 파일을 색인한다. (document_id, meta, chunk 수) 를 돌려준다.
+@work_regist("register_images")
+def register_images(*args, **kwargs):
+    """파서가 빼낸 이미지를 document_images 에 등록한다. 업로드 체인의 한 단계다.
 
-    register_document 는 '이미 임베딩된 문서' 에만 분류값을 붙일 수 있다 — 없으면
-    프로시저가 거절한다. 그래서 색인이 먼저다.
-
-    기존 work 을 그대로 불러 쓴다. 여기서 파싱·청킹을 다시 구현하면 색인 경로가 둘로
-    갈려서 한쪽만 고쳐지고 조용히 어긋난다.
+    실패해도 업로드를 실패로 만들지 않는다. 이미지는 본문 검색에 안 쓰이고, 목록이
+    비는 것과 색인을 통째로 되돌리는 것은 무게가 다르다.
     """
-    meta = args[0]
-    document = chunk_function(parse_function(meta["source_path"]))
-
-    # 축약어 사전. RAG 태스크와 같은 단계를 거친다 — 여기서 빠뜨리면 업로드한 문서는
-    # 사전에 한 줄도 안 들어가고, 나중에 그 축약어로 검색해도 확장이 안 걸린다.
-    #
-    # 실패해도 업로드를 실패로 만들지 않는다. 문서 전체를 LLM 에 넘기는 단계라
-    # 외부 API 사정으로 깨질 수 있는데, 사전이 비었다고 색인까지 되돌릴 이유는 없다.
-    try:
-        document = save_vocab_function(filter_vocab_function(vocab_function(document)))
-    except Exception as e:                                   # noqa: BLE001
-        print(f"[file_upload_index] 사전 추출 실패, 건너뜀: {type(e).__name__} - {e}")
-
-    embed_function(document)
-    document_id = save_function(document)
+    meta, (document_id, document) = _step_in(args)
     _register_images(document, document_id)
-    return document_id, meta, len(document.children())
+    return _step_out(meta, (document_id, len(document.children())))
 
 
 def _register_images(document, document_id: int) -> int:

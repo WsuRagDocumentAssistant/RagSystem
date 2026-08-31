@@ -5,6 +5,7 @@
 
 from taskcontroller import work_regist, tasks
 from functions.data_functions import db_call, _to_millis   # DB 호출은 예외처리까지 묶여 있다
+from functions.rag_functions import UploadStep, _step_in       # 업로드 체인이 meta 를 나르는 방법
 
 # 통신모듈 붙기 전까지 첫 work 에 입력을 넣어주는 자리
 TEST_DOCUMENT_ID     = 14
@@ -191,7 +192,13 @@ import re
 DOCUMENT_DIR = os.environ.get("RAG_DOCUMENT_DIR", "documents")
 
 # 색인이 먼저다. register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
-tasks["FILE_UPLOAD"] = ["file_upload_input", "file_upload_index", "file_upload_register"]
+# 색인이 먼저다 — register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
+# 업무 분류값(meta)은 UploadStep 에 실려 단계 사이를 통과한다(rag_functions).
+tasks["FILE_UPLOAD"] = ["file_upload_input",
+                        "parse_function", "chunk_function",
+                        "vocab_function", "filter_vocab_function", "save_vocab_function",
+                        "embed_function", "save_function", "register_images",
+                        "file_upload_register"]
 # get_vocab 은 DB 원본(word/replacement)을 그대로 준다. 클라이언트는 term/synonyms 로
 # 읽으므로 변환 단계를 뒤에 붙인다(data_functions 의 dictionary_list_output).
 tasks["DICTIONARY_LIST"] = ["get_vocab", "dictionary_list_output"]
@@ -230,13 +237,15 @@ def file_upload_input(*args, **kwargs):
         f.write(raw)
     print(f"[file_upload_input] 저장: {path} ({len(raw):,} bytes)")
 
+    # 이 뒤로는 meta 를 UploadStep 에 실어 나른다. 체인이 값 하나만 넘기는데
+    # 마지막 단계(register_document)가 분류값을 필요로 하기 때문이다.
     # register_document 가 **kwargs 로 받는 키 이름에 맞춘다(클라이언트는 camelCase).
     # production_year 는 프로시저가 정수로 받는다. 클라이언트는 문자열로 보내는데
     # 그대로 넘기면 db_call 이 예외를 삼키고 None 을 돌려줘 조용히 등록이 안 된다.
     year = payload.get("productionYear")
     year = int(year) if year not in (None, "") and str(year).isdigit() else None
 
-    return {
+    meta = {
         "production_year": year,
         "source_path": path.replace("\\", "/"),
         "work_category": payload.get("workCategory"),
@@ -244,6 +253,8 @@ def file_upload_input(*args, **kwargs):
         "department": payload.get("department"),
         "report_type": payload.get("reportType"),
     }
+    # 다음 단계는 parse_function 이다. 값 자리에 파싱할 경로를 넣는다.
+    return UploadStep(meta, meta["source_path"])
 
 
 @work_regist("file_upload_register")
@@ -253,7 +264,7 @@ def file_upload_register(*args, **kwargs):
     분류값 등록이 실패해도 업로드를 실패로 만들지 않는다. 색인은 이미 끝났고 문서는
     검색된다 — 분류값이 비어 있을 뿐이라 나중에 수정 화면에서 채우면 된다.
     """
-    document_id, meta, chunks = args[0]
+    meta, (document_id, chunks) = _step_in(args)
 
     # register_document 는 source_path 로 색인된 문서를 찾는다. 그런데 색인이 저장하는
     # source_path 는 우리가 넘긴 업로드 경로가 아니라 hwpx 문서 내부의 제목이다
@@ -309,18 +320,47 @@ def _static_url(path: str, root: str, prefix: str) -> str | None:
     return f"{prefix}/" + quote(rel.as_posix())
 
 
+def _find_document_file(row: dict):
+    """DB 행에 대응하는 원본 파일을 documents/ 에서 찾는다. 없으면 None.
+
+    경로를 그대로 쓸 수 없다. 색인이 저장하는 source_path 는 우리가 넘긴 업로드
+    경로가 아니라 hwpx 내부 이름이고, 확장자도 폴더도 없다(실측: 파일이
+    "documents/보고서.hwpx" 여도 source_path 는 "보고서").
+
+    그래서 이름(stem)이 같은 파일을 폴더에서 찾는다. 업로드하지 않고 색인만 된
+    문서는 애초에 원본이 없으므로 None 이 맞다.
+    """
+    from pathlib import Path
+
+    stem = (row.get("source_path") or row.get("filename") or "").strip()
+    if not stem:
+        return None
+
+    stem = Path(stem).stem          # 혹시 확장자가 붙어 와도 벗긴다
+    folder = Path(DOCUMENT_DIR)
+    if not folder.is_dir():
+        return None
+
+    for path in folder.iterdir():
+        if path.is_file() and path.stem == stem:
+            return path
+    return None
+
+
 @work_regist("file_download_output")
 def file_download_output(*args, **kwargs):
     """문서 행 -> 클라이언트가 읽는 {url}.
 
-    업로드로 들어온 문서만 원본 파일이 있다. 그 전에 색인만 된 문서는 source_path 가
-    hwpx 내부 제목이라 실제 파일이 없고, 그때는 url 이 비어 나간다.
+    업로드로 들어온 문서만 원본 파일이 있다. 색인만 된 문서는 url 이 비어 나간다 —
+    클라이언트가 다운로드 버튼을 눌러도 받을 게 없다는 뜻이다.
     """
     row = args[0] or {}
-    url = _static_url(row.get("source_path") or "", DOCUMENT_DIR, "/documents")
-    if url is None:
+    path = _find_document_file(row)
+    if path is None:
         print(f"[file_download_output] 원본 파일 없음: {row.get('source_path')!r}")
-    return {"url": url}
+        return {"url": None}
+
+    return {"url": _static_url(str(path), DOCUMENT_DIR, "/documents")}
 
 
 @work_regist("file_image_list_output")
