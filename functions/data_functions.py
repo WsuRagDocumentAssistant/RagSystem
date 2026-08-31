@@ -568,9 +568,10 @@ def ensure_session(*args, **kwargs):
 
 @work_regist("delete_session")
 def delete_session(*args, **kwargs):
-    sessionId = args[0]
-    print(f"[delete_session] 섹션 삭제 {sessionId}")
-    count = db_call("delete_session", session_id=sessionId)
+    req = args[0]
+    session_id = req.payload.get("sessionId")
+    print(f"[delete_session] 섹션 삭제 {session_id}")
+    count = db_call("delete_session", session_id=session_id)
     print(f"[delete_session] 섹션 삭제 {count}개")
     return count
 
