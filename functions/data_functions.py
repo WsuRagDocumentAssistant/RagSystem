@@ -309,7 +309,7 @@ tasks["EXTERNAL_API_SYNC"]     = ["api_id_input", "sync_db_api_data",
                                   "external_api_sync_output"]
 tasks["EXTERNAL_API_DELETE"]   = ["api_id_input", "delete_db_api_data_by_id",
                                   "external_api_delete_output"]
-
+tasks["CHAT_SESSION_DELETE"] = []
 
 @work_regist("session_id_input")
 def session_id_input(*args, **kwargs):
@@ -566,6 +566,13 @@ def ensure_session(*args, **kwargs):
     print(f"[ensure_session] 새 세션 {req['session_id']}")
     return req
 
+@work_regist("delete_session")
+def delete_session(*args, **kwargs):
+    sessionId = args[0]
+    print(f"[delete_session] 섹션 삭제 {sessionId}")
+    count = db_call("delete_session", session_id=sessionId)
+    print(f"[delete_session] 섹션 삭제 {count}개")
+    return count
 
 @work_regist("save_conversation")
 def save_conversation(*args, **kwargs):
