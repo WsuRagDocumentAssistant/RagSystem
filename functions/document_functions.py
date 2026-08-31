@@ -127,7 +127,8 @@ def get_report_type_options(*args, **kwargs):
 
 tasks["FILE_LIST"]     = ["list_documents", "file_list_output"]   # payload 없음
 tasks["FILE_DELETE"]   = ["file_id_input", "delete_document", "file_delete_output"]
-tasks["FILE_DOWNLOAD"] = ["file_id_input", "get_document"]
+tasks["FILE_DOWNLOAD"] = ["file_id_input", "get_document", "file_download_output"]
+tasks["FILE_IMAGE_LIST"] = ["file_id_input", "get_document", "file_image_list_output"]
 
 
 @work_regist("file_id_input")
@@ -284,3 +285,77 @@ def list_all_words(*args, **kwargs):
     print(f"[get_vocab] 사전 {len(vocab)}개")
     return {"entries": vocab}
 
+
+#────────────────────────────────────────────────┌> 다운로드 / 이미지
+
+IMAGE_DIR = os.environ.get("RAG_IMAGE_DIR", "images")
+
+
+def _static_url(path: str, root: str, prefix: str) -> str | None:
+    """서버 로컬 경로 -> 브라우저가 열 수 있는 URL.
+
+    main.py 가 /documents 와 /images 를 정적 경로로 내보낸다. 그 아래에 있는 파일만
+    URL 로 바꾼다 — 밖의 경로를 그대로 노출하면 서버 파일이 새어 나간다.
+    """
+    from pathlib import Path
+    from urllib.parse import quote
+
+    if not path:
+        return None
+    try:
+        rel = Path(path).resolve().relative_to(Path(root).resolve())
+    except (ValueError, OSError):
+        return None
+    return f"{prefix}/" + quote(rel.as_posix())
+
+
+@work_regist("file_download_output")
+def file_download_output(*args, **kwargs):
+    """문서 행 -> 클라이언트가 읽는 {url}.
+
+    업로드로 들어온 문서만 원본 파일이 있다. 그 전에 색인만 된 문서는 source_path 가
+    hwpx 내부 제목이라 실제 파일이 없고, 그때는 url 이 비어 나간다.
+    """
+    row = args[0] or {}
+    url = _static_url(row.get("source_path") or "", DOCUMENT_DIR, "/documents")
+    if url is None:
+        print(f"[file_download_output] 원본 파일 없음: {row.get('source_path')!r}")
+    return {"url": url}
+
+
+@work_regist("file_image_list_output")
+def file_image_list_output(*args, **kwargs):
+    """문서 행 -> 클라이언트가 읽는 {images:[...]}.
+
+    search_document_images 가 문서 id 가 아니라 제목으로 찾는다. 제목이 겹칠 수 있어
+    받은 결과를 document_id 로 한 번 더 거른다.
+
+    caption / majorTitle / aiSummary / keyFacts 등은 document_images 에 컬럼이 없다.
+    빈 값으로 내보내고, 클라이언트가 표시만 못 할 뿐 화면은 뜬다.
+    """
+    row = args[0] or {}
+    document_id = row.get("id")
+    title = row.get("filename") or row.get("source_path") or ""
+
+    rows = db_call("search_document_images", query=title) or []
+    if document_id is not None:
+        matched = [r for r in rows if r.get("document_id") == document_id]
+        rows = matched or rows
+
+    images = []
+    for index, r in enumerate(rows):
+        images.append({
+            "id": str(r.get("id")),
+            "index": index,
+            "imageUrl": _static_url(r.get("image_path") or "", IMAGE_DIR, "/images"),
+            "caption": None,
+            "majorTitle": None,
+            "midTitle": None,
+            "minorTitle": None,
+            "note": None,
+            "aiSummary": None,
+            "keyFacts": [],
+            "keyPhrases": [],
+        })
+    print(f"[file_image_list_output] 이미지 {len(images)}개 (document_id={document_id})")
+    return {"images": images}

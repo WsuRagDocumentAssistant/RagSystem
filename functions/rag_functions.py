@@ -544,4 +544,40 @@ def file_upload_index(*args, **kwargs):
 
     embed_function(document)
     document_id = save_function(document)
+    _register_images(document, document_id)
     return document_id, meta, len(document.children())
+
+
+def _register_images(document, document_id: int) -> int:
+    """파서가 빼낸 이미지를 document_images 에 등록한다. 등록한 개수.
+
+    parse(image_dir=...) 가 이미 images/<문서명>/ 으로 파일을 복사해뒀다. 그 폴더를
+    읽어 DB 에 이름과 경로만 남긴다 — 파일 자체는 /images 정적 경로로 나간다.
+
+    폴더명은 파서가 문서 내부 filename 의 stem 으로 만든다(업로드 파일명이 아니다).
+
+    실패해도 업로드를 실패로 만들지 않는다. 이미지는 본문 검색에 안 쓰이고, 목록이
+    비는 것과 색인을 통째로 되돌리는 것은 무게가 다르다.
+    """
+    import os
+    from pathlib import Path
+
+    try:
+        stem = Path(getattr(document.file, "filename", "") or "document").stem
+        folder = Path(IMAGE_PATH) / stem
+        if not folder.is_dir():
+            print(f"[_register_images] 이미지 폴더 없음: {folder}")
+            return 0
+
+        names = sorted(p.name for p in folder.iterdir() if p.is_file())
+        saved = 0
+        for name in names:
+            row = db_call("create_document_image", document_id=document_id,
+                          image_name=name, image_path=str(folder / name).replace("\\", "/"))
+            if row:
+                saved += 1
+        print(f"[_register_images] 이미지 {saved}/{len(names)}개 등록 (document_id={document_id})")
+        return saved
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[_register_images] 등록 실패, 건너뜀: {type(e).__name__} - {e}")
+        return 0

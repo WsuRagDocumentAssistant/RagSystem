@@ -305,6 +305,8 @@ tasks["DICTIONARY_SAVE"]       = ["dictionary_save_input", "save_db_words",
 tasks["EXTERNAL_API_LIST"]     = ["select_all_db_api_data", "external_api_list_output"]
 tasks["EXTERNAL_API_SAVE"]     = ["create_api_data", "insert_db_api_data",
                                   "embed_api_function", "external_api_save_output"]
+tasks["EXTERNAL_API_SYNC"]     = ["api_id_input", "sync_db_api_data",
+                                  "external_api_sync_output"]
 tasks["EXTERNAL_API_DELETE"]   = ["api_id_input", "delete_db_api_data_by_id",
                                   "external_api_delete_output"]
 
@@ -588,3 +590,37 @@ def save_conversation(*args, **kwargs):
         print(f"[save_conversation] 저장 실패, 답변은 그대로 보냄: {type(e).__name__} - {e}")
 
     return req, answers
+
+
+@work_regist("sync_db_api_data")
+def sync_db_api_data(*args, **kwargs):
+    """등록된 외부 API 한 건을 다시 수집해 저장한다. 갱신된 행을 돌려준다.
+
+    api_all_update 는 전체를 훑지만 명세의 EXTERNAL_API_SYNC 는 한 건만 갱신한다.
+    url 이 PK 라 목록에서 그 행을 찾아 title/source/key 를 그대로 쓰고 데이터만
+    새로 받아온다.
+    """
+    url = args[0]
+    rows = db_call("select_all_api_data") or []
+    row = next((r for r in rows if r.get("url") == url), None)
+    if row is None:
+        raise ValueError(f"등록되지 않은 외부 API 입니다: {url}")
+
+    entity = asyncio.run(collect(ApiEntity(
+        title=row.get("title"), url=row.get("url"),
+        source=row.get("source"), key=row.get("key"))))
+
+    db_call("update_api_data_date", url=url, data=entity.data)
+    print(f"[sync_db_api_data] 갱신: {row.get('title')}")
+
+    # 갱신된 date 를 읽어야 하므로 다시 조회한다
+    rows = db_call("select_all_api_data") or []
+    return next((r for r in rows if r.get("url") == url), row)
+
+
+@work_regist("external_api_sync_output")
+def external_api_sync_output(*args, **kwargs):
+    """갱신된 행 -> 클라이언트가 읽는 {fetchedAt}."""
+    row = args[0] or {}
+    fetched = row.get("date") or row.get("fetched_at")
+    return {"fetchedAt": str(fetched) if fetched else None}
