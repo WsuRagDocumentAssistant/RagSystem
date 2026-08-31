@@ -309,7 +309,7 @@ tasks["EXTERNAL_API_SYNC"]     = ["api_id_input", "sync_db_api_data",
                                   "external_api_sync_output"]
 tasks["EXTERNAL_API_DELETE"]   = ["api_id_input", "delete_db_api_data_by_id",
                                   "external_api_delete_output"]
-tasks["CHAT_SESSION_DELETE"] = []
+tasks["CHAT_SESSION_DELETE"] = ["delete_session"]
 
 @work_regist("session_id_input")
 def session_id_input(*args, **kwargs):
