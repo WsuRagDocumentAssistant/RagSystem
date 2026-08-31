@@ -485,8 +485,11 @@ def embed_api_function(*args, **kwargs):
 # 이름은 클라이언트(src/config/TaskType.js)가 보내는 그대로 쓴다. 기존 test_ 태스크는
 # 손대지 않는다 — 통신부 없이 체인만 돌려보는 통로가 그대로 남아 있어야 한다.
 
-tasks["USER_QUERY"]    = QUERY_CHAIN + ["search_api_function", "answer_function",
-                                        "user_query_output"]
+# 앞에 ensure_session, 뒤에 save_conversation 을 끼운다. 그래야 대화가 세션으로
+# 묶이고 사이드바 목록과 메시지 내역이 채워진다.
+tasks["USER_QUERY"]    = (["ensure_session"] + QUERY_CHAIN
+                          + ["search_api_function", "answer_function",
+                             "save_conversation", "user_query_output"])
 tasks["MERGE_RESULTS"] = ["merge_function", "merge_output"]
 
 

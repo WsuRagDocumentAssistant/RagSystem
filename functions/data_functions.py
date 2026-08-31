@@ -513,3 +513,78 @@ def external_api_save_output(*args, **kwargs):
         "fetchedAt": str(row.get("date") or row.get("fetched_at") or "") or None,
         "refreshIntervalMinutes": None,
     }}
+
+
+#────────────────────────────────────────────────┌> 대화 세션 (USER_QUERY 체인에 끼움)
+
+
+def _is_uuid(value) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+@work_regist("ensure_session")
+def ensure_session(*args, **kwargs):
+    """대화 세션을 확보해 요청에 담는다. 질의 체인의 첫 단계다.
+
+    클라이언트가 보낸 session_id 가 있으면 그대로 이어간다. 없으면(새 대화)
+    get_or_create_session 으로 만든다 — 그래야 응답의 sessionId 로 돌려줄 수 있고,
+    다음 요청부터 같은 대화로 묶인다.
+
+    토큰이 user_id 가 아니면(더미 로그인) 세션 없이 진행한다. 답변은 정상적으로
+    나가고 저장만 안 된다 — 그것 때문에 채팅을 막을 이유는 없다.
+
+    req 를 그대로 돌려준다. 뒤 단계(embed_query_function)가 이걸 받는다.
+    """
+    req = args[0] if args and isinstance(args[0], dict) else {}
+
+    if _is_uuid(req.get("session_id")):
+        return req
+
+    user_id = req.get("token")
+    if not _is_uuid(user_id):
+        print(f"[ensure_session] user_id 가 아닌 토큰({user_id!r}) — 세션 없이 진행")
+        return req
+
+    created = db_call("get_or_create_session", user_id=user_id)
+    session_id = created.get("session_id") if isinstance(created, dict) else created
+    if not session_id:
+        print("[ensure_session] 세션 생성 실패 — 세션 없이 진행")
+        return req
+
+    req["session_id"] = str(session_id)
+    req["_new_session"] = True          # 제목을 붙일지 판단하는 데 쓴다
+    print(f"[ensure_session] 새 세션 {req['session_id']}")
+    return req
+
+
+@work_regist("save_conversation")
+def save_conversation(*args, **kwargs):
+    """질문과 답변을 세션에 남긴다. 답변 직후에 끼운다.
+
+    저장에 실패해도 답변은 그대로 내보낸다 — 이미 만들어진 답을 기록 실패 때문에
+    버릴 이유가 없다.
+
+    (req, answers) 를 그대로 흘려보낸다. 다음 단계가 user_query_output 이다.
+    """
+    req, answers = args[0]
+    session_id = req.get("session_id")
+    if not session_id:
+        return req, answers
+
+    query = (req.get("payload") or {}).get("query") or ""
+    reply = answers[0]["answer"] if answers else ""
+
+    try:
+        db_call("insert_message", session_id=session_id, user_query=query, ai_response=reply)
+        if req.get("_new_session") and query:
+            # 첫 질문을 대화 제목으로 쓴다. 사이드바가 title 을 그대로 보여준다.
+            db_call("update_session_title", session_id=session_id, title=query[:30])
+        print(f"[save_conversation] 세션 {session_id} 에 저장")
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[save_conversation] 저장 실패, 답변은 그대로 보냄: {type(e).__name__} - {e}")
+
+    return req, answers
