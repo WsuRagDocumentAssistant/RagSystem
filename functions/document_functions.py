@@ -307,9 +307,12 @@ def list_all_words(*args, **kwargs):
     """
     from functions.rag_functions import load_vocab
 
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    search = ((req.get("payload") or {}).get("search") or "").strip()
+
     vocab = load_vocab() or {}
-    print(f"[get_vocab] 사전 {len(vocab)}개")
-    return {"entries": vocab}
+    print(f"[get_vocab] 사전 {len(vocab)}개" + (f" / 검색 {search!r}" if search else ""))
+    return {"entries": vocab, "search": search}
 
 
 #────────────────────────────────────────────────┌> 다운로드 / 이미지

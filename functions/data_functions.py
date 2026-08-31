@@ -299,7 +299,6 @@ def chat_session_list_output(*args, **kwargs):
 
 tasks["CHAT_SESSION_MESSAGES"] = ["session_id_input", "get_recent_db_messages",
                                   "chat_session_messages_output"]
-tasks["DICTIONARY_LIST"]       = ["list_all_db_words", "dictionary_list_output"]
 tasks["DICTIONARY_SAVE"]       = ["dictionary_save_input", "save_db_words",
                                   "dictionary_save_output"]
 tasks["EXTERNAL_API_LIST"]     = ["select_all_db_api_data", "external_api_list_output"]
@@ -346,18 +345,6 @@ def chat_session_messages_output(*args, **kwargs):
     return {"messages": messages}
 
 
-@work_regist("list_all_db_words")
-def list_all_db_words(*args, **kwargs):
-    """전체 목록을 읽고, 검색어를 다음 단계로 함께 넘긴다.
-
-    search_word 는 정확일치만 되고(부분일치 안 됨) 목록이 작아서, 검색은 여기서
-    받아온 목록을 걸러 처리한다.
-    """
-    req = args[0] if args and isinstance(args[0], dict) else {}
-    search = ((req.get("payload") or {}).get("search") or "").strip()
-    return search, (db_call("list_all_words") or [])
-
-
 @work_regist("dictionary_list_output")
 def dictionary_list_output(*args, **kwargs):
     """단어 행 -> {entries:[{id, term, synonyms, created_at, updated_at}]}.
@@ -376,6 +363,7 @@ def dictionary_list_output(*args, **kwargs):
     if isinstance(value, tuple):
         search, rows = value
     elif isinstance(value, dict):
+        search = value.get("search") or ""
         entries = value.get("entries")
         if isinstance(entries, dict):
             # load_vocab 은 {축약어: [확장어, ...]} 를 준다. 화면은 확장어를 한 줄로
@@ -385,7 +373,6 @@ def dictionary_list_output(*args, **kwargs):
                     for term, exp in entries.items()]
         else:
             rows = entries or []
-        search = ""
     else:
         search, rows = "", (value or [])
     entries = []
