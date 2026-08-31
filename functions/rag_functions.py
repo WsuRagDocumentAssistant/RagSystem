@@ -395,6 +395,31 @@ def rerank_function(*args, **kwargs):
 #------------------------------------------------┌> 답변
 
 
+def _dedup_sources(rows) -> list:
+    """(id, 이름) 쌍들 -> 클라이언트가 읽는 [{id, name}].
+
+    id 로 중복을 걷어내고, id 가 없으면 이름으로 본다 — 클라이언트가 목데이터를
+    섞어 보내도 같은 문서가 두 번 뜨지 않게 한다.
+    """
+    seen, sources = set(), []
+    for source_id, name in rows:
+        key = str(source_id or name or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        sources.append({"id": str(source_id or ""), "name": name or ""})
+    return sources
+
+
+def _to_sources(contexts) -> list:
+    """맥락들 -> [{id, name}]. 문서 하나당 한 줄만 남긴다.
+
+    document_id 가 없는 맥락은 버린다 — 문서에 붙지 않은 조각이라 출처로 띄울 게 없다.
+    """
+    return _dedup_sources((c.document_id, c.document_title)
+                          for c in contexts if c.document_id is not None)
+
+
 @work_regist("answer_function")
 def answer_function(*args, **kwargs):
     """초안을 만들고 고른 모델들이 각자 다듬는다. [{provider, answer}, ...].
@@ -425,17 +450,17 @@ def answer_function(*args, **kwargs):
         raise RuntimeError(f"다듬기가 전부 실패했습니다: {providers}")
     # 출처를 요청에 담아 흘려보낸다. 체인은 값 하나만 넘기는데 마지막 단계
     # (user_query_output)가 sources 를 채워야 하고, contexts 는 여기서 끊긴다.
-    seen, sources = set(), []
-    for context in contexts:
-        key = context.document_id
-        if key is None or key in seen:
-            continue
-        seen.add(key)
-        sources.append({"id": str(key), "name": context.document_title or ""})
-    req["_sources"] = sources
-    print(f"[answer_function] 출처 {len(sources)}건")
+    req["_sources"] = _to_sources(contexts)
+    print(f"[answer_function] 출처 {len(req['_sources'])}건")
 
     return req, [{"provider": name, "answer": text} for name, text in answers.items()]
+
+
+def _merge_sources(answers) -> list:
+    """답변들이 실어 온 출처를 하나로 합친다."""
+    return _dedup_sources((source.get("id"), source.get("name"))
+                          for answer in answers
+                          for source in answer.get("sources") or [])
 
 
 @work_regist("merge_function")
@@ -453,7 +478,8 @@ def merge_function(*args, **kwargs):
         req = value if isinstance(value, dict) else {}
         # 명세는 content, 이쪽은 answer 로 읽는다. 여기서 맞춘다.
         answers = [{"provider": a.get("provider"),
-                    "answer": a.get("content") or a.get("answer") or ""}
+                    "answer": a.get("content") or a.get("answer") or "",
+                    "sources": a.get("sources") or []}
                    for a in (req.get("payload") or {}).get("answers") or []]
     if not answers:
         raise ValueError("합칠 답변이 없습니다. payload.answers 를 보내주세요.")
@@ -464,7 +490,11 @@ def merge_function(*args, **kwargs):
 
     merged = get_controller().merge(query, [a["answer"] for a in answers], provider=provider)
     print(f"[merge_function] {provider} 병합 {len(merged):,}자")
-    return {"provider": provider, "answer": merged}
+    # 합친 답변의 출처는 재료가 된 답변들의 출처를 합집합으로 둔다 — 같은 질의에
+    # 대한 답변들이라 근거 문서도 그 답변들이 본 것 전부다. 질의 체인 뒤에 붙었을
+    # 때는(test_레그질의병합) 앞 단계가 req 에 담아둔 것을 쓴다.
+    sources = req.get("_sources") or _merge_sources(answers)
+    return {"provider": provider, "answer": merged, "sources": sources}
 
 
 #------------------------------------------------┌> 외부 데이터
@@ -564,9 +594,11 @@ def user_query_output(*args, **kwargs):
 
 @work_regist("merge_output")
 def merge_output(*args, **kwargs):
-    """merge_function 의 {provider, answer} -> 클라이언트가 읽는 {reply}."""
+    """merge_function 의 결과 -> 클라이언트가 읽는 {reply, sources}."""
     merged = args[0]
-    return {"reply": merged.get("answer", ""), "provider": merged.get("provider")}
+    return {"reply": merged.get("answer", ""),
+            "provider": merged.get("provider"),
+            "sources": merged.get("sources") or []}
 
 
 @work_regist("register_images")
