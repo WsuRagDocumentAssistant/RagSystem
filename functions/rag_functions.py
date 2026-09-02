@@ -30,6 +30,35 @@ from ragmodul import RagController, chunk, parse
 from ragmodul.util import document_to_payload, to_plain_sparse, to_plain_vector
 from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
 
+#────────────────────────────────────────────────┌> 테스트 태스크
+
+# 질의 검색은 세 task 가 공유한다. 세 번 적으면 한 곳만 고치고 어긋난다.
+QUERY_CHAIN = ["embed_query_function", "hybrid_search_function", "rerank_function"]
+
+tasks.update({
+    "test_레그준비": ["warmup_function"],                          # 모델 미리 올리기
+    "test_레그청킹": ["parse_function", "chunk_function"],          # 모델·DB 없이 확인용
+    "RAG": ["parse_function", "chunk_function",
+                    "vocab_function", "filter_vocab_function", "save_vocab_function",
+                    "embed_function", "save_function"],
+    "test_레그검색": QUERY_CHAIN,          
+    "test_레그질의": QUERY_CHAIN + ["search_api_function", "answer_function"],
+    "test_레그질의병합": QUERY_CHAIN + ["search_api_function", "answer_function", "merge_function"],
+    "RAG_Search": QUERY_CHAIN + ["search_api_function", "answer_function"],
+    "Merge": ["merge_function"],
+})
+
+#────────────────────────────────────────────────┌> 실제 태스크
+
+# 앞에 ensure_session, 뒤에 save_conversation 을 끼운다. 그래야 대화가 세션으로
+# 묶이고 사이드바 목록과 메시지 내역이 채워진다.
+tasks["USER_QUERY"]    = (["ensure_session"] + QUERY_CHAIN
+                          + ["search_api_function", "answer_function",
+                             "save_conversation", "user_query_output"])
+
+tasks["MERGE_RESULTS"] = ["merge_function", "merge_output"]
+
+
 #────────────────────────────────────────────────
 
 # 로컬 모델 폴더. 리랭커는 local_files_only 로 로드하므로 실제 폴더여야 한다.
@@ -79,7 +108,7 @@ ANSWER_PROVIDERS = [p for p in os.environ.get("RAG_LLM_PROVIDERS", "gpt").split(
 MERGE_WITH = os.environ.get("RAG_MERGE_WITH") or "gpt"
 
 # 사전 추출은 문서를 통째로 넘긴다. 로컬은 컨텍스트가 8192 토큰이라 안 들어간다.
-VOCAB_PROVIDER = os.environ.get("RAG_VOCAB_PROVIDER", "gpt")
+VOCAB_PROVIDER = os.environ.get("RAG_VOCAB_PROVIDER", "claude")
 
 
 # 외부 API 검색 개수. 1 이다 — 이건 근거가 아니라 "이런 것도 받아올 수 있다" 는
@@ -88,21 +117,7 @@ TOP_K_API = int(os.environ.get("RAG_TOP_K_API", "1"))
 
 #────────────────────────────────────────────────┌> test task 등록
 
-# 질의 검색은 세 task 가 공유한다. 세 번 적으면 한 곳만 고치고 어긋난다.
-QUERY_CHAIN = ["embed_query_function", "hybrid_search_function", "rerank_function"]
 
-tasks.update({
-    "test_레그준비": ["warmup_function"],                          # 모델 미리 올리기
-    "test_레그청킹": ["parse_function", "chunk_function"],          # 모델·DB 없이 확인용
-    "RAG": ["parse_function", "chunk_function",
-                    "vocab_function", "filter_vocab_function", "save_vocab_function",
-                    "embed_function", "save_function"],
-    "test_레그검색": QUERY_CHAIN,          
-    "test_레그질의": QUERY_CHAIN + ["search_api_function", "answer_function"],
-    "test_레그질의병합": QUERY_CHAIN + ["search_api_function", "answer_function", "merge_function"],
-    "RAG_Search": QUERY_CHAIN + ["search_api_function", "answer_function"],
-    "Merge": ["merge_function"],
-})
 
 #------------------------------------------------┌> 업로드 체인이 나르는 것
 
@@ -565,12 +580,6 @@ def embed_api_function(*args, **kwargs):
 # 이름은 클라이언트(src/config/TaskType.js)가 보내는 그대로 쓴다. 기존 test_ 태스크는
 # 손대지 않는다 — 통신부 없이 체인만 돌려보는 통로가 그대로 남아 있어야 한다.
 
-# 앞에 ensure_session, 뒤에 save_conversation 을 끼운다. 그래야 대화가 세션으로
-# 묶이고 사이드바 목록과 메시지 내역이 채워진다.
-tasks["USER_QUERY"]    = (["ensure_session"] + QUERY_CHAIN
-                          + ["search_api_function", "answer_function",
-                             "save_conversation", "user_query_output"])
-tasks["MERGE_RESULTS"] = ["merge_function", "merge_output"]
 
 
 @work_regist("user_query_output")

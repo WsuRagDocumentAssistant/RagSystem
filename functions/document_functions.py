@@ -7,6 +7,62 @@ from taskcontroller import work_regist, tasks
 from functions.data_functions import db_call, _to_millis   # DB 호출은 예외처리까지 묶여 있다
 from functions.rag_functions import UploadStep, _step_in       # 업로드 체인이 meta 를 나르는 방법
 
+#────────────────────────────────────────────────┌> 태스크
+
+# 문서 CRUD
+tasks["register_document"]             = ["test_document_input", "register_document"]
+
+tasks["get_document"]                  = ["test_document_id", "get_document"]
+
+tasks["list_documents"]                = ["list_documents"]
+
+tasks["search_documents_by_filename"]  = ["test_filename_query", "search_documents_by_filename"]
+
+tasks["update_document"]               = ["test_document_update_input", "update_document"]
+
+tasks["delete_document"]               = ["test_document_id", "delete_document"]
+
+# 드롭다운 옵션 (입력 없음)
+tasks["get_work_category_options"]     = ["get_work_category_options"]
+
+tasks["get_task_name_options"]         = ["get_task_name_options"]
+
+tasks["get_department_options"]        = ["get_department_options"]
+
+tasks["get_report_type_options"]       = ["get_report_type_options"]
+
+#────────────────────────────────────────────────┌> 실제 태스크
+
+tasks["FILE_LIST"]     = ["list_documents", "file_list_output"]   # payload 없음
+
+tasks["FILE_DELETE"]   = ["file_id_input", "delete_document", "file_delete_output"]
+
+tasks["FILE_DOWNLOAD"] = ["file_id_input", "get_document", "file_download_output"]
+
+# get_document 를 거치지 않는다. list_document_images 가 document_id 로 바로 찾는다
+# (제목으로 찾던 우회가 없어졌다).
+tasks["FILE_IMAGE_LIST"] = ["file_id_input", "list_document_images",
+                            "file_image_list_output"]
+
+# update_document_image 가 image_name·image_path 를 필수로 받는다. 저장 전에 현재
+# 행을 읽어와야 그 두 값을 그대로 넘길 수 있다 — 안 넘기면 NULL 로 덮여 이미지를 잃는다.
+tasks["FILE_IMAGE_SAVE"] = ["file_image_save_input", "get_document_image",
+                            "save_document_image", "file_image_save_output"]
+
+# 색인이 먼저다. register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
+# 색인이 먼저다 — register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
+# 업무 분류값(meta)은 UploadStep 에 실려 단계 사이를 통과한다(rag_functions).
+tasks["FILE_UPLOAD"] = ["file_upload_input",
+                        "parse_function", "chunk_function",
+                        "vocab_function", "filter_vocab_function", "save_vocab_function",
+                        "embed_function", "save_function", "register_images",
+                        "file_upload_register"]
+
+# get_vocab 은 DB 원본(word/replacement)을 그대로 준다. 클라이언트는 term/synonyms 로
+# 읽으므로 변환 단계를 뒤에 붙인다(data_functions 의 dictionary_list_output).
+tasks["DICTIONARY_LIST"] = ["get_vocab", "dictionary_list_output"]
+
+
 # 통신모듈 붙기 전까지 첫 work 에 입력을 넣어주는 자리
 TEST_DOCUMENT_ID     = 14
 TEST_PRODUCTION_YEAR = 2025
@@ -19,18 +75,6 @@ TEST_FILENAME_QUERY  = "테스트"
 
 #────────────────────────────────────────────────
 
-# 문서 CRUD
-tasks["register_document"]             = ["test_document_input", "register_document"]
-tasks["get_document"]                  = ["test_document_id", "get_document"]
-tasks["list_documents"]                = ["list_documents"]
-tasks["search_documents_by_filename"]  = ["test_filename_query", "search_documents_by_filename"]
-tasks["update_document"]               = ["test_document_update_input", "update_document"]
-tasks["delete_document"]               = ["test_document_id", "delete_document"]
-# 드롭다운 옵션 (입력 없음)
-tasks["get_work_category_options"]     = ["get_work_category_options"]
-tasks["get_task_name_options"]         = ["get_task_name_options"]
-tasks["get_department_options"]        = ["get_department_options"]
-tasks["get_report_type_options"]       = ["get_report_type_options"]
 
 #------------------------------------------------┌> dummy function
 
@@ -127,17 +171,6 @@ def get_report_type_options(*args, **kwargs):
 
 #────────────────────────────────────────────────┌> 통신부 task (명세 task_type)
 
-tasks["FILE_LIST"]     = ["list_documents", "file_list_output"]   # payload 없음
-tasks["FILE_DELETE"]   = ["file_id_input", "delete_document", "file_delete_output"]
-tasks["FILE_DOWNLOAD"] = ["file_id_input", "get_document", "file_download_output"]
-# get_document 를 거치지 않는다. list_document_images 가 document_id 로 바로 찾는다
-# (제목으로 찾던 우회가 없어졌다).
-tasks["FILE_IMAGE_LIST"] = ["file_id_input", "list_document_images",
-                            "file_image_list_output"]
-# update_document_image 가 image_name·image_path 를 필수로 받는다. 저장 전에 현재
-# 행을 읽어와야 그 두 값을 그대로 넘길 수 있다 — 안 넘기면 NULL 로 덮여 이미지를 잃는다.
-tasks["FILE_IMAGE_SAVE"] = ["file_image_save_input", "get_document_image",
-                            "save_document_image", "file_image_save_output"]
 
 
 @work_regist("file_id_input")
@@ -218,17 +251,6 @@ import re
 # 업로드된 원본이 쌓이는 곳. TEST_FILE_PATH 가 가리키던 자리와 같다.
 DOCUMENT_DIR = os.environ.get("RAG_DOCUMENT_DIR", "documents")
 
-# 색인이 먼저다. register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
-# 색인이 먼저다 — register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
-# 업무 분류값(meta)은 UploadStep 에 실려 단계 사이를 통과한다(rag_functions).
-tasks["FILE_UPLOAD"] = ["file_upload_input",
-                        "parse_function", "chunk_function",
-                        "vocab_function", "filter_vocab_function", "save_vocab_function",
-                        "embed_function", "save_function", "register_images",
-                        "file_upload_register"]
-# get_vocab 은 DB 원본(word/replacement)을 그대로 준다. 클라이언트는 term/synonyms 로
-# 읽으므로 변환 단계를 뒤에 붙인다(data_functions 의 dictionary_list_output).
-tasks["DICTIONARY_LIST"] = ["get_vocab", "dictionary_list_output"]
 
 def _safe_name(name: str) -> str:
     """경로 구분자와 상위 이동을 걷어낸다.

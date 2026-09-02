@@ -17,6 +17,58 @@ from api_data import collect, ApiEntity
 import db_manager
 from functions.exception_functions import safe_call
 
+#────────────────────────────────────────────────┌> 테스트 태스크
+
+# session-data
+# session insert
+tasks["session_insert"] = ["test_session_id", "create_session"]
+
+# session save
+tasks["session_save"] = ["test_session_data", "get_session", "insert_db_session_data"]
+
+# session title
+tasks["update_session_title"] = ["test_session_title_input", "update_db_session_title"]
+
+# session 확보 / 목록
+tasks["get_or_create_session"] = ["test_user_id", "get_or_create_db_session"]
+
+tasks["list_sessions"] = ["test_user_id", "list_db_sessions"]
+
+# api-data
+# api insert
+tasks["api_insert"] = ["create_api_data", "insert_db_api_data", "embed_api_function"]
+
+# api all update
+tasks["api_all_update"] = ["select_all_db_api_data", "update_api_data", "update_db_api_data"]
+
+# api delete
+tasks["api_delete"] = ["test_api_url", "delete_db_api_data"]
+
+#────────────────────────────────────────────────┌> 실제 태스크
+
+tasks["CHAT_SESSION_LIST"] = ["chat_session_list_input", "list_db_sessions",
+                              "chat_session_list_output"]
+
+tasks["CHAT_SESSION_MESSAGES"] = ["session_id_input", "get_recent_db_messages",
+                                  "chat_session_messages_output"]
+
+tasks["DICTIONARY_SAVE"]       = ["dictionary_save_input", "save_db_words",
+                                  "dictionary_save_output"]
+
+tasks["EXTERNAL_API_LIST"]     = ["select_all_db_api_data", "external_api_list_output"]
+
+tasks["EXTERNAL_API_SAVE"]     = ["create_api_data", "insert_db_api_data",
+                                  "embed_api_function", "external_api_save_output"]
+
+tasks["EXTERNAL_API_SYNC"]     = ["api_id_input", "sync_db_api_data",
+                                  "external_api_sync_output"]
+
+tasks["EXTERNAL_API_DELETE"]   = ["api_id_input", "delete_db_api_data_by_id",
+                                  "external_api_delete_output"]
+
+tasks["CHAT_SESSION_DELETE"] = ["delete_session"]
+
+
 load_dotenv()   # .env를 os.environ에 올린다 (없으면 조용히 넘어감)
 
 # 워커가 basicConfig(level=INFO) 로 루트 로거를 열기 때문에 httpx 가 요청마다
@@ -48,24 +100,7 @@ def db_call(task_name, **kwargs):
 
 #────────────────────────────────────────────────
 
-# session-data
-# session insert
-tasks["session_insert"] = ["test_session_id", "create_session"]
-# session save
-tasks["session_save"] = ["test_session_data", "get_session", "insert_db_session_data"]
-# session title
-tasks["update_session_title"] = ["test_session_title_input", "update_db_session_title"]
-# session 확보 / 목록
-tasks["get_or_create_session"] = ["test_user_id", "get_or_create_db_session"]
-tasks["list_sessions"] = ["test_user_id", "list_db_sessions"]
 
-# api-data
-# api insert
-tasks["api_insert"] = ["create_api_data", "insert_db_api_data", "embed_api_function"]
-# api all update
-tasks["api_all_update"] = ["select_all_db_api_data", "update_api_data", "update_db_api_data"]
-# api delete
-tasks["api_delete"] = ["test_api_url", "delete_db_api_data"]
 
 
 
@@ -229,8 +264,6 @@ def list_db_sessions(*args, **kwargs):
 
 #────────────────────────────────────────────────┌> 통신부 task (명세 task_type)
 
-tasks["CHAT_SESSION_LIST"] = ["chat_session_list_input", "list_db_sessions",
-                              "chat_session_list_output"]
 
 
 def _to_millis(value):
@@ -297,18 +330,6 @@ def chat_session_list_output(*args, **kwargs):
 
 #────────────────────────────────────────────────┌> 통신부 task (대화/사전/외부 API)
 
-tasks["CHAT_SESSION_MESSAGES"] = ["session_id_input", "get_recent_db_messages",
-                                  "chat_session_messages_output"]
-tasks["DICTIONARY_SAVE"]       = ["dictionary_save_input", "save_db_words",
-                                  "dictionary_save_output"]
-tasks["EXTERNAL_API_LIST"]     = ["select_all_db_api_data", "external_api_list_output"]
-tasks["EXTERNAL_API_SAVE"]     = ["create_api_data", "insert_db_api_data",
-                                  "embed_api_function", "external_api_save_output"]
-tasks["EXTERNAL_API_SYNC"]     = ["api_id_input", "sync_db_api_data",
-                                  "external_api_sync_output"]
-tasks["EXTERNAL_API_DELETE"]   = ["api_id_input", "delete_db_api_data_by_id",
-                                  "external_api_delete_output"]
-tasks["CHAT_SESSION_DELETE"] = ["delete_session"]
 
 @work_regist("session_id_input")
 def session_id_input(*args, **kwargs):

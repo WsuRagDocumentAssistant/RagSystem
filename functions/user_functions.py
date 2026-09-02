@@ -10,6 +10,34 @@ from dotenv import load_dotenv
 from taskcontroller import work_regist, tasks
 from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
 
+#────────────────────────────────────────────────┌> 테스트 태스크
+
+# 로그인 검증
+tasks["login"] = ["test_login_input", "login_user"]
+
+# 계정 생성
+tasks["create_user_account"] = ["test_account_input", "create_account"]
+
+# 권한 변경
+tasks["update_user_role"] = ["test_role_input", "update_user_role"]
+
+tasks["LOGIN"]    = ["login_input", "login_user", "login_output"]
+
+#────────────────────────────────────────────────┌> 실제 태스크
+
+# 회원가입/로그아웃은 클라이언트가 result 를 읽지 않는다. status 만 본다.
+tasks["REGISTER"] = ["register_input", "create_account", "register_output"]
+
+tasks["LOGOUT"]   = ["logout_output"]
+
+tasks["USER_LIST"]     = ["list_users", "user_list_output"]
+
+# 클라이언트는 바꿀 대상을 email 로 보낸다(payload {email, role}). DB 는 uuid 를
+# 받으므로 목록에서 email 로 찾아 바꿔준다.
+tasks["USER_SET_ROLE"] = ["user_set_role_input", "set_user_role",
+                          "user_set_role_output"]
+
+
 load_dotenv()
 
 # 통신모듈 붙기 전까지 첫 work 에 입력을 넣어주는 자리
@@ -25,12 +53,6 @@ TEST_NEW_ROLE       = "user"   # "admin" 또는 "user"
 
 #────────────────────────────────────────────────
 
-# 로그인 검증
-tasks["login"] = ["test_login_input", "login_user"]
-# 계정 생성
-tasks["create_user_account"] = ["test_account_input", "create_account"]
-# 권한 변경
-tasks["update_user_role"] = ["test_role_input", "update_user_role"]
 
 #------------------------------------------------┌> dummy function
 
@@ -78,7 +100,6 @@ def update_user_role(*args, **kwargs):
 # "통신모듈 붙기 전까지 입력을 넣어주는 자리" 였고, 이제 그 자리를 payload 가 채운다.
 # 이름은 클라이언트(src/config/TaskType.js)가 보내는 그대로 쓴다.
 
-tasks["LOGIN"]    = ["login_input", "login_user", "login_output"]
 
 
 @work_regist("login_input")
@@ -133,15 +154,7 @@ def login_output(*args, **kwargs):
     }
 
 
-# 회원가입/로그아웃은 클라이언트가 result 를 읽지 않는다. status 만 본다.
-tasks["REGISTER"] = ["register_input", "create_account", "register_output"]
-tasks["LOGOUT"]   = ["logout_output"]
 
-tasks["USER_LIST"]     = ["list_users", "user_list_output"]
-# 클라이언트는 바꿀 대상을 email 로 보낸다(payload {email, role}). DB 는 uuid 를
-# 받으므로 목록에서 email 로 찾아 바꿔준다.
-tasks["USER_SET_ROLE"] = ["user_set_role_input", "set_user_role",
-                          "user_set_role_output"]
 
 
 @work_regist("list_users")
