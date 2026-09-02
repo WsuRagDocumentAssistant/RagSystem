@@ -137,6 +137,86 @@ def login_output(*args, **kwargs):
 tasks["REGISTER"] = ["register_input", "create_account", "register_output"]
 tasks["LOGOUT"]   = ["logout_output"]
 
+tasks["USER_LIST"]     = ["list_users", "user_list_output"]
+# 클라이언트는 바꿀 대상을 email 로 보낸다(payload {email, role}). DB 는 uuid 를
+# 받으므로 목록에서 email 로 찾아 바꿔준다.
+tasks["USER_SET_ROLE"] = ["user_set_role_input", "set_user_role",
+                          "user_set_role_output"]
+
+
+@work_regist("list_users")
+def list_users(*args, **kwargs):
+    """전체 사용자 행 목록. payload 가 없다."""
+    return db_call("list_users") or []
+
+
+@work_regist("user_list_output")
+def user_list_output(*args, **kwargs):
+    """사용자 행 -> 클라이언트가 읽는 {users:[{id, email, name, role}]}.
+
+    DB 는 login_id 로 부르고 클라이언트는 email 로 읽는다.
+    id 는 uuid 문자열이다 — 클라이언트 타입이 number 로 선언돼 있지만 화면에서
+    행 구분에만 쓰므로 문자열이어도 동작한다.
+    """
+    rows = args[0] or []
+    return {"users": [
+        {
+            "id": str(row.get("user_id")),
+            "email": row.get("login_id"),
+            "name": row.get("name"),
+            "role": row.get("role"),
+        }
+        for row in rows
+    ]}
+
+
+@work_regist("user_set_role_input")
+def user_set_role_input(*args, **kwargs):
+    """payload {email, role} + 토큰 -> (관리자 uuid, 대상 uuid, 새 role).
+
+    호출자가 admin 인지는 DB 함수가 admin_user_id 로 검증한다. 토큰이 곧 user_id 인
+    임시 구조라 그대로 넘긴다 — 토큰 발급 방식이 바뀌면 여기서 변환이 필요하다.
+    """
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    payload = req.get("payload") or {}
+    email, role = payload.get("email"), payload.get("role")
+
+    if role not in ("admin", "user"):
+        raise ValueError(f"role 은 admin 또는 user 여야 합니다: {role!r}")
+
+    admin_user_id = req.get("token")
+    if not admin_user_id:
+        raise ValueError("사용자를 알 수 없습니다. Authorization 헤더가 필요합니다.")
+
+    # 클라이언트가 email 로 지목하므로 uuid 를 찾아준다.
+    target = next((r for r in (db_call("list_users") or [])
+                   if r.get("login_id") == email), None)
+    if not target:
+        raise ValueError(f"그런 사용자가 없습니다: {email!r}")
+
+    return admin_user_id, str(target["user_id"]), role
+
+
+@work_regist("set_user_role")
+def set_user_role(*args, **kwargs):
+    """권한을 바꾼다. DB 가 {success, message} 를 돌려준다."""
+    admin_user_id, target_user_id, new_role = args[0]
+    return db_call("update_user_role", admin_user_id=admin_user_id,
+                   target_user_id=target_user_id, new_role=new_role)
+
+
+@work_regist("user_set_role_output")
+def user_set_role_output(*args, **kwargs):
+    """{success, message} -> {}. 실패면 DB 가 준 이유를 그대로 올린다.
+
+    admin 이 아닌 사용자가 부르면 DB 가 success=False 로 거절한다. 그걸 성공으로
+    넘기면 화면에는 권한이 바뀐 것처럼 보이고 실제로는 안 바뀐다.
+    """
+    result = args[0] or {}
+    if not result.get("success"):
+        raise ValueError(result.get("message") or "권한을 변경하지 못했습니다.")
+    return {}
+
 
 @work_regist("register_output")
 def register_output(*args, **kwargs):

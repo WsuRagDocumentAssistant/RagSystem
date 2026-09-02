@@ -122,7 +122,7 @@ def get_session_data(*args, **kwargs):
 def insert_db_session_data(*args, **kwargs):
     inserted_message = db_call("insert_message", session_id=args[0].session_id, user_query=args[0].session.recent_conversations[-1]["user_query"], ai_response=args[0].session.recent_conversations[-1]["ai_response"])
     updated_topic = db_call("update_current_topic", session_id=args[0].session_id, topic=args[0].session.current_topic)
-    updated_summary = db_call("update_overall_summary", session_id=args[0].session_id, summary=args[0].session.summary)
+    updated_summary = db_call("update_  ", session_id=args[0].session_id, summary=args[0].session.summary)
     return inserted_message, updated_topic, updated_summary
 
 #-----------------------------------------------┌> api func
