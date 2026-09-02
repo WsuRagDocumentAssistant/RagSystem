@@ -254,9 +254,18 @@ def save_function(*args, **kwargs):
     """
     meta, document = _step_in(args)
     rag = get_controller()
+
+    # 파서는 파일 크기·형식을 모른다(hwpx 내용만 다룬다). 업로드 요청이 들고 온 값을
+    # meta 로 받아 여기서 얹는다 — 프로시저가 JSON 에서 size/mime_type 을 꺼내 쓴다.
+    # meta 가 없는 경로(RAG 태스크·메뉴)에서는 키가 안 붙고 컬럼이 NULL 로 남는다.
+    payload = document_to_payload(document)
+    for key in ("size", "mime_type"):
+        if meta and meta.get(key) is not None:
+            payload[key] = meta[key]
+
     document_id = db_call(
         "index_document",
-        document=document_to_payload(document),
+        document=payload,
         sparse_dim=rag.sparse_dimension,
     )
     print(f"[save_function] 저장 종료: document_id={document_id}, "

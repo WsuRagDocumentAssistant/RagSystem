@@ -224,6 +224,8 @@ def file_list_output(*args, **kwargs):
             # 아직 없으면 None 이고 클라이언트는 빈 값으로 표시한다.
             "size": row.get("size"),
             "mimeType": row.get("mime_type"),
+            # save_document_json 이 색인 끝에 child_chunk 개수를 세어 채운다.
+            "chunks": row.get("chunks"),
             # status 는 명세상 선택이고 저장할 값이 없다. 목록에 있으면 색인이 끝난
             # 문서라 ready 말고 다른 값이 될 수 없다 — 클라이언트 기본값에 맡긴다.
         }
@@ -301,6 +303,11 @@ def file_upload_input(*args, **kwargs):
         "task": payload.get("task"),
         "department": payload.get("department"),
         "report_type": payload.get("reportType"),
+        # 색인 프로시저가 JSON 에서 찾는 값이다(save_document_json). register_document
+        # 는 이 두 키를 안 읽으므로 함께 실어 보내도 무해하다.
+        # size 는 클라이언트가 보낸 값 대신 디코딩한 실제 바이트 수를 쓴다.
+        "size": len(raw),
+        "mime_type": payload.get("mimeType") or None,
     }
     # 다음 단계는 parse_function 이다. 값 자리에 파싱할 경로를 넣는다.
     return UploadStep(meta, meta["source_path"])
