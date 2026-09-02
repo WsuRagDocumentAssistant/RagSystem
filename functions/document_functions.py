@@ -130,9 +130,14 @@ def get_report_type_options(*args, **kwargs):
 tasks["FILE_LIST"]     = ["list_documents", "file_list_output"]   # payload 없음
 tasks["FILE_DELETE"]   = ["file_id_input", "delete_document", "file_delete_output"]
 tasks["FILE_DOWNLOAD"] = ["file_id_input", "get_document", "file_download_output"]
-tasks["FILE_IMAGE_LIST"] = ["file_id_input", "get_document", "file_image_list_output"]
-tasks["FILE_IMAGE_SAVE"] = ["file_image_save_input", "save_document_image",
-                            "file_image_save_output"]
+# get_document 를 거치지 않는다. list_document_images 가 document_id 로 바로 찾는다
+# (제목으로 찾던 우회가 없어졌다).
+tasks["FILE_IMAGE_LIST"] = ["file_id_input", "list_document_images",
+                            "file_image_list_output"]
+# update_document_image 가 image_name·image_path 를 필수로 받는다. 저장 전에 현재
+# 행을 읽어와야 그 두 값을 그대로 넘길 수 있다 — 안 넘기면 NULL 로 덮여 이미지를 잃는다.
+tasks["FILE_IMAGE_SAVE"] = ["file_image_save_input", "get_document_image",
+                            "save_document_image", "file_image_save_output"]
 
 
 @work_regist("file_id_input")
@@ -180,10 +185,14 @@ def file_list_output(*args, **kwargs):
             "department": row.get("department"),
             "reportType": row.get("report_type"),
             "productionYear": row.get("production_year"),
-            # 클라이언트는 숫자 timestamp 로 읽는다. status/size/mimeType 은 documents
-            # 테이블에 컬럼이 없어 못 채운다 — status 는 명세상 선택이라 없으면
-            # 클라이언트가 ready 로 본다.
+            # 클라이언트는 숫자 timestamp 로 읽는다.
             "uploadedAt": _to_millis(row.get("registered_at")),
+            # list_documents 가 SELECT * 라, 테이블에 컬럼이 생기면 그대로 실려 온다.
+            # 아직 없으면 None 이고 클라이언트는 빈 값으로 표시한다.
+            "size": row.get("size"),
+            "mimeType": row.get("mime_type"),
+            # status 는 명세상 선택이고 저장할 값이 없다. 목록에 있으면 색인이 끝난
+            # 문서라 ready 말고 다른 값이 될 수 없다 — 클라이언트 기본값에 맡긴다.
         }
         for row in rows
     ]
@@ -403,57 +412,66 @@ def file_download_output(*args, **kwargs):
     return {"url": _static_url(str(path), DOCUMENT_DIR, "/api/documents")}
 
 
+@work_regist("list_document_images")
+def list_document_images(*args, **kwargs):
+    """문서 id -> (문서 id, 이미지 행 목록)."""
+    document_id = args[0]
+    rows = db_call("list_document_images", document_id=document_id) or []
+    return document_id, rows
+
+
 @work_regist("file_image_list_output")
 def file_image_list_output(*args, **kwargs):
-    """문서 행 -> 클라이언트가 읽는 {images:[...]}.
+    """이미지 행 목록 -> 클라이언트가 읽는 {images:[...]}.
 
-    search_document_images 가 문서 id 가 아니라 제목으로 찾는다. 제목이 겹칠 수 있어
-    받은 결과를 document_id 로 한 번 더 거른다.
-
-    caption / majorTitle / aiSummary / keyFacts 등은 document_images 에 컬럼이 없다.
-    빈 값으로 내보내고, 클라이언트가 표시만 못 할 뿐 화면은 뜬다.
+    DB 컬럼은 스네이크, 클라이언트는 camelCase 다. 여기서 맞춘다.
+    key_facts·key_phrases 는 text[] 라 그대로 배열로 온다.
     """
-    row = args[0] or {}
-    document_id = row.get("id")
-    title = row.get("filename") or row.get("source_path") or ""
+    document_id, rows = args[0]
 
-    rows = db_call("search_document_images", query=title) or []
-    if document_id is not None:
-        matched = [r for r in rows if r.get("document_id") == document_id]
-        rows = matched or rows
-
-    images = []
-    for index, r in enumerate(rows):
-        images.append({
+    images = [
+        {
             "id": str(r.get("id")),
             "index": index,
             "imageUrl": _static_url(r.get("image_path") or "", IMAGE_DIR, "/api/images"),
-            "caption": None,
-            "majorTitle": None,
-            "midTitle": None,
-            "minorTitle": None,
-            "note": None,
-            "aiSummary": None,
-            "keyFacts": [],
-            "keyPhrases": [],
-        })
+            "caption": r.get("caption"),
+            "majorTitle": r.get("major_title"),
+            "midTitle": r.get("mid_title"),
+            "minorTitle": r.get("minor_title"),
+            "note": r.get("note"),
+            "aiSummary": r.get("ai_summary"),
+            "keyFacts": r.get("key_facts") or [],
+            "keyPhrases": r.get("key_phrases") or [],
+        }
+        for index, r in enumerate(rows)
+    ]
     print(f"[file_image_list_output] 이미지 {len(images)}개 (document_id={document_id})")
     return {"images": images}
 
 
-# 이미지 설명 필드. 클라이언트 타입(DocumentImage)에서 그대로 가져왔다.
-# 앞의 여섯은 글, 뒤의 둘은 문자열 배열이다.
-IMAGE_TEXT_FIELDS = ("caption", "majorTitle", "midTitle", "minorTitle", "note", "aiSummary")
-IMAGE_LIST_FIELDS = ("keyFacts", "keyPhrases")
+# 이미지 설명 필드. 클라이언트 이름 -> DB 컬럼 이름.
+# 앞의 여섯은 글(text), 뒤의 둘은 문자열 배열(text[])이다.
+IMAGE_TEXT_FIELDS = {
+    "caption": "caption",
+    "majorTitle": "major_title",
+    "midTitle": "mid_title",
+    "minorTitle": "minor_title",
+    "note": "note",
+    "aiSummary": "ai_summary",
+}
+IMAGE_LIST_FIELDS = {"keyFacts": "key_facts", "keyPhrases": "key_phrases"}
 
 
 @work_regist("file_image_save_input")
 def file_image_save_input(*args, **kwargs):
-    """payload {fileId, imageId, ...설명} -> 저장할 값 하나로 정리한다.
+    """payload {fileId, imageId, ...설명} -> update_document_image 가 받는 dict.
 
     클라이언트는 바뀐 필드만 보낼 수도, 전부 보낼 수도 있다(이미지 보기 모달의
-    저장 버튼). 보내지 않은 필드는 키 자체를 빼서 넘긴다 — DB 가 붙었을 때
-    "빈 문자열로 덮어쓰기" 와 "안 건드림" 을 구분할 수 있어야 한다.
+    저장 버튼). 보내지 않은 필드는 키 자체를 뺀다 — "빈 문자열로 덮어쓰기" 와
+    "안 건드림" 을 뒤 단계가 구분할 수 있어야 한다.
+
+    키 이름을 여기서 DB 컬럼으로 바꾼다. 뒤 단계는 넘기기만 하므로 클라이언트
+    명세를 몰라도 된다 — file_upload_input 과 같은 방식이다.
     """
     payload = (args[0].get("payload") or {}) if args and isinstance(args[0], dict) else {}
 
@@ -464,47 +482,75 @@ def file_image_save_input(*args, **kwargs):
     if not str(image_id).isdigit():
         raise ValueError(f"올바른 이미지 id 가 아닙니다: {image_id!r}")
 
-    changes = {}
-    for field in IMAGE_TEXT_FIELDS:
-        if field in payload:
-            value = payload[field]
-            changes[field] = "" if value is None else str(value)
-    for field in IMAGE_LIST_FIELDS:
-        if field in payload:
-            value = payload[field] or []
-            # 클라이언트가 줄바꿈 하나로 보내는 경우도 있어 문자열이면 감싼다
-            changes[field] = [str(v) for v in (value if isinstance(value, list) else [value])]
+    fields = {"id": int(image_id), "document_id": int(document_id)}
+    for name, column in IMAGE_TEXT_FIELDS.items():
+        if name in payload:
+            value = payload[name]
+            fields[column] = "" if value is None else str(value)
+    for name, column in IMAGE_LIST_FIELDS.items():
+        if name in payload:
+            value = payload[name] or []
+            # 클라이언트가 문자열 하나로 보내는 경우도 있어 배열이 아니면 감싼다
+            fields[column] = [str(v) for v in (value if isinstance(value, list) else [value])]
 
-    return {"document_id": int(document_id), "image_id": int(image_id), "changes": changes}
+    return fields
+
+
+@work_regist("get_document_image")
+def get_document_image(*args, **kwargs):
+    """저장할 dict 에 현재 image_name·image_path 를 채워 넣는다.
+
+    update_document_image 가 그 둘을 필수로 받는다. 설명만 고치는 요청에도
+    넘겨야 하고, 빠뜨리면 NULL 로 덮여 이미지 파일을 잃는다.
+    """
+    fields = args[0]
+    row = db_call("get_document_image", id=fields["id"])
+    if not row:
+        raise ValueError(f"이미지를 찾을 수 없습니다: {fields['id']}")
+
+    # 다른 문서의 이미지 id 를 보내 남의 이미지를 고치는 것을 막는다.
+    if row.get("document_id") != fields["document_id"]:
+        raise ValueError("이 문서의 이미지가 아닙니다.")
+
+    fields["image_name"] = row.get("image_name")
+    fields["image_path"] = row.get("image_path")
+    return fields
 
 
 @work_regist("save_document_image")
 def save_document_image(*args, **kwargs):
-    """이미지 설명을 저장한다 — 아직 저장하지 못하고 받기만 한다.
+    """이미지 설명을 저장한다. 받은 dict 을 그대로 DB 로 넘긴다.
 
-    document_images 의 컬럼은 id, document_id, image_name, image_path 뿐이라
-    설명을 넣을 자리가 없고, DocumentImageRepository.update 도 NotImplementedError 다.
-    컬럼과 함수가 생기면 아래 db_call 한 줄만 열면 된다.
-
-    받은 값을 그대로 흘려보낸다. 클라이언트는 이미 화면에 낙관적으로 반영해두고
-    실패를 조용히 삼키므로(AppState.saveDocumentImage), 여기서 예외를 던져도
-    사용자에게는 아무 차이가 없다 — 대신 로그에 남겨 무엇이 안 되고 있는지 보이게 한다.
+    앞 단계가 DB 컬럼 이름으로 맞춰 주므로 여기서는 이름을 손대지 않는다.
+    document_id 는 update 함수가 받지 않으므로 빼고 넘긴다.
     """
-    request = args[0]
-    # TODO(db): document_images 에 caption/major_title/mid_title/minor_title/note/
-    #           ai_summary/key_facts/key_phrases 컬럼과 update 함수가 생기면 아래를 연다.
-    # db_call("update_document_image", image_id=request["image_id"], **request["changes"])
-    print(f"[save_document_image] 저장 보류 (DB 컬럼 없음) "
-          f"image_id={request['image_id']} 필드={list(request['changes'])}")
-    return request
+    fields = dict(args[0])
+    fields.pop("document_id", None)
+
+    saved = db_call("update_document_image", **fields)
+    if not saved:
+        raise ValueError("이미지 설명을 저장하지 못했습니다.")
+    print(f"[save_document_image] id={fields['id']} 저장 필드={list(fields)}")
+    return saved
 
 
 @work_regist("file_image_save_output")
 def file_image_save_output(*args, **kwargs):
-    """저장 결과 -> 클라이언트가 읽는 {image:{...}}.
+    """저장된 행 -> 클라이언트가 읽는 {image:{...}}.
 
     클라이언트는 응답을 쓰지 않지만(낙관적 반영), 나중에 서버 값으로 되맞출 수
     있도록 저장된 모양 그대로 돌려준다.
     """
-    request = args[0]
-    return {"image": {"id": str(request["image_id"]), **request["changes"]}}
+    row = args[0]
+    return {"image": {
+        "id": str(row.get("id")),
+        "imageUrl": _static_url(row.get("image_path") or "", IMAGE_DIR, "/api/images"),
+        "caption": row.get("caption"),
+        "majorTitle": row.get("major_title"),
+        "midTitle": row.get("mid_title"),
+        "minorTitle": row.get("minor_title"),
+        "note": row.get("note"),
+        "aiSummary": row.get("ai_summary"),
+        "keyFacts": row.get("key_facts") or [],
+        "keyPhrases": row.get("key_phrases") or [],
+    }}
