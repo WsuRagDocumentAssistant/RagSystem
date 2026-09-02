@@ -110,6 +110,11 @@ MERGE_WITH = os.environ.get("RAG_MERGE_WITH") or "gpt"
 # 사전 추출은 문서를 통째로 넘긴다. 로컬은 컨텍스트가 8192 토큰이라 안 들어간다.
 VOCAB_PROVIDER = os.environ.get("RAG_VOCAB_PROVIDER", "claude")
 
+# 축약어 추출을 몇 자씩 나눠 보낼지. pack_texts 가 부모 조각을 이 상한에 맞춰 묶는다.
+# 크게 둘수록 앞뒤로 흩어진 짝을 잘 잇지만, 한 번에 너무 크면 응답이 느려져
+# llm_api.timeout(config.json) 에 걸린다 — claude 로 88,000자를 한 번에 보내다 겪었다.
+VOCAB_CHUNK_CHARS = int(os.environ.get("RAG_VOCAB_CHUNK_CHARS", "30000"))
+
 
 # 외부 API 검색 개수. 1 이다 — 이건 근거가 아니라 "이런 것도 받아올 수 있다" 는
 # 안내라서, 여러 개를 늘어놓으면 답변 끝이 목록이 된다.
@@ -265,21 +270,31 @@ def save_function(*args, **kwargs):
 
 @work_regist("vocab_function")
 def vocab_function(*args, **kwargs):
-    """문서 전체에서 축약어/확장어 짝을 뽑는다. LLM 한 번.
+    """문서에서 축약어/확장어 짝을 뽑는다. 몇 덩어리로 나눠 동시에 보낸다.
 
-    부모 단위로 쪼개 돌리면 호출이 32번인데 결과는 더 적다 — 문서 앞뒤에 흩어진
-    '축약어 ... 풀어쓴 말' 을 못 잇기 때문이다. 로컬 모델은 컨텍스트가 8192 토큰이라
-    문서 전체(88,178자)가 안 들어가므로 클라우드로 부른다.
+    부모 단위로 쪼개면(호출 32번) 결과가 더 적다 — 문서 앞뒤에 흩어진
+    '축약어 ... 풀어쓴 말' 을 못 잇기 때문이다. 그렇다고 전체를 한 번에 보내면
+    응답이 느려 timeout 에 걸리고, JSON 파싱이 어긋나면 88,000자를 통째로 다시
+    보내게 된다(claude 로 겪었다).
+
+    그래서 pack_texts 로 크게 묶는다. 30,000자면 경계가 두어 곳뿐이라 짝을 잇는 데
+    거의 지장이 없고, 호출 하나는 시간 안에 끝난다. extract_vocab_all 이 동시에
+    던지므로 걸리는 시간은 가장 느린 하나다.
+
+    로컬 모델은 컨텍스트가 8192 토큰이라 이 크기가 안 들어간다 — 클라우드로 부른다.
 
     다음 단계들이 문서도 필요하므로 함께 실어 보낸다.
     """
     meta, document = _step_in(args)
-    text = "/n/n".join(parent.content for parent in document.parents)
-    # 실패를 삼키지 않는다. 이 단계는 색인 저장(save_function)보다 앞이라, 여기서
-    # 멈추면 DB 에 아무것도 안 들어간다 — 어중간한 상태가 남지 않는다.
-    # 사전 없이 색인된 문서를 만드는 것보다 실패를 알리고 다시 올리게 하는 편이 낫다.
-    pairs = get_controller().extract_vocab(text, provider=VOCAB_PROVIDER)
-    print(f"[vocab_function] {len(text):,}자 -> {len(pairs)}짝")
+    rag = get_controller()
+
+    chunks = rag.pack_texts([parent.content for parent in document.parents],
+                            max_chars=VOCAB_CHUNK_CHARS)
+    # 조각 하나가 실패해도 나머지는 돌려준다. 중복은 다음 단계(filter_vocab)가 지운다.
+    pairs = rag.extract_vocab_all(chunks, provider=VOCAB_PROVIDER)
+
+    print(f"[vocab_function] {sum(len(c) for c in chunks):,}자 "
+          f"-> {len(chunks)}덩어리 -> {len(pairs)}짝")
     return _step_out(meta, (pairs, document))
 
 
