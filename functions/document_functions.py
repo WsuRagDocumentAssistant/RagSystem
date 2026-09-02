@@ -86,6 +86,7 @@ def get_document(*args, **kwargs):
 @work_regist("list_documents")
 def list_documents(*args, **kwargs):
     document_list = db_call("list_documents")
+    print(f" db 적용됐는지 확인하는 코드입니다{document_list}")
     return document_list
 
 # 파일명 부분일치 검색
