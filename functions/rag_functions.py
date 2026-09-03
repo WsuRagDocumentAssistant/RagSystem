@@ -42,9 +42,10 @@ tasks.update({
                     "vocab_function", "filter_vocab_function", "save_vocab_function",
                     "embed_function", "save_function"],
     "test_레그검색": QUERY_CHAIN,          
-    "test_레그질의": QUERY_CHAIN + ["search_api_function", "answer_function"],
-    "test_레그질의병합": QUERY_CHAIN + ["search_api_function", "answer_function", "merge_function"],
-    "RAG_Search": QUERY_CHAIN + ["search_api_function", "answer_function"],
+    "test_레그질의": QUERY_CHAIN + ["search_api_function", "history_function", "answer_function"],
+    "test_레그질의병합": QUERY_CHAIN + ["search_api_function", "history_function",
+                                        "answer_function", "merge_function"],
+    "RAG_Search": QUERY_CHAIN + ["search_api_function", "history_function", "answer_function"],
     "Merge": ["merge_function"],
 })
 
@@ -53,7 +54,7 @@ tasks.update({
 # 앞에 ensure_session, 뒤에 save_conversation 을 끼운다. 그래야 대화가 세션으로
 # 묶이고 사이드바 목록과 메시지 내역이 채워진다.
 tasks["USER_QUERY"]    = (["ensure_session"] + QUERY_CHAIN
-                          + ["search_api_function", "answer_function",
+                          + ["search_api_function", "history_function", "answer_function",
                              "save_conversation", "user_query_output"])
 
 tasks["MERGE_RESULTS"] = ["merge_function", "merge_output"]
@@ -440,6 +441,28 @@ def rerank_function(*args, **kwargs):
 #------------------------------------------------┌> 답변
 
 
+@work_regist("history_function")
+def history_function(*args, **kwargs):
+    """이전 대화를 읽어 함께 넘긴다. (req, 질의, 맥락, 외부, 이력).
+
+    ragmodul 의 _format_history 가 get_recent_messages 의 모양({user_query,
+    ai_response})을 그대로 받는다. 가공하지 않고 넘긴다 — 자르기와 순서(최근 것부터,
+    넘치면 오래된 차례를 버림)도 그쪽이 한다.
+
+    session_id 가 없으면(새 대화·더미 토큰) 빈 목록이다. 읽기에 실패해도 질의를 막지
+    않는다 — 이력은 해석 단서일 뿐이라 없으면 없는 대로 답하면 된다.
+    """
+    req, query, contexts, refs = args[0]
+
+    session_id = req.get("session_id")
+    history = db_call("get_recent_messages", session_id=session_id) if session_id else None
+    history = history or []
+
+    print(f"[history_function] 이전 대화 {len(history)}차례")
+    return req, query, contexts, refs, history
+
+
+
 def _dedup_sources(rows) -> list:
     """(id, 이름) 쌍들 -> 클라이언트가 읽는 [{id, name}].
 
@@ -491,13 +514,17 @@ def answer_function(*args, **kwargs):
     순차로 넘기면 앞 모델의 판단이 굳어져 뒷 모델이 손댈 여지가 줄어든다.
     걸리는 시간도 합이 아니라 가장 느린 하나가 된다.
     """
-    req, query, contexts, refs = args[0]
+    req, query, contexts, refs, history = args[0]
     rag = get_controller()
 
-    # 초안에는 외부 데이터를 주지 않는다. DRAFT_PROVIDER 가 로컬 모델(8,192 토큰)이라
-    # API 응답 원문이 붙으면 게이트웨이가 413 으로 자른다(ragmodul 주석의 실측 사례).
-    # 최종 답변은 다듬기 단계에서 나오므로 거기서만 실어 보내면 된다.
-    draft = rag.answer(query, contexts, provider=DRAFT_PROVIDER)
+    # 초안에는 외부 데이터를 주지 않는다. DRAFT_PROVIDER 가 로컬 모델이라 API 응답
+    # 원문이 붙으면 게이트웨이가 413 으로 자른다(실측 32KB). 최종 답변은 다듬기
+    # 단계에서 나오므로 거기서만 실어 보내면 된다.
+    #
+    # 이력은 초안에도 준다. 다듬는 쪽이 "초안이 대명사를 제대로 짚었는지" 판단하려면
+    # 같은 대화를 보고 있어야 한다(ragmodul arefine 의 설명). 실은 만큼 맥락 예산에서
+    # 빼주므로 로컬이 넘치지 않는다.
+    draft = rag.answer(query, contexts, provider=DRAFT_PROVIDER, history=history)
     print(f"[answer_function] 초안 {DRAFT_PROVIDER} {len(draft):,}자 (내부용)")
 
     # 클라이언트가 고른 모델. 없으면 설정값으로 떨어진다(통신부 없이 돌리는 test_ 태스크).
@@ -506,7 +533,8 @@ def answer_function(*args, **kwargs):
     # dict 로 넘기면 ragmodul 이 title·source 만 쓴다(_format_external). 문자열로 넘기면
     # 그 줄을 그대로 실어주므로, 응답 원문까지 붙여 보낸다.
     external = [_format_api_ref(ref) for ref in refs]
-    answers = rag.refine_all(query, contexts, draft, providers, external=external)
+    answers = rag.refine_all(query, contexts, draft, providers,
+                             external=external, history=history)
     for name in providers:
         mark = f"{len(answers[name]):,}자" if name in answers else "실패"
         print(f"[answer_function] 다듬기 {name} {mark}")
