@@ -21,7 +21,6 @@ DB 는 RagController 를 거치지 않는다(use_db=False). 저장 프로시저�
 넘어가지 않는다. 환경변수는 spawn 시점에 상속되므로 넘어간다.
 """
 
-import json
 import os
 import typing
 
@@ -29,6 +28,7 @@ from taskcontroller import work_regist, tasks
 from ragmodul import RagController, chunk, parse
 from ragmodul.util import document_to_payload, to_plain_sparse, to_plain_vector
 from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
+from utils import from_jsonb
 
 #────────────────────────────────────────────────┌> 테스트 태스크
 
@@ -119,6 +119,10 @@ VOCAB_CHUNK_CHARS = int(os.environ.get("RAG_VOCAB_CHUNK_CHARS", "30000"))
 # 외부 API 검색 개수. 1 이다 — 이건 근거가 아니라 "이런 것도 받아올 수 있다" 는
 # 안내라서, 여러 개를 늘어놓으면 답변 끝이 목록이 된다.
 TOP_K_API = int(os.environ.get("RAG_TOP_K_API", "1"))
+
+# 외부 API 응답 원문을 프롬프트에 얼마나 실을지. 원문이 수십 KB 일 수 있어 자른다 —
+# 다듬기는 클라우드라 컨텍스트는 넉넉하지만 매 질의마다 토큰이 나간다.
+API_DATA_CHARS = int(os.environ.get("RAG_API_DATA_CHARS", "20000"))
 
 #────────────────────────────────────────────────┌> test task 등록
 
@@ -268,6 +272,11 @@ def save_function(*args, **kwargs):
         document=payload,
         sparse_dim=rag.sparse_dimension,
     )
+    # db_call 은 실패를 삼키고 None 을 준다. 그대로 흘려보내면 뒤 단계가 document_id
+    # None 으로 헛돌고(이미지 등록이 전부 거절됐다) 업로드가 성공으로 응답된다 —
+    # 임베딩까지 다 해놓고 검색에 안 잡히는 문서가 생긴다.
+    if document_id is None:
+        raise ValueError("문서 색인에 실패했습니다. 잠시 후 다시 시도해주세요.")
     print(f"[save_function] 저장 종료: document_id={document_id}, "
           f"child {len(document.children())}개")
     # 업로드 체인은 다음 단계(register_images)가 document 를 봐야 해서 함께 넘긴다.
@@ -346,10 +355,7 @@ def load_vocab() -> dict:
     반환 설명은 dict 인데 실제로는 str 이다). 여기서 푼다 — 문자열을 그대로 넘기면
     질의 확장이 dict 처럼 순회하다 깨진다. 그쪽이 고쳐도 아래 검사는 그대로 통과한다.
     """
-    vocab = db_call("load_vocab") or {}
-    if isinstance(vocab, str):
-        vocab = json.loads(vocab or "{}")
-    return vocab
+    return from_jsonb(db_call("load_vocab"), {})
 
 #------------------------------------------------┌> 질의 검색
 
@@ -450,6 +456,20 @@ def _dedup_sources(rows) -> list:
     return sources
 
 
+def _format_api_ref(ref: dict) -> str:
+    """외부 API 한 건 -> 프롬프트에 실을 한 덩어리.
+
+    제목·출처만으로는 모델이 값을 알 수 없어 응답 원문(data)까지 붙인다. url 과 key 는
+    넣지 않는다 — 링크를 답변에 옮기면 사용자가 인증 없이 눌러 실패하고, 키는 새면 안 된다.
+    """
+    head = f"{ref.get('title') or ''} ({ref.get('source') or ''})".strip()
+    data = (ref.get("data") or "")[:API_DATA_CHARS]
+    if not data:
+        return head
+    return f"""{head}
+{data}"""
+
+
 def _to_sources(contexts) -> list:
     """맥락들 -> [{id, name}]. 문서 하나당 한 줄만 남긴다.
 
@@ -474,25 +494,35 @@ def answer_function(*args, **kwargs):
     req, query, contexts, refs = args[0]
     rag = get_controller()
 
-    draft = rag.answer(query, contexts, provider=DRAFT_PROVIDER, external=refs)
+    # 초안에는 외부 데이터를 주지 않는다. DRAFT_PROVIDER 가 로컬 모델(8,192 토큰)이라
+    # API 응답 원문이 붙으면 게이트웨이가 413 으로 자른다(ragmodul 주석의 실측 사례).
+    # 최종 답변은 다듬기 단계에서 나오므로 거기서만 실어 보내면 된다.
+    draft = rag.answer(query, contexts, provider=DRAFT_PROVIDER)
     print(f"[answer_function] 초안 {DRAFT_PROVIDER} {len(draft):,}자 (내부용)")
 
     # 클라이언트가 고른 모델. 없으면 설정값으로 떨어진다(통신부 없이 돌리는 test_ 태스크).
     providers = [p] if (p := (req.get("payload") or {}).get("provider")) else ANSWER_PROVIDERS
 
-    answers = rag.refine_all(query, contexts, draft, providers, external=refs)
+    # dict 로 넘기면 ragmodul 이 title·source 만 쓴다(_format_external). 문자열로 넘기면
+    # 그 줄을 그대로 실어주므로, 응답 원문까지 붙여 보낸다.
+    external = [_format_api_ref(ref) for ref in refs]
+    answers = rag.refine_all(query, contexts, draft, providers, external=external)
     for name in providers:
         mark = f"{len(answers[name]):,}자" if name in answers else "실패"
         print(f"[answer_function] 다듬기 {name} {mark}")
 
     if not answers:
         raise RuntimeError(f"다듬기가 전부 실패했습니다: {providers}")
-    # 출처를 요청에 담아 흘려보낸다. 체인은 값 하나만 넘기는데 마지막 단계
-    # (user_query_output)가 sources 를 채워야 하고, contexts 는 여기서 끊긴다.
-    req["_sources"] = _to_sources(contexts)
-    print(f"[answer_function] 출처 {len(req['_sources'])}건")
 
-    return req, [{"provider": name, "answer": text} for name, text in answers.items()]
+    # contexts 는 여기서 끊기는데 뒤 단계(save_conversation, user_query_output)가
+    # 출처를 필요로 한다. 요청 봉투(req)에 얹지 않고 함께 넘긴다 — 봉투는 통신부가
+    # 만든 것이라 우리 중간 결과를 섞지 않는다.
+    sources = _to_sources(contexts)
+    print(f"[answer_function] 출처 {len(sources)}건")
+
+    return (req,
+            [{"provider": name, "answer": text} for name, text in answers.items()],
+            sources)
 
 
 def _merge_sources(answers) -> list:
@@ -511,8 +541,9 @@ def merge_function(*args, **kwargs):
     근거가 묽어진다.
     """
     value = args[0] if args else None
+    sources = None
     if isinstance(value, tuple):                      # 질의 체인 뒤에 붙었을 때
-        req, answers = value
+        req, answers, sources = value                 # answer_function 이 출처까지 준다
     else:                                             # MERGE_RESULTS 로 단독 호출
         req = value if isinstance(value, dict) else {}
         # 명세는 content, 이쪽은 answer 로 읽는다. 여기서 맞춘다.
@@ -531,9 +562,9 @@ def merge_function(*args, **kwargs):
     print(f"[merge_function] {provider} 병합 {len(merged):,}자")
     # 합친 답변의 출처는 재료가 된 답변들의 출처를 합집합으로 둔다 — 같은 질의에
     # 대한 답변들이라 근거 문서도 그 답변들이 본 것 전부다. 질의 체인 뒤에 붙었을
-    # 때는(test_레그질의병합) 앞 단계가 req 에 담아둔 것을 쓴다.
-    sources = req.get("_sources") or _merge_sources(answers)
-    return {"provider": provider, "answer": merged, "sources": sources}
+    # 때는(test_레그질의병합) 앞 단계가 준 것을 그대로 쓴다.
+    return {"provider": provider, "answer": merged,
+            "sources": sources or _merge_sources(answers)}
 
 
 #------------------------------------------------┌> 외부 데이터
@@ -616,12 +647,12 @@ def user_query_output(*args, **kwargs):
 
     answers 는 명세에 없지만 provider 를 여러 개 쓸 때 비교 화면에 필요하다.
     """
-    req, answers = args[0]
+    req, answers, sources = args[0]
     return {
         "reply": answers[0]["answer"] if answers else "",
         "answers": answers,
         "sessionId": req.get("session_id"),
-        "sources": req.get("_sources") or [],
+        "sources": sources or [],
     }
 
 

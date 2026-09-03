@@ -16,6 +16,7 @@ from session_data import build_session, Session
 from api_data import collect, ApiEntity
 import db_manager
 from functions.exception_functions import safe_call
+from utils import from_jsonb
 
 #────────────────────────────────────────────────┌> 테스트 태스크
 
@@ -362,7 +363,9 @@ def chat_session_messages_output(*args, **kwargs):
         if row.get("ai_response"):
             messages.append({"id": f"{turn}-assistant", "role": "assistant",
                              "content": row["ai_response"], "createdAt": created,
-                             "turnId": turn, "preferred": True})
+                             "turnId": turn, "preferred": True,
+                             # 저장 안 된 예전 대화는 NULL 이라 빈 목록이 된다.
+                             "sources": from_jsonb(row.get("sources"), [])})
     return {"messages": messages}
 
 
@@ -569,8 +572,16 @@ def ensure_session(*args, **kwargs):
         return req
 
     req["session_id"] = str(session_id)
-    req["_new_session"] = True          # 제목을 붙일지 판단하는 데 쓴다
-    print(f"[ensure_session] 새 세션 {req['session_id']}")
+
+    # 제목을 여기서 붙인다. 저장 단계(save_conversation)까지 미루면, 그 사이 답변이
+    # 실패한 방이 제목 없이 남는다 — 다음 요청부터는 클라이언트가 이 session_id 를
+    # 보내오므로 이 work 이 다시 돌지 않아 영영 무제목이 된다(LLM 오류로 겪었다).
+    # 질문은 이 시점에 이미 payload 에 있어 따로 읽을 것이 없다.
+    title = ((req.get("payload") or {}).get("query") or "").strip()
+    if title:
+        db_call("update_session_title", session_id=req["session_id"], title=title[:30])
+
+    print(f"[ensure_session] 새 세션 {req['session_id']} 제목={title[:30]!r}")
     return req
 
 @work_regist("delete_session")
@@ -604,24 +615,24 @@ def save_conversation(*args, **kwargs):
 
     (req, answers) 를 그대로 흘려보낸다. 다음 단계가 user_query_output 이다.
     """
-    req, answers = args[0]
+    req, answers, sources = args[0]
     session_id = req.get("session_id")
     if not session_id:
-        return req, answers
+        return req, answers, sources
 
     query = (req.get("payload") or {}).get("query") or ""
     reply = answers[0]["answer"] if answers else ""
 
     try:
-        db_call("insert_message", session_id=session_id, user_query=query, ai_response=reply)
-        if req.get("_new_session") and query:
-            # 첫 질문을 대화 제목으로 쓴다. 사이드바가 title 을 그대로 보여준다.
-            db_call("update_session_title", session_id=session_id, title=query[:30])
+        # 출처는 answer_function 이 함께 넘겨준 것이다. jsonb 컬럼이라 목록을 그대로
+        # 넘기면 db_manager 가 json 문자열로 만들어 보낸다.
+        db_call("insert_message", session_id=session_id, user_query=query,
+                ai_response=reply, sources=sources)
         print(f"[save_conversation] 세션 {session_id} 에 저장")
     except Exception as e:                                   # noqa: BLE001
         print(f"[save_conversation] 저장 실패, 답변은 그대로 보냄: {type(e).__name__} - {e}")
 
-    return req, answers
+    return req, answers, sources
 
 
 @work_regist("sync_db_api_data")
