@@ -295,6 +295,7 @@ def chat_session_list_input(*args, **kwargs):
     """
     req = args[0] if args and isinstance(args[0], dict) else {}
     user_id = req.get("token")
+    logging.info(f"[chat_session_list_input] user_id={user_id!r}")
     if not user_id:
         raise ValueError("사용자를 알 수 없습니다. Authorization 헤더가 필요합니다.")
 
