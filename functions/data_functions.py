@@ -294,7 +294,7 @@ def chat_session_list_input(*args, **kwargs):
     인자가 없으면(메뉴로 직접 실행) TEST_USER_ID 로 떨어진다.
     """
     req = args[0] if args and isinstance(args[0], dict) else {}
-    user_id = req.get("token") or TEST_USER_ID
+    user_id = req.get("token")
     if not user_id:
         raise ValueError("사용자를 알 수 없습니다. Authorization 헤더가 필요합니다.")
 
