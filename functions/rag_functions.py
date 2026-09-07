@@ -57,7 +57,12 @@ tasks["USER_QUERY"]    = (["ensure_session"] + QUERY_CHAIN
                           + ["search_api_function", "history_function", "answer_function",
                              "save_conversation", "user_query_output"])
 
-tasks["MERGE_RESULTS"] = ["merge_function", "merge_output"]
+tasks["MERGE_RESULTS"] = ["merge_function", "save_merged", "merge_output"]
+
+# 클라이언트가 대화 차례를 세어 창을 넘기면 부른다. 질의와 별도 요청이라 답변이
+# 늦어지지 않는다.
+tasks["CHAT_SESSION_COMPRESS"] = ["session_id_input", "compress_session",
+                                  "compress_output"]
 
 
 #────────────────────────────────────────────────
@@ -115,6 +120,14 @@ VOCAB_PROVIDER = os.environ.get("RAG_VOCAB_PROVIDER", "claude")
 # 크게 둘수록 앞뒤로 흩어진 짝을 잘 잇지만, 한 번에 너무 크면 응답이 느려져
 # llm_api.timeout(config.json) 에 걸린다 — claude 로 88,000자를 한 번에 보내다 겪었다.
 VOCAB_CHUNK_CHARS = int(os.environ.get("RAG_VOCAB_CHUNK_CHARS", "30000"))
+
+# 대화 압축. 최근 KEEP_TURNS 차례는 원문으로 남기고 그보다 앞은 요약에 접어 넣는다.
+# history_function 이 읽어 넘기는 차례 수와 같아야 한다 — 다르면 어느 쪽에도 안 실리는
+# 구간이 생긴다.
+KEEP_TURNS = int(os.environ.get("RAG_KEEP_TURNS", "5"))
+# 압축 대상을 찾으려면 창보다 많이 읽어야 한다. 세션 하나의 전체 대화 상한이기도 하다.
+COMPRESS_SCAN_TURNS = int(os.environ.get("RAG_COMPRESS_SCAN_TURNS", "100"))
+SUMMARY_PROVIDER = os.environ.get("RAG_SUMMARY_PROVIDER", "claude")
 
 
 # 외부 API 검색 개수. 1 이다 — 이건 근거가 아니라 "이런 것도 받아올 수 있다" 는
@@ -387,23 +400,50 @@ def embed_query_function(*args, **kwargs):
     return req, query, vector, weights
 
 
+def _document_ids(req) -> list | None:
+    """payload 의 fileIds -> 정수 목록. 없으면 None(전체 검색).
+
+    클라이언트는 문서 id 를 문자열로 보낸다(FILE_LIST 가 준 그대로). DB 는 정수
+    배열을 받으므로 바꿔 넘긴다.
+
+    숫자가 아닌 값이 섞이면 거절한다. 업로드 응답을 못 받은 클라이언트가 자기가 만든
+    임시 id("tmp-1788139009759")를 보내는 경우가 있는데, 조용히 걸러내면 사용자는
+    문서 다섯 개를 골랐다고 믿는 채 네 개만 검색된 답을 받는다.
+    """
+    file_ids = (req.get("payload") or {}).get("fileIds") if isinstance(req, dict) else None
+    if not file_ids:
+        return None
+
+    bad = [i for i in file_ids if not str(i).isdigit()]
+    if bad:
+        raise ValueError(f"올바른 문서 id 가 아닙니다: {bad}")
+    return [int(i) for i in file_ids]
+
+
 @work_regist("hybrid_search_function")
 def hybrid_search_function(*args, **kwargs):
     """dense + sparse 를 RRF 로 합쳐 검색한다.
 
     두 점수를 더하지 않고 순위로 합친다 — dense 는 코사인이라 0~1 인데 sparse 는
     가중치 내적이라 상한이 없어서, 그냥 더하면 sparse 가 결과를 지배한다.
+
+    payload 에 fileIds 가 오면 그 문서들 안에서만 찾는다("검색 문서 선택"). 프로시저가
+    순위를 매기기 전에 걸러 주므로, 몇 개를 고르든 후보 수는 top_k 로 같다.
     """
     req, query, vector, weights = args[0]
     rag = get_controller()
+
+    document_ids = _document_ids(req)
     hits = db_call(
         "search_documents_hybrid",
         query_vector=to_plain_vector(vector),
         query_weights=to_plain_sparse(weights),
         sparse_dim=rag.sparse_dimension,
         top_k=TOP_K_SEARCH,
+        document_ids=document_ids,      # None 이면 전체 검색
     ) or []
-    print(f"[hybrid_search_function] 조각 {len(hits)}개")
+    scope = f"문서 {document_ids} 한정" if document_ids else "전체"
+    print(f"[hybrid_search_function] 조각 {len(hits)}개 ({scope})")
     return req, query, hits
 
 
@@ -443,7 +483,11 @@ def rerank_function(*args, **kwargs):
 
 @work_regist("history_function")
 def history_function(*args, **kwargs):
-    """이전 대화를 읽어 함께 넘긴다. (req, 질의, 맥락, 외부, 이력).
+    """이전 대화와 요약을 읽어 함께 넘긴다. (req, 질의, 맥락, 외부, 세션맥락).
+
+    세션맥락은 {"history": 최근 차례들, "summary": 그 앞의 요약} 이다. 둘을 묶는 이유는
+    같은 것의 두 부분이기 때문이다 — 튜플 자리를 하나씩 늘리면 뒤 work 의 언팩이
+    금세 여섯 일곱 개가 된다.
 
     ragmodul 의 _format_history 가 get_recent_messages 의 모양({user_query,
     ai_response})을 그대로 받는다. 가공하지 않고 넘긴다 — 자르기와 순서(최근 것부터,
@@ -455,11 +499,17 @@ def history_function(*args, **kwargs):
     req, query, contexts, refs = args[0]
 
     session_id = req.get("session_id")
-    history = db_call("get_recent_messages", session_id=session_id) if session_id else None
-    history = history or []
+    if not session_id:
+        return req, query, contexts, refs, {"history": [], "summary": ""}
 
-    print(f"[history_function] 이전 대화 {len(history)}차례")
-    return req, query, contexts, refs, history
+    history = db_call("get_recent_messages", session_id=session_id,
+                      limit_count=KEEP_TURNS) or []
+    # 창 밖으로 밀려난 대화는 요약으로만 남는다(CHAT_SESSION_COMPRESS 가 채운다).
+    context = db_call("get_session_context", session_id=session_id) or {}
+    summary = context.get("overall_summary") or ""
+
+    print(f"[history_function] 이전 대화 {len(history)}차례, 요약 {len(summary)}자")
+    return req, query, contexts, refs, {"history": history, "summary": summary}
 
 
 
@@ -514,7 +564,8 @@ def answer_function(*args, **kwargs):
     순차로 넘기면 앞 모델의 판단이 굳어져 뒷 모델이 손댈 여지가 줄어든다.
     걸리는 시간도 합이 아니라 가장 느린 하나가 된다.
     """
-    req, query, contexts, refs, history = args[0]
+    req, query, contexts, refs, session = args[0]
+    history, summary = session["history"], session["summary"]
     rag = get_controller()
 
     # 초안에는 외부 데이터를 주지 않는다. DRAFT_PROVIDER 가 로컬 모델이라 API 응답
@@ -524,7 +575,8 @@ def answer_function(*args, **kwargs):
     # 이력은 초안에도 준다. 다듬는 쪽이 "초안이 대명사를 제대로 짚었는지" 판단하려면
     # 같은 대화를 보고 있어야 한다(ragmodul arefine 의 설명). 실은 만큼 맥락 예산에서
     # 빼주므로 로컬이 넘치지 않는다.
-    draft = rag.answer(query, contexts, provider=DRAFT_PROVIDER, history=history)
+    draft = rag.answer(query, contexts, provider=DRAFT_PROVIDER,
+                       history=history, summary=summary)
     print(f"[answer_function] 초안 {DRAFT_PROVIDER} {len(draft):,}자 (내부용)")
 
     # 클라이언트가 고른 모델. 없으면 설정값으로 떨어진다(통신부 없이 돌리는 test_ 태스크).
@@ -534,7 +586,7 @@ def answer_function(*args, **kwargs):
     # 그 줄을 그대로 실어주므로, 응답 원문까지 붙여 보낸다.
     external = [_format_api_ref(ref) for ref in refs]
     answers = rag.refine_all(query, contexts, draft, providers,
-                             external=external, history=history)
+                             external=external, history=history, summary=summary)
     for name in providers:
         mark = f"{len(answers[name]):,}자" if name in answers else "실패"
         print(f"[answer_function] 다듬기 {name} {mark}")
@@ -591,8 +643,60 @@ def merge_function(*args, **kwargs):
     # 합친 답변의 출처는 재료가 된 답변들의 출처를 합집합으로 둔다 — 같은 질의에
     # 대한 답변들이라 근거 문서도 그 답변들이 본 것 전부다. 질의 체인 뒤에 붙었을
     # 때는(test_레그질의병합) 앞 단계가 준 것을 그대로 쓴다.
-    return {"provider": provider, "answer": merged,
-            "sources": sources or _merge_sources(answers)}
+    # req 를 함께 넘긴다. 다음 단계(save_merged)가 session_id 를 봐야 한다.
+    return req, {"provider": provider, "answer": merged,
+                 "sources": sources or _merge_sources(answers)}
+
+
+#------------------------------------------------┌> 대화 압축
+
+
+@work_regist("compress_session")
+def compress_session(*args, **kwargs):
+    """창 밖으로 밀려난 대화를 요약에 접어 넣는다. (요약, 접어 넣은 차례 수).
+
+    최근 KEEP_TURNS 차례는 원문으로 실리므로 압축 대상이 아니다. 그보다 앞의 차례만
+    넘긴다 — ragmodul 이 '기존 요약 + 밀려난 차례' 로 누적 갱신한다.
+
+    밀려난 차례가 없으면 ragmodul 이 LLM 을 부르지 않고 기존 요약을 그대로 돌려준다.
+    그래도 여기서 먼저 걸러 DB 쓰기까지 건너뛴다.
+    """
+    session_id = args[0]
+
+    rows = db_call("get_recent_messages", session_id=session_id,
+                   limit_count=COMPRESS_SCAN_TURNS) or []
+    dropped = rows[:-KEEP_TURNS] if len(rows) > KEEP_TURNS else []
+    if not dropped:
+        print(f"[compress_session] 밀려난 차례 없음 ({len(rows)}차례)")
+        return "", 0
+
+    context = db_call("get_session_context", session_id=session_id) or {}
+    previous = context.get("overall_summary") or ""
+
+    summary, topic = get_controller().summarize_session(previous, dropped,
+                                                        provider=SUMMARY_PROVIDER)
+    if not summary:
+        raise ValueError("대화 요약에 실패했습니다.")
+
+    db_call("update_overall_summary", session_id=session_id, summary=summary)
+    # 주제는 빈 문자열로 올 수 있다(밀려난 차례가 없어 LLM 을 안 부른 경우).
+    # 그때 덮어쓰면 쓰던 주제를 지우는 셈이라 건너뛴다.
+    if topic:
+        db_call("update_current_topic", session_id=session_id, topic=topic)
+
+    print(f"[compress_session] {len(dropped)}차례 압축 -> {len(summary)}자, 주제={topic!r}")
+    return summary, len(dropped)
+
+
+@work_regist("compress_output")
+def compress_output(*args, **kwargs):
+    """(요약, 차례 수) -> 클라이언트가 읽는 {compressed}.
+
+    요약문 자체는 내보내지 않는다. 서버가 다음 질의에 알아서 싣는 값이라 화면에
+    쓸 일이 없고, 지나간 대화 내용이 그대로 나가는 것도 피한다.
+    """
+    _summary, count = args[0]
+    return {"compressed": count}
 
 
 #------------------------------------------------┌> 외부 데이터
@@ -684,10 +788,42 @@ def user_query_output(*args, **kwargs):
     }
 
 
+@work_regist("save_merged")
+def save_merged(*args, **kwargs):
+    """병합 답변을 세션에 남긴다. (req, 병합결과) 를 그대로 흘려보낸다.
+
+    질문 자리를 비워 넣는다. 같은 질문이 두 번 저장되면 대화 내역에 질문이 두 번
+    보이는데, chat_session_messages_output 이 user_query 가 빈 행은 답변만 내보내므로
+    화면에는 답변 하나가 더 붙는 모양이 된다 — 클라이언트가 병합 답변을 별도 말풍선으로
+    그리는 것과 같다.
+
+    session_id 가 없으면 저장하지 않는다. MERGE_RESULTS 명세에 sessionId 가 없어서
+    지금은 늘 이 갈래로 떨어진다 — 클라이언트가 보내주면 그때부터 저장된다.
+
+    저장에 실패해도 답변은 그대로 내보낸다.
+    """
+    req, merged = args[0]
+
+    session_id = req.get("session_id")
+    if not session_id:
+        print("[save_merged] sessionId 가 없어 저장 건너뜀")
+        return req, merged
+
+    try:
+        db_call("insert_message", session_id=session_id, user_query="",
+                ai_response=merged.get("answer") or "",
+                sources=merged.get("sources"))
+        print(f"[save_merged] 세션 {session_id} 에 병합 답변 저장")
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[save_merged] 저장 실패, 답변은 그대로 보냄: {type(e).__name__} - {e}")
+
+    return req, merged
+
+
 @work_regist("merge_output")
 def merge_output(*args, **kwargs):
-    """merge_function 의 결과 -> 클라이언트가 읽는 {reply, sources}."""
-    merged = args[0]
+    """(req, 병합결과) -> 클라이언트가 읽는 {reply, sources}."""
+    _req, merged = args[0]
     return {"reply": merged.get("answer", ""),
             "provider": merged.get("provider"),
             "sources": merged.get("sources") or []}

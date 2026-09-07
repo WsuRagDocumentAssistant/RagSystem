@@ -49,6 +49,12 @@ tasks["FILE_IMAGE_LIST"] = ["file_id_input", "list_document_images",
 tasks["FILE_IMAGE_SAVE"] = ["file_image_save_input", "get_document_image",
                             "save_document_image", "file_image_save_output"]
 
+# 그림 파일 자체를 바꾼다(설명은 FILE_IMAGE_SAVE). 옛 경로를 알아야 같은 폴더에 쓸 수
+# 있어서 get_document_image 가 먼저 온다.
+tasks["FILE_IMAGE_UPLOAD"] = ["file_image_upload_input", "get_document_image",
+                              "replace_image_file", "save_document_image",
+                              "file_image_upload_output"]
+
 # 색인이 먼저다. register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
 # 색인이 먼저다 — register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
 # 업무 분류값(meta)은 UploadStep 에 실려 단계 사이를 통과한다(rag_functions).
@@ -380,6 +386,26 @@ def _display_name(row: dict, disk: dict) -> str:
     return disk.get(stem, stem)
 
 
+def _resolve_image(image_path: str):
+    """DB 의 image_path -> 실제 파일 경로.
+
+    저장할 때 "images/<문서명>/image7.png" 처럼 넣었으므로 대개 그대로 열린다.
+    IMAGE_DIR 이 환경변수로 바뀌었을 때를 대비해 폴더 기준으로도 한 번 찾는다.
+    """
+    from pathlib import Path
+
+    path = Path(image_path)
+    if path.exists():
+        return path
+    # "images/" 접두어가 붙은 채 저장된 경우, 설정된 폴더 기준으로 다시 맞춘다
+    parts = path.parts
+    if parts and parts[0] != IMAGE_DIR:
+        candidate = Path(IMAGE_DIR).joinpath(*parts[1:]) if len(parts) > 1 else Path(IMAGE_DIR) / path.name
+        if candidate.exists():
+            return candidate
+    return path
+
+
 def _static_url(path: str, root: str, prefix: str) -> str | None:
     """서버 로컬 경로 -> 브라우저가 열 수 있는 URL.
 
@@ -527,10 +553,14 @@ def file_image_save_input(*args, **kwargs):
 
 @work_regist("get_document_image")
 def get_document_image(*args, **kwargs):
-    """저장할 dict 에 현재 image_name·image_path 를 채워 넣는다.
+    """저장할 dict 의 빈 자리를 현재 행 값으로 채운다.
 
-    update_document_image 가 그 둘을 필수로 받는다. 설명만 고치는 요청에도
-    넘겨야 하고, 빠뜨리면 NULL 로 덮여 이미지 파일을 잃는다.
+    update_document_image 는 image_name·image_path 를 필수로 받고, 설명 필드는
+    안 넘기면 NULL 로 덮는다. 그래서 요청이 안 보낸 것들을 여기서 기존 값으로 메운다 —
+    설명만 고칠 때 이미지 경로를 잃지 않고, 이미지만 바꿀 때 설명을 잃지 않는다.
+
+    setdefault 인 게 중요하다. 덮어쓰면 앞 단계가 정한 새 값(교체된 파일 이름)이
+    사라진다.
     """
     fields = args[0]
     row = db_call("get_document_image", id=fields["id"])
@@ -541,8 +571,10 @@ def get_document_image(*args, **kwargs):
     if row.get("document_id") != fields["document_id"]:
         raise ValueError("이 문서의 이미지가 아닙니다.")
 
-    fields["image_name"] = row.get("image_name")
-    fields["image_path"] = row.get("image_path")
+    for column in ("image_name", "image_path", *IMAGE_TEXT_FIELDS.values(),
+                   *IMAGE_LIST_FIELDS.values()):
+        if column in row:
+            fields.setdefault(column, row[column])
     return fields
 
 
@@ -553,14 +585,88 @@ def save_document_image(*args, **kwargs):
     앞 단계가 DB 컬럼 이름으로 맞춰 주므로 여기서는 이름을 손대지 않는다.
     document_id 는 update 함수가 받지 않으므로 빼고 넘긴다.
     """
-    fields = dict(args[0])
-    fields.pop("document_id", None)
+    # document_id 는 update 함수가 안 받는다. 밑줄로 시작하는 키는 체인 안에서만 쓰는
+    # 값이라(교체할 파일 내용 등) DB 로 넘기면 안 된다.
+    fields = {k: v for k, v in args[0].items()
+              if k != "document_id" and not k.startswith("_")}
 
     saved = db_call("update_document_image", **fields)
     if not saved:
         raise ValueError("이미지 설명을 저장하지 못했습니다.")
     print(f"[save_document_image] id={fields['id']} 저장 필드={list(fields)}")
     return saved
+
+
+@work_regist("file_image_upload_input")
+def file_image_upload_input(*args, **kwargs):
+    """payload {fileId, imageId, name, mimeType, content} -> 교체할 값.
+
+    파일은 아직 안 쓴다. 어디에 쓸지는 기존 행의 image_path 를 봐야 알 수 있고,
+    그건 다음 단계(get_document_image)가 읽어온다.
+
+    확장자만 올린 파일에서 가져온다. 이름 전체를 쓰면 경로 문자·중복·한글이 섞여
+    들어오는데, 폴더 안 다른 이미지와 충돌하면 남의 그림을 덮어쓴다.
+    """
+    payload = (args[0].get("payload") or {}) if args and isinstance(args[0], dict) else {}
+
+    document_id, image_id = payload.get("fileId"), payload.get("imageId")
+    if not str(document_id).isdigit():
+        raise ValueError(f"올바른 문서 id 가 아닙니다: {document_id!r}")
+    if not str(image_id).isdigit():
+        raise ValueError(f"올바른 이미지 id 가 아닙니다: {image_id!r}")
+
+    content = payload.get("content")
+    if not content:
+        raise ValueError("이미지 내용(content)이 비어 있습니다.")
+
+    return {
+        "id": int(image_id),
+        "document_id": int(document_id),
+        # 다음 단계들이 쓰는 값. DB 로는 안 넘어간다(save_document_image 가 걸러낸다).
+        "_content": base64.b64decode(content),
+        "_suffix": os.path.splitext(_safe_name(payload.get("name")))[1].lower(),
+    }
+
+
+@work_regist("replace_image_file")
+def replace_image_file(*args, **kwargs):
+    """새 이미지를 옛 파일 자리에 쓰고, 이름·경로를 갱신한다.
+
+    이름은 옛 stem + 올린 파일의 확장자다. stem 이 폴더 안에서 유일했으므로 충돌이
+    없고, image1·image2… 순서 규칙도 유지된다.
+
+    옛 파일은 새 파일을 쓴 뒤에 지운다 — 쓰기가 실패하면 원본이 그대로 남는다.
+    확장자가 같으면 경로가 같아 덮어써지고 지울 것이 없다.
+    """
+    fields = args[0]
+    old_path = fields.get("image_path")
+    if not old_path:
+        raise ValueError("기존 이미지 경로를 찾지 못했습니다.")
+
+    old = _resolve_image(old_path)
+    suffix = fields.pop("_suffix", "") or old.suffix
+    new = old.with_suffix(suffix)
+
+    new.parent.mkdir(parents=True, exist_ok=True)
+    with open(new, "wb") as f:
+        f.write(fields.pop("_content"))
+
+    if new != old and old.exists():
+        os.remove(old)
+        print(f"[replace_image_file] 옛 파일 삭제: {old.name}")
+
+    # DB 에는 저장할 때와 같은 상대 경로 모양으로 넣는다.
+    fields["image_name"] = new.name
+    fields["image_path"] = old_path.rsplit("/", 1)[0] + "/" + new.name if "/" in old_path else new.name
+    print(f"[replace_image_file] {old.name} -> {new.name} ({new.stat().st_size:,} bytes)")
+    return fields
+
+
+@work_regist("file_image_upload_output")
+def file_image_upload_output(*args, **kwargs):
+    """저장된 행 -> 클라이언트가 읽는 {imageUrl}."""
+    row = args[0]
+    return {"imageUrl": _static_url(row.get("image_path") or "", IMAGE_DIR, "/api/images")}
 
 
 @work_regist("file_image_save_output")
