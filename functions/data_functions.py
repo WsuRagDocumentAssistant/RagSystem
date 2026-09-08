@@ -69,6 +69,11 @@ tasks["EXTERNAL_API_DELETE"]   = ["api_id_input", "delete_db_api_data_by_id",
 
 tasks["CHAT_SESSION_DELETE"] = ["delete_session"]
 
+# 다중 질의에서 사용자가 답변 하나를 고르면 그것만 저장한다. USER_QUERY 는 답변이
+# 여럿이면 저장하지 않는다 — 최종 답변이 병합이나 선택으로 나중에 정해지기 때문이다.
+tasks["CHAT_ANSWER_SAVE"] = ["answer_save_input", "save_answer",
+                             "answer_save_output"]
+
 
 load_dotenv()   # .env를 os.environ에 올린다 (없으면 조용히 넘어감)
 
@@ -606,6 +611,65 @@ def delete_session(*args, **kwargs):
     if not deleted:
         raise ValueError("대화를 삭제하지 못했습니다. 이미 삭제됐거나 메시지가 남아 있습니다.")
     return {}
+
+@work_regist("answer_save_input")
+def answer_save_input(*args, **kwargs):
+    """payload {sessionId, query, provider, content, sources} -> 저장할 값.
+
+    사용자가 비교 화면에서 고른 답변이다. 병합과 달리 LLM 을 부르지 않고 받은 것을
+    그대로 넣는다.
+
+    provider 는 받아만 둔다. messages 에 컬럼이 없어 저장할 자리가 없다 — 로그로 남겨
+    어느 모델이 선택됐는지는 보이게 한다. 컬럼이 생기면 save_answer 에서 열면 된다.
+    """
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    payload = req.get("payload") or {}
+
+    session_id = req.get("session_id") or payload.get("sessionId")
+    if not _is_uuid(session_id):
+        raise ValueError(f"올바른 sessionId 가 아닙니다: {session_id!r}")
+
+    content = (payload.get("content") or "").strip()
+    if not content:
+        raise ValueError("저장할 답변(content)이 비어 있습니다.")
+
+    return {
+        "session_id": str(session_id),
+        "query": payload.get("query") or "",
+        "content": content,
+        "sources": payload.get("sources") or [],
+        "provider": payload.get("provider") or "",
+    }
+
+
+@work_regist("save_answer")
+def save_answer(*args, **kwargs):
+    """고른 답변을 세션에 남긴다.
+
+    질문과 함께 한 행으로 넣는다. USER_QUERY 가 다중 질의를 저장하지 않으므로
+    여기가 그 차례의 유일한 기록이다 — 질문을 빼면 무엇에 대한 답인지 알 수 없다.
+
+    실패는 예외로 올린다. 병합·질의와 달리 이 요청은 저장이 목적이라, 실패를 성공으로
+    돌려주면 사용자는 남은 줄 알고 넘어간다.
+    """
+    fields = args[0]
+
+    saved = db_call("insert_message", session_id=fields["session_id"],
+                    user_query=fields["query"], ai_response=fields["content"],
+                    sources=fields["sources"])
+    if not saved:
+        raise ValueError("답변을 저장하지 못했습니다.")
+
+    print(f"[save_answer] 세션 {fields['session_id']} 에 저장 "
+          f"(provider={fields['provider']!r}, 출처 {len(fields['sources'])}건)")
+    return saved
+
+
+@work_regist("answer_save_output")
+def answer_save_output(*args, **kwargs):
+    """명세대로 빈 객체. 클라이언트가 필드를 읽지 않는다."""
+    return {}
+
 
 @work_regist("save_conversation")
 def save_conversation(*args, **kwargs):
