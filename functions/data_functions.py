@@ -621,6 +621,14 @@ def save_conversation(*args, **kwargs):
     if not session_id:
         return req, answers, sources
 
+    # 답변이 여럿이면 여기서 저장하지 않는다. 최종 답변이 아직 안 정해졌기 때문이다 —
+    # 사용자가 병합하거나(MERGE_RESULTS) 하나를 고르면 그때 그 답변이 질문과 함께
+    # 한 행으로 저장된다. 여기서 answers[0] 을 넣어두면 최종 답변과 두 행이 되고,
+    # 질문도 두 번 남는다.
+    if len(answers) > 1:
+        print(f"[save_conversation] 답변 {len(answers)}개 — 병합·선택 때 저장한다")
+        return req, answers, sources
+
     query = (req.get("payload") or {}).get("query") or ""
     reply = answers[0]["answer"] if answers else ""
 

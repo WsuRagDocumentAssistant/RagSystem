@@ -792,25 +792,28 @@ def user_query_output(*args, **kwargs):
 def save_merged(*args, **kwargs):
     """병합 답변을 세션에 남긴다. (req, 병합결과) 를 그대로 흘려보낸다.
 
-    질문 자리를 비워 넣는다. 같은 질문이 두 번 저장되면 대화 내역에 질문이 두 번
-    보이는데, chat_session_messages_output 이 user_query 가 빈 행은 답변만 내보내므로
-    화면에는 답변 하나가 더 붙는 모양이 된다 — 클라이언트가 병합 답변을 별도 말풍선으로
-    그리는 것과 같다.
+    질문도 함께 넣는다. 다중 질의에서는 최종 답변이 병합 결과라, 그 행 하나에 질문과
+    답변이 모여야 대화 내역이 완결된다 — 질문을 비워두면 그 행만 봐서는 무엇에 대한
+    답인지 알 수 없다.
 
-    session_id 가 없으면 저장하지 않는다. MERGE_RESULTS 명세에 sessionId 가 없어서
-    지금은 늘 이 갈래로 떨어진다 — 클라이언트가 보내주면 그때부터 저장된다.
+    질문은 payload 에 있다. MERGE_RESULTS 가 query 를 그대로 받기 때문이다.
+
+    session_id 가 없으면 저장하지 않는다. 통신부가 봉투에 넣어주지 않는 경우를 대비해
+    payload 도 본다.
 
     저장에 실패해도 답변은 그대로 내보낸다.
     """
     req, merged = args[0]
+    payload = req.get("payload") or {}
 
-    session_id = req.get("session_id")
+    session_id = req.get("session_id") or payload.get("sessionId")
     if not session_id:
         print("[save_merged] sessionId 가 없어 저장 건너뜀")
         return req, merged
 
     try:
-        db_call("insert_message", session_id=session_id, user_query="",
+        db_call("insert_message", session_id=session_id,
+                user_query=payload.get("query") or "",
                 ai_response=merged.get("answer") or "",
                 sources=merged.get("sources"))
         print(f"[save_merged] 세션 {session_id} 에 병합 답변 저장")
