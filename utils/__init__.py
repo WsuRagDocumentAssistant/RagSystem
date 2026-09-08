@@ -3,8 +3,8 @@
 # utils.__init__.py
 #================================================
 
-from .convert import from_jsonb
+from .convert import from_jsonb, static_url
 
-__all__ = ["from_jsonb"]
+__all__ = ["from_jsonb", "static_url"]
 
 #────────────────────────────────────────────────

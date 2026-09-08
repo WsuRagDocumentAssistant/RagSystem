@@ -28,7 +28,7 @@ from taskcontroller import work_regist, tasks
 from ragmodul import RagController, chunk, parse
 from ragmodul.util import document_to_payload, to_plain_sparse, to_plain_vector
 from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
-from utils import from_jsonb
+from utils import from_jsonb, static_url
 
 #────────────────────────────────────────────────┌> 테스트 태스크
 
@@ -54,7 +54,8 @@ tasks.update({
 # 앞에 ensure_session, 뒤에 save_conversation 을 끼운다. 그래야 대화가 세션으로
 # 묶이고 사이드바 목록과 메시지 내역이 채워진다.
 tasks["USER_QUERY"]    = (["ensure_session"] + QUERY_CHAIN
-                          + ["search_api_function", "history_function", "answer_function",
+                          + ["search_api_function", "history_function",
+                             "search_images_function", "answer_function",
                              "save_conversation", "user_query_output"])
 
 tasks["MERGE_RESULTS"] = ["merge_function", "save_merged", "merge_output"]
@@ -126,6 +127,27 @@ KEEP_TURNS = int(os.environ.get("RAG_KEEP_TURNS", "5"))
 COMPRESS_SCAN_TURNS = int(os.environ.get("RAG_COMPRESS_SCAN_TURNS", "100"))
 SUMMARY_PROVIDER = os.environ.get("RAG_SUMMARY_PROVIDER", "claude")
 
+# 이미지 설명. hwpx 문서 그림은 절반쯤이 bmp 인데(실측 243장 중 117장) gpt·claude 는
+# bmp 를 400 으로 거절한다 — gemini 만 읽는다. 다른 걸 고르면 그 그림들이 통째로 빠진다.
+IMAGE_PROVIDER = os.environ.get("RAG_IMAGE_PROVIDER", "gemini")
+# 동시에 몇 장을 보낼지. 큰 요청 여럿이 같은 순간에 나가면 429 가 난다(ragmodul 실측).
+# extract_vocab_all 이 쓰는 값과 같은 수준으로 잡았다. 429 가 보이면 줄인다.
+IMAGE_CONCURRENCY = int(os.environ.get("RAG_IMAGE_CONCURRENCY", "4"))
+
+
+# 질의에 붙일 그림. 검색은 넉넉히 뽑고 그중 몇 장만 모델에 실어 보낸다.
+#
+# 두 장인 이유: 로컬에 1MB 그림 한 장을 붙이면 초안이 3초쯤 걸린다(실측). 장수만큼
+# 늘어나므로, 답변을 기다리는 시간과 맞바꾸는 값이다.
+IMAGE_SEARCH_TOP_K = int(os.environ.get("RAG_IMAGE_SEARCH_TOP_K", "3"))
+IMAGE_ATTACH_MAX = int(os.environ.get("RAG_IMAGE_ATTACH_MAX", "2"))
+
+# 이 아래 점수는 버린다. 유사도 검색은 질의가 무엇이든 상위 몇 개를 돌려주므로
+# 문턱이 없으면 상관없는 그림이 딸려 나온다.
+#
+# 0.4 는 자리를 채운 값이지 실측이 아니다. 검색된 그림의 similarity 를 전부 로그에
+# 찍어두었으니, 실제 질의 몇 개를 돌려보고 정하면 된다.
+IMAGE_MIN_SIMILARITY = float(os.environ.get("RAG_IMAGE_MIN_SIMILARITY", "0.4"))
 
 # 외부 API 검색 개수. 1 이다 — 이건 근거가 아니라 "이런 것도 받아올 수 있다" 는
 # 안내라서, 여러 개를 늘어놓으면 답변 끝이 목록이 된다.
@@ -510,6 +532,86 @@ def history_function(*args, **kwargs):
 
 
 
+@work_regist("search_images_function")
+def search_images_function(*args, **kwargs):
+    """질의에 딸려 보낼 문서 그림을 고른다. (req, 질의, 맥락, 외부, 세션맥락, 그림들).
+
+    먼저 그림을 찾는 질의인지 가른다(ragmodul is_image_query). "그림·도표·그래프를
+    직접 찾는 말" 일 때만 참이고, 내용을 묻는 말은 그림이 도움이 될 것 같아도 거짓이다.
+    아니면 벡터 검색도 하지 않고 빈 목록으로 지나간다.
+
+    판정을 먼저 두면 질의마다 LLM 왕복이 하나 붙는다(짧은 프롬프트라 1초 안쪽).
+    반대로 검색을 먼저 하고 걸린 게 있을 때만 판정하면 그 왕복을 아낄 수 있는데,
+    대신 그림이 없는 질의에서도 매번 벡터 검색이 돈다. 지금은 판정을 먼저 둔다 —
+    답변이 느려지는 게 보이면 순서를 뒤집으면 된다.
+
+    고른 그림은 두 곳에 쓰인다. 하나는 모델이다(초안·다듬기 양쪽에 실어 보낸다 —
+    로컬도 이미지를 받는다. 실측 png 1MB 3.2초, 두 장도 됨). 다른 하나는 화면이라,
+    사용자가 답변과 같은 그림을 본다.
+
+    실패해도 질의를 막지 않는다. 그림은 덤이라 없으면 없는 대로 답하면 된다.
+    """
+    req, query, contexts, refs, session = args[0]
+
+    try:
+        images = _search_images(req, query)
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[search_images_function] 건너뜀: {type(e).__name__} - {e}")
+        images = []
+    return req, query, contexts, refs, session, images
+
+
+def _search_images(req, query: str) -> list:
+    """그림 검색. 모델에 실을 payload 까지 붙여 돌려준다.
+
+    payload 는 [{"mime_type", "data": base64}] 모양이다(ragmodul aask 가 받는 것).
+    파일을 못 읽는 행은 뺀다 — 화면에는 띄우고 모델에는 못 보내는 반쪽이 되면
+    답변과 그림이 어긋난다.
+    """
+    import base64
+
+    rag = get_controller()
+    if not rag.is_image_query(query):
+        print(f"[search_images] 그림을 찾는 질의가 아니다 — 건너뜀")
+        return []
+
+    vector, _ = rag.embed_query(query)
+    rows = db_call("search_document_image_vector",
+                   query_vector=to_plain_vector(vector),
+                   top_k=IMAGE_SEARCH_TOP_K,
+                   document_ids=_document_ids(req)) or []
+
+    # 점수를 전부 찍는다. 문턱값을 실측으로 정하려면 버린 것도 보여야 한다.
+    picked = []
+    for row in rows:
+        score = row.get("similarity") or 0.0
+        mark = "o" if score >= IMAGE_MIN_SIMILARITY else "x"
+        print(f"[search_images] {mark} sim={score:.4f} {row.get('image_name')} "
+              f"({row.get('document_title')})")
+        if score >= IMAGE_MIN_SIMILARITY:
+            picked.append(row)
+
+    images = []
+    for row in picked[:IMAGE_ATTACH_MAX]:
+        path = _resolve_image_path(row.get("image_path") or "")
+        if path is None:
+            print(f"[search_images] 파일 없음: {row.get('image_path')}")
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            print(f"[search_images] {path.name} 읽기 실패: {type(e).__name__} - {e}")
+            continue
+        images.append({**row, "_payload": {
+            "mime_type": _mime_type(path),
+            "data": base64.b64encode(data).decode("ascii"),
+        }})
+
+    print(f"[search_images] 그림 {len(images)}장 첨부 (검색 {len(rows)}, "
+          f"문턱 {IMAGE_MIN_SIMILARITY} 통과 {len(picked)})")
+    return images
+
+
 def _dedup_sources(rows) -> list:
     """(id, 이름) 쌍들 -> 클라이언트가 읽는 [{id, name}].
 
@@ -561,10 +663,18 @@ def answer_function(*args, **kwargs):
     순차로 넘기면 앞 모델의 판단이 굳어져 뒷 모델이 손댈 여지가 줄어든다.
     걸리는 시간도 합이 아니라 가장 느린 하나가 된다.
     """
-    req, query, contexts, refs, session = args[0]
+    # search_images_function 이 붙으면 6칸, 없으면(test_ 태스크) 5칸이다.
+    value = args[0]
+    req, query, contexts, refs, session = value[:5]
+    images = value[5] if len(value) > 5 else []
     history, summary = session["history"], session["summary"]
+    payload = [image["_payload"] for image in images]
     rag = get_controller()
 
+    # 그림은 초안에도 준다. 로컬도 이미지를 받는다(실측 png 1MB 3.2초, 두 장도 됨).
+    # 초안이 그림을 보고 써야 다듬는 쪽이 "초안이 그림을 제대로 읽었는지" 를 볼 수 있다
+    # — refine 프롬프트가 그걸 전제로 쓰여 있다.
+    #
     # 초안에는 외부 데이터를 주지 않는다. DRAFT_PROVIDER 가 로컬 모델이라 API 응답
     # 원문이 붙으면 게이트웨이가 413 으로 자른다(실측 32KB). 최종 답변은 다듬기
     # 단계에서 나오므로 거기서만 실어 보내면 된다.
@@ -573,7 +683,7 @@ def answer_function(*args, **kwargs):
     # 같은 대화를 보고 있어야 한다(ragmodul arefine 의 설명). 실은 만큼 맥락 예산에서
     # 빼주므로 로컬이 넘치지 않는다.
     draft = rag.answer(query, contexts, provider=DRAFT_PROVIDER,
-                       history=history, summary=summary)
+                       history=history, summary=summary, images=payload)
     print(f"[answer_function] 초안 {DRAFT_PROVIDER} {len(draft):,}자 (내부용)")
 
     # 클라이언트가 고른 모델. 배열로 온다 — 비교 화면에서 여러 개를 고르면 여럿,
@@ -600,7 +710,8 @@ def answer_function(*args, **kwargs):
     # 그 줄을 그대로 실어주므로, 응답 원문까지 붙여 보낸다.
     external = [_format_api_ref(ref) for ref in refs]
     answers = rag.refine_all(query, contexts, draft, providers,
-                             external=external, history=history, summary=summary)
+                             external=external, history=history, summary=summary,
+                             images=payload)
     for name in providers:
         mark = f"{len(answers[name]):,}자" if name in answers else "실패"
         print(f"[answer_function] 다듬기 {name} {mark}")
@@ -616,7 +727,7 @@ def answer_function(*args, **kwargs):
 
     return (req,
             [{"provider": name, "answer": text} for name, text in answers.items()],
-            sources)
+            sources, images)
 
 
 def _merge_sources(answers) -> list:
@@ -637,7 +748,7 @@ def merge_function(*args, **kwargs):
     value = args[0] if args else None
     sources = None
     if isinstance(value, tuple):                      # 질의 체인 뒤에 붙었을 때
-        req, answers, sources = value                 # answer_function 이 출처까지 준다
+        req, answers, sources = value[:3]             # answer_function 이 출처까지 준다
     else:                                             # MERGE_RESULTS 로 단독 호출
         req = value if isinstance(value, dict) else {}
         # 명세는 content, 이쪽은 answer 로 읽는다. 여기서 맞춘다.
@@ -711,6 +822,132 @@ def compress_output(*args, **kwargs):
     """
     _summary, count = args[0]
     return {"compressed": count}
+
+
+#------------------------------------------------┌> 문서 이미지 설명
+
+
+@work_regist("describe_images_function")
+def describe_images_function(*args, **kwargs):
+    """등록된 그림마다 LLM 설명을 만들어 document_images 에 채운다.
+
+    질의 때 그림을 찾으려면 그림 내용이 텍스트로 있어야 한다. 그 텍스트를 여기서
+    만든다 — 업로드 때 장당 한 번이고, 질의 때는 다시 부르지 않는다.
+
+    provider 는 gemini 가 기본이다. hwpx 그림은 절반쯤이 bmp 인데 gpt·claude 는
+    그걸 400 으로 거절한다(ragmodul 실측).
+
+    동시에 여러 장을 보낸다. 순차로 돌리면 장당 몇 초 × 수십 장이라 업로드가 몇 분씩
+    길어진다. 동시 실행은 ragmodul 의 describe_images_all 이 맡고, 한 번에 너무 많이
+    던지지 않도록 IMAGE_CONCURRENCY 를 넘겨준다.
+
+    실패해도 업로드를 실패로 만들지 않는다. 색인은 이미 끝났고, 설명이 없는 그림은
+    검색에 안 걸릴 뿐이다 — 그것 때문에 문서 등록을 통째로 되돌릴 이유가 없다.
+    """
+    meta, (document_id, chunks, rows) = _step_in(args)
+    if not rows:
+        return _step_out(meta, (document_id, chunks, []))
+
+    described = _describe_images(rows)
+    print(f"[describe_images_function] 설명 {len(described)}/{len(rows)}장 "
+          f"(provider={IMAGE_PROVIDER}, 동시 {IMAGE_CONCURRENCY})")
+    return _step_out(meta, (document_id, chunks, described))
+
+
+def _describe_images(rows: list) -> list:
+    """그림들을 동시에 설명해 DB 에 저장한다. 설명이 붙은 행 목록.
+
+    동시 실행은 ragmodul 이 한다. 여기서 asyncio 를 쓰면 안 된다 — 그쪽은 스레드마다
+    루프를 하나 만들어 재사용하고 HTTP 클라이언트가 그 루프에 묶여 있는데, 우리가
+    asyncio.run 으로 루프를 새로 파면 같은 클라이언트를 다른 루프에서 쓰게 된다.
+    같은 이유로 그 루프 안에서는 db_call 도 못 부른다(DBManager 가 자기 루프에
+    run_until_complete 를 건다). 그래서 설명은 한 번에 받고, 저장은 여기서 한다.
+
+    로고·장식처럼 설명할 것이 없는 그림은 세 값이 다 비어서 온다. 실패한 그림도
+    빈 설명으로 온다(둘은 반환값으로 구분되지 않는다 — ragmodul 로그를 본다).
+    어느 쪽이든 결과에 넣지 않는다 — 억지로 임베딩하면 엉뚱한 질의에 걸린다.
+    """
+    rag = get_controller()
+
+    # 파일을 못 읽는 그림은 여기서 뺀다. 목록에 남겨두면 설명 결과와 행의 짝이 어긋난다.
+    targets = []
+    for row in rows:
+        path = _resolve_image_path(row.get("image_path") or "")
+        if path is None:
+            print(f"[describe_images] 파일 없음: {row.get('image_path')}")
+            continue
+        try:
+            targets.append((row, path, path.read_bytes()))
+        except OSError as e:
+            print(f"[describe_images] {path.name} 읽기 실패: {type(e).__name__} - {e}")
+    if not targets:
+        return []
+
+    descriptions = rag.describe_images_all(
+        [(data, _mime_type(path)) for _, path, data in targets],
+        provider=IMAGE_PROVIDER, max_concurrent=IMAGE_CONCURRENCY)
+
+    described = []
+    for (row, path, _data), desc in zip(targets, descriptions):
+        text = " ".join([desc.ai_summary, *desc.key_facts, *desc.key_phrases]).strip()
+        if not text:
+            print(f"[describe_images] {path.name} 설명 없음 — 건너뜀")
+            continue
+        # image_name·image_path 는 update 가 필수로 받는다. 안 넘기면 NULL 로 덮인다.
+        db_call("update_document_image", id=row["id"],
+                image_name=row["image_name"], image_path=row["image_path"],
+                ai_summary=desc.ai_summary, key_facts=list(desc.key_facts),
+                key_phrases=list(desc.key_phrases))
+        described.append({**row, "_text": text})
+    return described
+
+
+@work_regist("embed_images_function")
+def embed_images_function(*args, **kwargs):
+    """설명을 임베딩해 이미지 벡터로 저장한다.
+
+    설명 세 값을 이어붙인 문장 하나를 임베딩한다. 이미지 하나당 벡터 하나라 검색
+    결과가 그대로 이미지 목록이 된다.
+
+    임베딩은 목록을 한 번에 넘긴다 — 장마다 부르면 모델 호출이 장 수만큼 늘어난다.
+    """
+    meta, (document_id, chunks, described) = _step_in(args)
+    if not described:
+        return _step_out(meta, (document_id, chunks))
+
+    vectors = get_controller().embed_texts([row["_text"] for row in described])
+
+    saved = 0
+    for row, vector in zip(described, vectors):
+        if db_call("save_document_image_vector", image_id=row["id"],
+                   embedding=to_plain_vector(vector)):
+            saved += 1
+
+    print(f"[embed_images_function] 이미지 벡터 {saved}/{len(described)}개 저장")
+    # 뒤 단계(file_upload_register)는 등록 전 모양을 기대한다. 이미지 정보는 여기서 끝난다.
+    return _step_out(meta, (document_id, chunks))
+
+
+def _resolve_image_path(image_path: str):
+    """DB 의 image_path -> 실제 파일 경로. 없으면 None."""
+    from pathlib import Path
+
+    path = Path(image_path)
+    if path.exists():
+        return path
+    parts = path.parts
+    if parts and parts[0] != IMAGE_PATH and len(parts) > 1:
+        candidate = Path(IMAGE_PATH).joinpath(*parts[1:])
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _mime_type(path) -> str:
+    """확장자로 mime 을 정한다. gemini 가 형식을 보고 처리한다."""
+    import mimetypes
+
+    return mimetypes.guess_type(path.name)[0] or "image/png"
 
 
 #------------------------------------------------┌> 외부 데이터
@@ -801,7 +1038,9 @@ def user_query_output(*args, **kwargs):
     sources 는 검색 결과라 답변마다 같다. 최상위와 각 답변에 같은 값을 넣어 클라이언트가
     어느 쪽을 읽어도 되게 한다.
     """
-    req, answers, sources = args[0]
+    value = args[0]
+    req, answers, sources = value[:3]
+    images = value[3] if len(value) > 3 else []
     sources = sources or []
     return {
         "reply": answers[0]["answer"] if answers else "",
@@ -809,6 +1048,20 @@ def user_query_output(*args, **kwargs):
                      "sources": sources} for a in answers],
         "sessionId": req.get("session_id"),
         "sources": sources,
+        # 모델이 본 그림을 사용자도 본다. base64 는 빼고 URL 로 준다 — 응답에 실으면
+        # 방금 보낸 것을 되돌려주는 셈이라 무겁고, 파일은 /api/images 로 이미 나간다.
+        "images": [
+            {
+                "id": str(image.get("image_id") or ""),
+                "url": static_url(image.get("image_path") or "", IMAGE_PATH, "/api/images"),
+                "name": image.get("image_name"),
+                "caption": image.get("caption"),
+                "aiSummary": image.get("ai_summary"),
+                "documentId": str(image.get("document_id") or ""),
+                "documentTitle": image.get("document_title"),
+            }
+            for image in images
+        ],
     }
 
 
@@ -839,7 +1092,10 @@ def save_merged(*args, **kwargs):
         db_call("insert_message", session_id=session_id,
                 user_query=payload.get("query") or "",
                 ai_response=merged.get("answer") or "",
-                sources=merged.get("sources"))
+                sources=merged.get("sources"),
+                # 병합에 쓴 모델을 남긴다. "merged" 같은 종류 표시가 아니라 실제로
+                # 그 답변을 만든 모델이다 — 컬럼이 그 값을 담게 되어 있다.
+                provider=merged.get("provider"))
         print(f"[save_merged] 세션 {session_id} 에 병합 답변 저장")
     except Exception as e:                                   # noqa: BLE001
         print(f"[save_merged] 저장 실패, 답변은 그대로 보냄: {type(e).__name__} - {e}")
@@ -864,12 +1120,14 @@ def register_images(*args, **kwargs):
     비는 것과 색인을 통째로 되돌리는 것은 무게가 다르다.
     """
     meta, (document_id, document) = _step_in(args)
-    _register_images(document, document_id)
-    return _step_out(meta, (document_id, len(document.children())))
+    rows = _register_images(document, document_id)
+    # 뒤 단계(설명·임베딩)가 등록된 행의 id 와 경로를 쓴다. 개수만 넘기면 다시 조회해
+    # 이름으로 짝을 맞춰야 한다.
+    return _step_out(meta, (document_id, len(document.children()), rows))
 
 
-def _register_images(document, document_id: int) -> int:
-    """파서가 빼낸 이미지를 document_images 에 등록한다. 등록한 개수.
+def _register_images(document, document_id: int) -> list:
+    """파서가 빼낸 이미지를 document_images 에 등록한다. 등록된 행 목록.
 
     parse(image_dir=...) 가 이미 images/<문서명>/ 으로 파일을 복사해뒀다. 그 폴더를
     읽어 DB 에 이름과 경로만 남긴다 — 파일 자체는 /images 정적 경로로 나간다.
@@ -887,17 +1145,17 @@ def _register_images(document, document_id: int) -> int:
         folder = Path(IMAGE_PATH) / stem
         if not folder.is_dir():
             print(f"[_register_images] 이미지 폴더 없음: {folder}")
-            return 0
+            return []
 
         names = sorted(p.name for p in folder.iterdir() if p.is_file())
-        saved = 0
+        saved = []
         for name in names:
             row = db_call("create_document_image", document_id=document_id,
                           image_name=name, image_path=str(folder / name).replace("\\", "/"))
             if row:
-                saved += 1
-        print(f"[_register_images] 이미지 {saved}/{len(names)}개 등록 (document_id={document_id})")
+                saved.append(row)
+        print(f"[_register_images] 이미지 {len(saved)}/{len(names)}개 등록 (document_id={document_id})")
         return saved
     except Exception as e:                                   # noqa: BLE001
         print(f"[_register_images] 등록 실패, 건너뜀: {type(e).__name__} - {e}")
-        return 0
+        return []

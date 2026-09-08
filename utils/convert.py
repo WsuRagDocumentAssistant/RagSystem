@@ -22,3 +22,23 @@ def from_jsonb(value, default):
     if isinstance(value, str):
         value = json.loads(value or "null")
     return default if value is None else value
+
+
+def static_url(path: str, root: str, prefix: str) -> str | None:
+    """서버 로컬 경로 -> 브라우저가 열 수 있는 URL. root 밖이면 None.
+
+    main.py 가 /api/documents 와 /api/images 를 정적 경로로 내보낸다. 그 아래 있는
+    파일만 URL 로 바꾼다 — 밖의 경로를 그대로 노출하면 서버 파일이 새어 나간다.
+
+    문서 쪽과 질의 쪽이 같은 규칙으로 URL 을 만들어야 해서 여기로 올렸다.
+    """
+    from pathlib import Path
+    from urllib.parse import quote
+
+    if not path:
+        return None
+    try:
+        rel = Path(path).resolve().relative_to(Path(root).resolve())
+    except (ValueError, OSError):
+        return None
+    return f"{prefix}/" + quote(rel.as_posix())

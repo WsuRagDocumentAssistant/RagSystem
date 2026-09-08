@@ -36,3 +36,7 @@ brotli>=1.2.0
 # rag-router 가 python-dotenv==1.2.2 를 못박아 둔다. 여기서 다른 버전을 요구하면
 # pip 이 해결하지 못하고 빌드가 멈춘다(실제로 겪었다).
 python-dotenv==1.2.2
+
+# 파서가 BMP 를 PNG 로 바꿀 때 쓴다. 없으면 BMP 가 그대로 남아
+# gpt/claude 는 400, 로컬은 500 으로 거절한다(실측).
+Pillow

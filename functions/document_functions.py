@@ -5,7 +5,8 @@
 
 from taskcontroller import work_regist, tasks
 from functions.data_functions import db_call, _to_millis   # DB 호출은 예외처리까지 묶여 있다
-from functions.rag_functions import UploadStep, _step_in       # 업로드 체인이 meta 를 나르는 방법
+from functions.rag_functions import UploadStep, _step_in
+from utils import static_url as _static_url       # 업로드 체인이 meta 를 나르는 방법
 
 #────────────────────────────────────────────────┌> 태스크
 
@@ -62,6 +63,7 @@ tasks["FILE_UPLOAD"] = ["file_upload_input",
                         "parse_function", "chunk_function",
                         "vocab_function", "filter_vocab_function", "save_vocab_function",
                         "embed_function", "save_function", "register_images",
+                        "describe_images_function", "embed_images_function",
                         "file_upload_register"]
 
 # get_vocab 은 DB 원본(word/replacement)을 그대로 준다. 클라이언트는 term/synonyms 로
@@ -404,24 +406,6 @@ def _resolve_image(image_path: str):
         if candidate.exists():
             return candidate
     return path
-
-
-def _static_url(path: str, root: str, prefix: str) -> str | None:
-    """서버 로컬 경로 -> 브라우저가 열 수 있는 URL.
-
-    main.py 가 /documents 와 /images 를 정적 경로로 내보낸다. 그 아래에 있는 파일만
-    URL 로 바꾼다 — 밖의 경로를 그대로 노출하면 서버 파일이 새어 나간다.
-    """
-    from pathlib import Path
-    from urllib.parse import quote
-
-    if not path:
-        return None
-    try:
-        rel = Path(path).resolve().relative_to(Path(root).resolve())
-    except (ValueError, OSError):
-        return None
-    return f"{prefix}/" + quote(rel.as_posix())
 
 
 def _find_document_file(row: dict):

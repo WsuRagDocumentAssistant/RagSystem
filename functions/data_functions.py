@@ -370,6 +370,8 @@ def chat_session_messages_output(*args, **kwargs):
             messages.append({"id": f"{turn}-assistant", "role": "assistant",
                              "content": row["ai_response"], "createdAt": created,
                              "turnId": turn, "preferred": True,
+                             # 예전 대화는 NULL 이다. 클라이언트가 없으면 일반 말풍선으로 그린다.
+                             "provider": row.get("provider"),
                              # 저장 안 된 예전 대화는 NULL 이라 빈 목록이 된다.
                              "sources": from_jsonb(row.get("sources"), [])})
     return {"messages": messages}
@@ -619,8 +621,7 @@ def answer_save_input(*args, **kwargs):
     사용자가 비교 화면에서 고른 답변이다. 병합과 달리 LLM 을 부르지 않고 받은 것을
     그대로 넣는다.
 
-    provider 는 받아만 둔다. messages 에 컬럼이 없어 저장할 자리가 없다 — 로그로 남겨
-    어느 모델이 선택됐는지는 보이게 한다. 컬럼이 생기면 save_answer 에서 열면 된다.
+    provider 는 사용자가 고른 모델이다. messages.provider 에 그대로 저장한다.
     """
     req = args[0] if args and isinstance(args[0], dict) else {}
     payload = req.get("payload") or {}
@@ -656,7 +657,7 @@ def save_answer(*args, **kwargs):
 
     saved = db_call("insert_message", session_id=fields["session_id"],
                     user_query=fields["query"], ai_response=fields["content"],
-                    sources=fields["sources"])
+                    sources=fields["sources"], provider=fields["provider"] or None)
     if not saved:
         raise ValueError("답변을 저장하지 못했습니다.")
 
@@ -680,10 +681,12 @@ def save_conversation(*args, **kwargs):
 
     (req, answers) 를 그대로 흘려보낸다. 다음 단계가 user_query_output 이다.
     """
-    req, answers, sources = args[0]
+    # answer_function 이 그림까지 실어 보낸다(4칸). test_ 태스크에서는 3칸이다.
+    value = args[0]
+    req, answers, sources = value[:3]
     session_id = req.get("session_id")
     if not session_id:
-        return req, answers, sources
+        return value
 
     # 비교 질의면 여기서 저장하지 않는다. 최종 답변이 아직 안 정해졌기 때문이다 —
     # 사용자가 병합하거나(MERGE_RESULTS) 하나를 고르면(CHAT_ANSWER_SAVE) 그때 그 답변이
@@ -698,7 +701,7 @@ def save_conversation(*args, **kwargs):
     if requested > 1 or len(answers) > 1:
         print(f"[save_conversation] 비교 질의(요청 {requested}개, 답변 {len(answers)}개)"
               f" — 병합·선택 때 저장한다")
-        return req, answers, sources
+        return value
 
     query = (req.get("payload") or {}).get("query") or ""
     reply = answers[0]["answer"] if answers else ""
@@ -707,12 +710,13 @@ def save_conversation(*args, **kwargs):
         # 출처는 answer_function 이 함께 넘겨준 것이다. jsonb 컬럼이라 목록을 그대로
         # 넘기면 db_manager 가 json 문자열로 만들어 보낸다.
         db_call("insert_message", session_id=session_id, user_query=query,
-                ai_response=reply, sources=sources)
+                ai_response=reply, sources=sources,
+                provider=answers[0]["provider"] if answers else None)
         print(f"[save_conversation] 세션 {session_id} 에 저장")
     except Exception as e:                                   # noqa: BLE001
         print(f"[save_conversation] 저장 실패, 답변은 그대로 보냄: {type(e).__name__} - {e}")
 
-    return req, answers, sources
+    return value
 
 
 @work_regist("sync_db_api_data")
