@@ -685,12 +685,19 @@ def save_conversation(*args, **kwargs):
     if not session_id:
         return req, answers, sources
 
-    # 답변이 여럿이면 여기서 저장하지 않는다. 최종 답변이 아직 안 정해졌기 때문이다 —
-    # 사용자가 병합하거나(MERGE_RESULTS) 하나를 고르면 그때 그 답변이 질문과 함께
-    # 한 행으로 저장된다. 여기서 answers[0] 을 넣어두면 최종 답변과 두 행이 되고,
-    # 질문도 두 번 남는다.
-    if len(answers) > 1:
-        print(f"[save_conversation] 답변 {len(answers)}개 — 병합·선택 때 저장한다")
+    # 비교 질의면 여기서 저장하지 않는다. 최종 답변이 아직 안 정해졌기 때문이다 —
+    # 사용자가 병합하거나(MERGE_RESULTS) 하나를 고르면(CHAT_ANSWER_SAVE) 그때 그 답변이
+    # 질문과 함께 한 행으로 저장된다. 여기서 answers[0] 을 넣어두면 최종 답변과 두 행이
+    # 되고 질문도 두 번 남는다.
+    #
+    # "성공한 답변 수" 가 아니라 "요청한 provider 수" 로 판단한다. 셋을 요청했는데 둘이
+    # 실패하면 답변은 하나인데 사용자는 여전히 비교 화면에 있다 — 그걸 저장해두면
+    # 그 하나를 고를 때 CHAT_ANSWER_SAVE 가 또 저장해 중복이 된다.
+    chosen = (req.get("payload") or {}).get("provider")
+    requested = len(chosen) if isinstance(chosen, (list, tuple)) else 1
+    if requested > 1 or len(answers) > 1:
+        print(f"[save_conversation] 비교 질의(요청 {requested}개, 답변 {len(answers)}개)"
+              f" — 병합·선택 때 저장한다")
         return req, answers, sources
 
     query = (req.get("payload") or {}).get("query") or ""

@@ -107,9 +107,6 @@ TOP_K_FINAL = int(os.environ.get("RAG_TOP_K_FINAL", "5"))        # LLM 에 실�
 # 고를 수 있는 목록에도 없다 — 다듬은 결과만 나간다.
 DRAFT_PROVIDER = os.environ.get("RAG_DRAFT_PROVIDER", "local_llm")
 
-# 사용자가 고른 provider 들. 초안을 각자 다듬는다. 여기서 나온 것만 클라이언트로 간다.
-ANSWER_PROVIDERS = [p for p in os.environ.get("RAG_LLM_PROVIDERS", "gpt").split(",") if p]
-
 # 병합에 쓸 provider. 답변을 낸 것과 달라도 된다 — 판단 작업이라 더 센 모델을 쓸 수 있다.
 MERGE_WITH = os.environ.get("RAG_MERGE_WITH") or "gpt"
 
@@ -579,8 +576,25 @@ def answer_function(*args, **kwargs):
                        history=history, summary=summary)
     print(f"[answer_function] 초안 {DRAFT_PROVIDER} {len(draft):,}자 (내부용)")
 
-    # 클라이언트가 고른 모델. 없으면 설정값으로 떨어진다(통신부 없이 돌리는 test_ 태스크).
-    providers = [p] if (p := (req.get("payload") or {}).get("provider")) else ANSWER_PROVIDERS
+    # 클라이언트가 고른 모델. 배열로 온다 — 비교 화면에서 여러 개를 고르면 여럿,
+    # 하나만 고르면 하나짜리 배열이다. 문자열도 받아준다.
+    #
+    # 배열로 받는 게 중요한 이유: provider 마다 요청을 따로 보내면 같은 질의로 검색·
+    # 리랭킹·초안 생성이 그 수만큼 반복된다(실측 28초 × N). 한 번에 받으면 그 앞단이
+    # 한 번만 돌고 다듬기만 병렬로 늘어난다.
+    chosen = (req.get("payload") or {}).get("provider")
+    if isinstance(chosen, (list, tuple)):
+        providers = [str(name) for name in chosen if name]
+    elif chosen:
+        providers = [str(chosen)]
+    else:
+        providers = []
+
+    # 클라이언트가 최소 하나를 강제하므로 빈 값은 오지 않는다. 그래도 확인은 남긴다 —
+    # 빈 목록을 그대로 넘기면 refine_all 이 아무것도 부르지 않고
+    # "다듬기가 전부 실패했습니다: []" 라는 엉뚱한 문장이 사용자에게 간다.
+    if not providers:
+        raise ValueError("답변할 모델(provider)이 지정되지 않았습니다.")
 
     # dict 로 넘기면 ragmodul 이 title·source 만 쓴다(_format_external). 문자열로 넘기면
     # 그 줄을 그대로 실어주므로, 응답 원문까지 붙여 보낸다.
@@ -777,14 +791,24 @@ def user_query_output(*args, **kwargs):
     보내기 때문에(ChatService.sendMessage), 여기서 비우면 대화가 매번 끊긴다.
     세션 work 이 붙으면 새로 만든 id 로 바뀐다.
 
-    answers 는 명세에 없지만 provider 를 여러 개 쓸 때 비교 화면에 필요하다.
+    answers 는 provider 를 여러 개 골랐을 때 비교 화면이 쓴다. 모양을 MERGE_RESULTS
+    payload 와 같게(provider/content/sources) 맞춰서, 클라이언트가 변환 없이 그대로
+    실어 보낼 수 있게 한다.
+
+    실패한 provider 는 answers 에 없다. 셋을 보냈는데 둘만 오면 하나가 실패한 것이다 —
+    refine_all 이 성공한 것만 돌려주기 때문이다. 전부 실패하면 앞 단계가 예외를 낸다.
+
+    sources 는 검색 결과라 답변마다 같다. 최상위와 각 답변에 같은 값을 넣어 클라이언트가
+    어느 쪽을 읽어도 되게 한다.
     """
     req, answers, sources = args[0]
+    sources = sources or []
     return {
         "reply": answers[0]["answer"] if answers else "",
-        "answers": answers,
+        "answers": [{"provider": a["provider"], "content": a["answer"],
+                     "sources": sources} for a in answers],
         "sessionId": req.get("session_id"),
-        "sources": sources or [],
+        "sources": sources,
     }
 
 
