@@ -8,7 +8,6 @@ import multiprocessing
 import logging
 import os
 import queue
-import sys
 import threading
 
 from taskcontroller import work_lst, TaskController,tasks, Task
@@ -39,9 +38,8 @@ def timer_loop(executor, stop_event):
     """
     while not stop_event.is_set():
         executor.task_queue.put(Task(tasks["api_all_update"], None))
-        print()
         # 실행부가 (task, result) 로 돌려준다
-        print("[타이머] api_all_update 결과 :", _unwrap(executor.get_task_result()))
+        logger.info("타이머 api_all_update 결과: %s", _unwrap(executor.get_task_result()))
         stop_event.wait(TIMER_INTERVAL)
 
 GATEWAY_TIMEOUT = 600   # 초. 라우터 기본값 60 은 색인에 턱없이 모자란다
@@ -59,20 +57,15 @@ GATEWAY_TIMEOUT = 600   # 초. 라우터 기본값 60 은 색인에 턱없이 �
 GATEWAY_WORKERS = int(os.environ.get("RAG_GATEWAY_WORKERS", "1"))
 
 # 정적으로 내보낼 폴더. rag_functions / document_functions 가 파일을 떨구는 곳과 같다.
-IMAGE_DIR = os.environ.get("RAG_IMAGE_DIR", "images")
-DOCUMENT_DIR = os.environ.get("RAG_DOCUMENT_DIR", "documents")
+from utils import IMAGE_DIR, DOCUMENT_DIR
 
 logger = logging.getLogger("bridge")
 
 
 def _unwrap(outcome):
-    """실행부가 돌려주는 (task, result) 에서 결과만 꺼낸다.
-
-    실패 갈래는 아직 결과만 오는 경우가 있어 두 모양을 다 받는다.
-    """
-    if isinstance(outcome, tuple) and len(outcome) == 2:
-        return outcome[1]
-    return outcome
+    """실행부가 돌려주는 (task, result) 에서 결과만 꺼낸다."""
+    _task, result = outcome
+    return result
 
 # 실행부에 넘긴 요청들. job_id -> 라우터 Task.
 _pending: dict = {}
@@ -135,26 +128,12 @@ def bridge_collect_loop(executor, stop_event):
         except queue.Empty:
             continue
 
-        # 실행부가 (task, result) 로 보낸다. 실패 갈래는 아직 결과만 오는 경우가
-        # 있어서 두 모양을 다 받는다.
-        if isinstance(outcome, tuple) and len(outcome) == 2:
-            done_task, result = outcome
-        else:
-            done_task, result = None, outcome
-
-        params = getattr(done_task, "params", None) or {}
-        job_id = params.get("job_id")
+        # 실행부가 성공이든 실패든 (task, result) 로 보낸다. job_id 는 그 task 에
+        # 실려 있으므로 결과가 어느 순서로 오든 짝이 맞는다.
+        done_task, result = outcome
+        job_id = (getattr(done_task, "params", None) or {}).get("job_id")
 
         with _pending_lock:
-            if job_id is None and _pending:
-                # job_id 를 못 실어온 결과. 실행부의 실패 갈래가 아직 (task, result) 가
-                # 아니라 TaskExecutionError 만 보내서 그렇다.
-                #
-                # 워커가 하나면 실행 순서가 곧 도착 순서라, 가장 먼저 넣은 요청이 그것이다
-                # (dict 는 넣은 순서를 지킨다). 워커를 늘리면 이 가정이 깨지므로,
-                # 실행부가 실패 때도 task 를 실어 보내도록 고치는 게 맞다.
-                job_id = next(iter(_pending))
-                logger.warning("job_id 없는 결과 — 가장 오래된 요청(%s)으로 본다", job_id)
             task = _pending.pop(job_id, None)
 
         if task is None:
@@ -189,39 +168,6 @@ def _error_message(failure, task) -> str:
     if head.strip() == "ValueError" and detail:
         return detail.strip()
     return f"작업 실행에 실패했습니다: {task.task_type}"
-
-
-def print_task():
-    for idx, task in enumerate(tasks):
-        print(f"[{idx}] {task}", end="\n")
-
-
-def menu_loop(taskcontroller, taskexecutor, stop_event):
-    """터미널에서 직접 태스크를 돌려보는 통로.
-
-    컨테이너(docker CMD python main.py)에는 stdin 이 없어 input() 이 EOF 로 즉시
-    돌아온다. 그래서 tty 일 때만 띄운다.
-
-    통신부와 실행부를 따로 쓴다. 같은 결과 큐를 보면 HTTP 요청의 결과를 메뉴가
-    가져가 버린다(타이머를 따로 둔 것과 같은 이유).
-    """
-    while not stop_event.is_set():
-        print_task()
-        print("\n------------------------------------------------------")
-        print("[q] 종료")
-        print("[w] task 입력")
-
-        key = input("메뉴 입력: ")
-
-        match key:
-            case "q":
-                break
-
-            case "w":
-                task_name = input("이름 입력: ")
-                taskcontroller.task_queue.put((task_name, None))
-                result = _unwrap(taskexecutor.get_task_result())
-                print(f"결과 : {result}")
 
 
 if __name__ == "__main__":
@@ -266,18 +212,6 @@ if __name__ == "__main__":
     stop_timer = threading.Event()
     threading.Thread(target=timer_loop, args=(timerexecutor, stop_timer), daemon=True).start()
 
-    # ── 메뉴 전용 (터미널에서 띄웠을 때만) ──────────────
-    taskexecutor = taskcontroller = None
-    stop_menu = threading.Event()
-    if sys.stdin is not None and sys.stdin.isatty():
-        taskexecutor = TaskExecutor()
-        taskcontroller = TaskController(taskexecutor.get_task_queue())
-        taskexecutor.start()
-        taskcontroller.start()
-        threading.Thread(target=menu_loop,
-                         args=(taskcontroller, taskexecutor, stop_menu),
-                         daemon=True).start()
-
     try:
         from rag_router.gateway import gateway
 
@@ -294,16 +228,17 @@ if __name__ == "__main__":
         # (다운로드가 .html 로 받아진다).
         from fastapi.staticfiles import StaticFiles
 
-        for url_path, directory in (("/api/images", IMAGE_DIR), ("/api/documents", DOCUMENT_DIR)):
-            os.makedirs(directory, exist_ok=True)
-            gateway.app.mount(url_path, StaticFiles(directory=directory), name=url_path.strip("/"))
-        logger.info("정적 경로 연결: /images -> %s, /documents -> %s", IMAGE_DIR, DOCUMENT_DIR)
+        os.makedirs(IMAGE_DIR, exist_ok=True)
+        os.makedirs(DOCUMENT_DIR, exist_ok=True)
+        gateway.app.mount("/api/images", StaticFiles(directory=IMAGE_DIR), name="api/images")
+        gateway.app.mount("/api/documents", StaticFiles(directory=DOCUMENT_DIR), name="api/documents")
+        logger.info("정적 경로 연결: /api/images -> %s, /api/documents -> %s",
+                    IMAGE_DIR, DOCUMENT_DIR)
 
         gateway.run()          # uvicorn. 블로킹이다
     finally:
         stop_bridge.set()
         stop_timer.set()
-        stop_menu.set()
 
         timerexecutor.stop()
         timerexecutor.collect()   # 결과 큐를 비워야 자식이 join 에서 멈추지 않는다
@@ -322,10 +257,3 @@ if __name__ == "__main__":
             ex.join()
         gwcontroller.terminate()  # TaskController 에는 정상 종료 신호가 없다
         gwcontroller.join()
-
-        if taskexecutor is not None:
-            taskexecutor.stop()
-            taskexecutor.collect()   # 결과 큐를 비워야 자식이 join 에서 멈추지 않는다
-            taskexecutor.join()
-            taskcontroller.terminate()
-            taskcontroller.join()

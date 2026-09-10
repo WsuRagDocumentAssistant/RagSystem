@@ -21,6 +21,7 @@ DB 는 RagController 를 거치지 않는다(use_db=False). 저장 프로시저�
 넘어가지 않는다. 환경변수는 spawn 시점에 상속되므로 넘어간다.
 """
 
+import logging
 import os
 import typing
 
@@ -28,7 +29,9 @@ from taskcontroller import work_regist, tasks
 from ragmodul import RagController, chunk, parse
 from ragmodul.util import document_to_payload, to_plain_sparse, to_plain_vector
 from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
-from utils import from_jsonb, static_url
+from utils import from_jsonb, static_url, IMAGE_DIR, UNPACK_DIR
+
+logger = logging.getLogger(__name__)
 
 #────────────────────────────────────────────────┌> 테스트 태스크
 
@@ -93,11 +96,7 @@ def _default_device() -> str | None:
 # RAG_DEVICE 로 강제할 수 있다("cuda" / "cuda:1" / "cpu"). 없으면 위 규칙을 따른다.
 DEVICE = os.environ.get("RAG_DEVICE") or _default_device()
 
-UNPACK_DIR = os.environ.get("RAG_UNPACK_DIR", "unpacked")
 HWPX_FILE_PATH = os.environ.get("RAG_HWPX_FILE", "C:/Users/user/Desktop/RagSystem/test_file/2주기(2023년) 2022 ~ 2024 대학혁신지원사업 성과평가보고서.hwpx")
-# 정적 서빙(main.py 의 IMAGE_DIR)과 같은 환경변수를 본다. 어긋나면 저장한 곳과
-# 내보내는 곳이 달라져서 이미지가 안 뜬다.
-IMAGE_PATH = os.environ.get("RAG_IMAGE_DIR", "images")
 
 QUERY = os.environ.get("RAG_QUERY", "솔드림에 대해 설명해줘")
 
@@ -139,15 +138,19 @@ IMAGE_CONCURRENCY = int(os.environ.get("RAG_IMAGE_CONCURRENCY", "4"))
 #
 # 두 장인 이유: 로컬에 1MB 그림 한 장을 붙이면 초안이 3초쯤 걸린다(실측). 장수만큼
 # 늘어나므로, 답변을 기다리는 시간과 맞바꾸는 값이다.
-IMAGE_SEARCH_TOP_K = int(os.environ.get("RAG_IMAGE_SEARCH_TOP_K", "3"))
+# 후보는 넉넉히 뽑고 리랭커가 줄인다. 문서 검색과 같은 방식이다 — 약한 신호(유사도)로
+# 미리 자른 뒤 강한 신호(리랭커)에게 남은 것만 주는 건 순서가 거꾸로다.
+IMAGE_SEARCH_TOP_K = int(os.environ.get("RAG_IMAGE_SEARCH_TOP_K", "20"))
 IMAGE_ATTACH_MAX = int(os.environ.get("RAG_IMAGE_ATTACH_MAX", "2"))
 
 # 이 아래 점수는 버린다. 유사도 검색은 질의가 무엇이든 상위 몇 개를 돌려주므로
 # 문턱이 없으면 상관없는 그림이 딸려 나온다.
 #
-# 0.4 는 자리를 채운 값이지 실측이 아니다. 검색된 그림의 similarity 를 전부 로그에
-# 찍어두었으니, 실제 질의 몇 개를 돌려보고 정하면 된다.
-IMAGE_MIN_SIMILARITY = float(os.environ.get("RAG_IMAGE_MIN_SIMILARITY", "0.4"))
+# 코사인 유사도 대신 리랭커 점수로 거른다. 코사인은 절대값을 해석하기 어려운데
+# 리랭커 점수는 관련성으로 학습돼서 0~1 로 나온다. 0.01 은 ragmodul 이 문서 맥락으로
+# 재서 정한 바닥값이다(무관한 질의 최고점이 0.000445 였다). 이미지 설명으로는 아직
+# 재보지 않았으니, 로그의 점수를 보고 조정하면 된다.
+IMAGE_MIN_RERANK = float(os.environ.get("RAG_IMAGE_MIN_RERANK", "0.01"))
 
 # 외부 API 검색 개수. 1 이다 — 이건 근거가 아니라 "이런 것도 받아올 수 있다" 는
 # 안내라서, 여러 개를 늘어놓으면 답변 끝이 목록이 된다.
@@ -216,7 +219,7 @@ def get_controller() -> RagController:
             RERANKER_MODEL_PATH,
             device=DEVICE,
             unpack_dir=UNPACK_DIR,
-            image_dir=IMAGE_PATH,
+            image_dir=IMAGE_DIR,
             use_db=False,
             llm_api_config=cfg.llm_api,
             local_llm_config=cfg.local_llm,
@@ -229,7 +232,7 @@ def get_controller() -> RagController:
 def warmup_function(*args, **kwargs):
     """모델을 미리 올려둔다. 첫 질의가 몇십 초 걸리는 걸 앞으로 당긴다."""
     rag = get_controller()
-    print(f"[warmup_function] 준비 완료. LLM: {', '.join(rag.llm.providers())}")
+    logger.info(f"[warmup_function] 준비 완료. LLM: {', '.join(rag.llm.providers())}")
     return "ready"
 
 #------------------------------------------------┌> 문서 등록
@@ -241,6 +244,14 @@ def parse_function(*args, **kwargs):
 
     FILE_UPLOAD 는 앞 work 이 방금 저장한 경로를 넘겨준다. 메뉴로 돌리는 test_ 태스크는
     params 가 None 이라 args 가 비고, 그때는 상수로 떨어진다. 문자열만 경로로 인정한다.
+
+    끝나면 압축을 푼 자리를 치운다. 그 폴더를 읽는 건 파싱하는 동안뿐이다 — parse 가
+    hwpx 를 거기 풀고 그림을 images/ 로 복사해 오면 그걸로 끝이고, 뒤 단계(청킹·임베딩·
+    저장)는 메모리의 모델만 본다. 그대로 두면 문서마다 압축 해제분이 쌓인다(219MB
+    문서면 그만큼이다).
+
+    실패했을 때는 남긴다. 무엇을 받았는지 열어봐야 하는 경우가 그때다 — hwp 를 hwpx 로
+    올려서 zip 이 아니라던 일이 있었다. 실패는 드물어서 쌓이지도 않는다.
     """
     meta, value = _step_in(args)
     file_path = value if isinstance(value, str) and value else HWPX_FILE_PATH
@@ -249,10 +260,38 @@ def parse_function(*args, **kwargs):
             "문서 경로가 비어 있습니다. RAG_HWPX_FILE 환경변수나 "
             "rag_functions.HWPX_FILE_PATH 를 지정하세요."
         )
-    print(f"[parse_function] 파싱 시작: {file_path}")
-    parsed = parse(file_path, unpack_dir=UNPACK_DIR, image_dir=IMAGE_PATH)
-    print(f"[parse_function] 파싱 종료: block {len(parsed.blocks)}개")
+    logger.info(f"[parse_function] 파싱 시작: {file_path}")
+    parsed = parse(file_path, unpack_dir=UNPACK_DIR, image_dir=IMAGE_DIR)
+    logger.info(f"[parse_function] 파싱 종료: block {len(parsed.blocks)}개")
+    _clear_unpacked()
     return _step_out(meta, parsed)
+
+
+def _clear_unpacked() -> None:
+    """압축을 푼 자리를 비운다. 폴더째로 지운다.
+
+    그 문서 것만 골라 지우지 않는 이유는 배치를 우리가 모르기 때문이다. parse 안에서도
+    "BinData 를 가진 폴더를 찾는" 방식으로 더듬어 찾고 있다(라이브러리가 바뀌면 규칙이
+    달라진다는 뜻이다). 통째로 지우는 편이 그 규칙에 기대지 않는다.
+
+    통째로 지워도 되는 전제는 "같은 순간에 두 문서를 파싱하지 않는다" 다. 실행부가
+    프로세스 하나로 큐를 처리하고 있어서 지금은 성립한다(그 개수는 main.py 의
+    RAG_GATEWAY_WORKERS 가 정한다 — 이 파일에는 손잡이가 없다).
+
+    그 전제가 깨지면(실행부가 여럿이 되면) 남의 문서 파싱 중간 산출물을 지울 수 있다.
+    그때는 parse 쪽에 그 문서 것만 지우는 통로가 필요하다.
+
+    지우지 못해도 파싱을 실패로 만들지 않는다. 디스크에 남는 것뿐이다.
+    """
+    import shutil
+
+    try:
+        shutil.rmtree(UNPACK_DIR, ignore_errors=False)
+        logger.info(f"[parse_function] 압축 해제분 삭제: {UNPACK_DIR}")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"[parse_function] 압축 해제분 삭제 실패: {type(e).__name__} - {e}")
 
 
 @work_regist("chunk_function")
@@ -260,7 +299,7 @@ def chunk_function(*args, **kwargs):
     """DocumentModel -> ChunkedDocument (parent/child)."""
     meta, parsed = _step_in(args)
     document = chunk(parsed)
-    print(f"[chunk_function] 청킹 종료: parent {len(document.parents)}, "
+    logger.info(f"[chunk_function] 청킹 종료: parent {len(document.parents)}, "
           f"child {len(document.children())}")
     return _step_out(meta, document)
 
@@ -274,7 +313,7 @@ def embed_function(*args, **kwargs):
     """
     meta, parsed = _step_in(args)
     document = get_controller().embed_bge_m3(parsed)
-    print(f"[embed_function] 임베딩 종료: child {len(document.children())}개")
+    logger.info(f"[embed_function] 임베딩 종료: child {len(document.children())}개")
     return _step_out(meta, document)
 
 
@@ -310,7 +349,7 @@ def save_function(*args, **kwargs):
     # 임베딩까지 다 해놓고 검색에 안 잡히는 문서가 생긴다.
     if document_id is None:
         raise ValueError("문서 색인에 실패했습니다. 잠시 후 다시 시도해주세요.")
-    print(f"[save_function] 저장 종료: document_id={document_id}, "
+    logger.info(f"[save_function] 저장 종료: document_id={document_id}, "
           f"child {len(document.children())}개")
     # 업로드 체인은 다음 단계(register_images)가 document 를 봐야 해서 함께 넘긴다.
     # RAG 태스크와 메뉴는 예전처럼 document_id 하나만 받는다.
@@ -344,7 +383,7 @@ def vocab_function(*args, **kwargs):
     # 조각 하나가 실패해도 나머지는 돌려준다. 중복은 다음 단계(filter_vocab)가 지운다.
     pairs = rag.extract_vocab_all(chunks, provider=VOCAB_PROVIDER)
 
-    print(f"[vocab_function] {sum(len(c) for c in chunks):,}자 "
+    logger.info(f"[vocab_function] {sum(len(c) for c in chunks):,}자 "
           f"-> {len(chunks)}덩어리 -> {len(pairs)}짝")
     return _step_out(meta, (pairs, document))
 
@@ -360,9 +399,9 @@ def filter_vocab_function(*args, **kwargs):
     meta, (pairs, document) = _step_in(args)
     kept, dropped = get_controller().filter_vocab(pairs)
     for pair in kept:
-        print(f"[filter_vocab_function] {pair.term} -> {pair.expansion}")
+        logger.info(f"[filter_vocab_function] {pair.term} -> {pair.expansion}")
     for pair, reason in dropped:
-        print(f"[filter_vocab_function] 버림({reason}) {pair.term}")
+        logger.info(f"[filter_vocab_function] 버림({reason}) {pair.term}")
     return _step_out(meta, (kept, document))
 
 
@@ -377,7 +416,7 @@ def save_vocab_function(*args, **kwargs):
         "save_vocab_pairs",
         pairs=[{"term": p.term, "expansion": p.expansion} for p in kept],
     )
-    print(f"[save_vocab_function] 확장어 {added}개 추가")
+    logger.info(f"[save_vocab_function] 확장어 {added}개 추가")
     return _step_out(meta, document)
 
 
@@ -415,7 +454,7 @@ def embed_query_function(*args, **kwargs):
 
     vocab = load_vocab()
     vector, weights = get_controller().embed_query(query, vocab)
-    print(f"[embed_query_function] 사전 {len(vocab)}개 적용 / 질의 {query[:40]!r}")
+    logger.info(f"[embed_query_function] 사전 {len(vocab)}개 적용 / 질의 {query[:40]!r}")
     return req, query, vector, weights
 
 
@@ -462,7 +501,7 @@ def hybrid_search_function(*args, **kwargs):
         document_ids=document_ids,      # None 이면 전체 검색
     ) or []
     scope = f"문서 {document_ids} 한정" if document_ids else "전체"
-    print(f"[hybrid_search_function] 조각 {len(hits)}개 ({scope})")
+    logger.info(f"[hybrid_search_function] 조각 {len(hits)}개 ({scope})")
     return req, query, hits
 
 
@@ -488,12 +527,12 @@ def rerank_function(*args, **kwargs):
     rag = get_controller()
 
     contexts = rag.build_contexts(hits)
-    print(f"[rerank_function] 맥락 {len(contexts)}개 "
+    logger.info(f"[rerank_function] 맥락 {len(contexts)}개 "
           f"(승격 {sum(1 for c in contexts if c.merged)})")
 
     ordered = rag.rerank(query, contexts, top_k=TOP_K_FINAL)
     for rank, context in enumerate(ordered, 1):
-        print(f"[rerank_function] {rank}. score={context.rerank_score:.4f} "
+        logger.info(f"[rerank_function] {rank}. score={context.rerank_score:.4f} "
               f"merged={context.merged} {context.breadcrumb[:60]}")
     return req, query, ordered
 
@@ -527,7 +566,7 @@ def history_function(*args, **kwargs):
     context = db_call("get_session_context", session_id=session_id) or {}
     summary = context.get("overall_summary") or ""
 
-    print(f"[history_function] 이전 대화 {len(history)}차례, 요약 {len(summary)}자")
+    logger.info(f"[history_function] 이전 대화 {len(history)}차례, 요약 {len(summary)}자")
     return req, query, contexts, refs, {"history": history, "summary": summary}
 
 
@@ -556,23 +595,28 @@ def search_images_function(*args, **kwargs):
     try:
         images = _search_images(req, query)
     except Exception as e:                                   # noqa: BLE001
-        print(f"[search_images_function] 건너뜀: {type(e).__name__} - {e}")
+        logger.warning(f"[search_images_function] 건너뜀: {type(e).__name__} - {e}")
         images = []
     return req, query, contexts, refs, session, images
 
 
 def _search_images(req, query: str) -> list:
-    """그림 검색. 모델에 실을 payload 까지 붙여 돌려준다.
+    """그림 검색. 화면에 띄울 행 목록을 돌려준다.
 
-    payload 는 [{"mime_type", "data": base64}] 모양이다(ragmodul aask 가 받는 것).
-    파일을 못 읽는 행은 뺀다 — 화면에는 띄우고 모델에는 못 보내는 반쪽이 되면
-    답변과 그림이 어긋난다.
+    모델에는 그림을 보내지 않는다. 색인할 때 만들어둔 설명(ai_summary)이 이미
+    검색을 태웠고, 그림 자체를 다시 실어 보내면 장당 몇 초가 답변 시간에 더해진다
+    (로컬 실측 1MB 3.2초). 사용자는 답변 옆에서 그림을 직접 본다.
+
+    후보를 넉넉히 뽑아 리랭커로 줄인다. 벡터 검색은 의미가 비슷한 것을 찾을 뿐이라,
+    "2026년 취업률 그래프" 처럼 숫자와 이름이 걸린 질의에서 순위가 흔들린다.
+    리랭커는 질의와 설명을 함께 보고 판정하므로 그 자리를 메운다.
+
+    파일이 실제로 있는 행만 남긴다 — 없는 파일의 URL 을 내보내면 화면에 깨진
+    그림이 뜨고, 그런 걸 리랭킹하는 것도 낭비다.
     """
-    import base64
-
     rag = get_controller()
     if not rag.is_image_query(query):
-        print(f"[search_images] 그림을 찾는 질의가 아니다 — 건너뜀")
+        logger.info("[search_images] 그림을 찾는 질의가 아니다 — 건너뜀")
         return []
 
     vector, _ = rag.embed_query(query)
@@ -581,35 +625,44 @@ def _search_images(req, query: str) -> list:
                    top_k=IMAGE_SEARCH_TOP_K,
                    document_ids=_document_ids(req)) or []
 
-    # 점수를 전부 찍는다. 문턱값을 실측으로 정하려면 버린 것도 보여야 한다.
-    picked = []
+    candidates, texts = [], []
     for row in rows:
-        score = row.get("similarity") or 0.0
-        mark = "o" if score >= IMAGE_MIN_SIMILARITY else "x"
-        print(f"[search_images] {mark} sim={score:.4f} {row.get('image_name')} "
-              f"({row.get('document_title')})")
-        if score >= IMAGE_MIN_SIMILARITY:
+        # 설명이 없는 그림은 판정할 근거가 없다. 로고·장식이라 설명이 비어 있거나,
+        # 색인 때 설명 생성이 실패한 경우다.
+        text = " ".join(x for x in (row.get("ai_summary"), row.get("caption")) if x).strip()
+        if not text:
+            continue
+        if _resolve_image_path(row.get("image_path") or "") is None:
+            logger.warning(f"[search_images] 파일 없음: {row.get('image_path')}")
+            continue
+        candidates.append(row)
+        texts.append(text)
+
+    if not candidates:
+        logger.info(f"[search_images] 후보 없음 (검색 {len(rows)})")
+        return []
+
+    # 문턱은 여기서 걸지 않는다. 버린 것의 점수도 로그로 봐야 문턱을 실측으로 정할
+    # 수 있어서, 전부 받아놓고 아래에서 자른다.
+    ranked = rag.rerank_texts(query, texts, min_score=None)
+
+    picked = []
+    for index, score in ranked:
+        row = candidates[index]
+        if score < IMAGE_MIN_RERANK:
+            mark = "x"          # 문턱 미달
+        elif len(picked) >= IMAGE_ATTACH_MAX:
+            mark = "-"          # 점수는 됐는데 자리가 찼다
+        else:
+            mark = "o"
             picked.append(row)
+        logger.info(f"[search_images] {mark} rerank={score:.4f} "
+                    f"sim={row.get('similarity') or 0:.4f} "
+                    f"{row.get('image_name')} ({row.get('document_title')})")
 
-    images = []
-    for row in picked[:IMAGE_ATTACH_MAX]:
-        path = _resolve_image_path(row.get("image_path") or "")
-        if path is None:
-            print(f"[search_images] 파일 없음: {row.get('image_path')}")
-            continue
-        try:
-            data = path.read_bytes()
-        except OSError as e:
-            print(f"[search_images] {path.name} 읽기 실패: {type(e).__name__} - {e}")
-            continue
-        images.append({**row, "_payload": {
-            "mime_type": _mime_type(path),
-            "data": base64.b64encode(data).decode("ascii"),
-        }})
-
-    print(f"[search_images] 그림 {len(images)}장 첨부 (검색 {len(rows)}, "
-          f"문턱 {IMAGE_MIN_SIMILARITY} 통과 {len(picked)})")
-    return images
+    logger.info(f"[search_images] 그림 {len(picked)}장 "
+                f"(검색 {len(rows)}, 후보 {len(candidates)}, 문턱 {IMAGE_MIN_RERANK})")
+    return picked
 
 
 def _dedup_sources(rows) -> list:
@@ -668,12 +721,11 @@ def answer_function(*args, **kwargs):
     req, query, contexts, refs, session = value[:5]
     images = value[5] if len(value) > 5 else []
     history, summary = session["history"], session["summary"]
-    payload = [image["_payload"] for image in images]
     rag = get_controller()
 
-    # 그림은 초안에도 준다. 로컬도 이미지를 받는다(실측 png 1MB 3.2초, 두 장도 됨).
-    # 초안이 그림을 보고 써야 다듬는 쪽이 "초안이 그림을 제대로 읽었는지" 를 볼 수 있다
-    # — refine 프롬프트가 그걸 전제로 쓰여 있다.
+    # 그림은 모델에 넘기지 않는다. 찾은 그림은 응답에만 실어 사용자가 보게 한다
+    # (user_query_output). 그림을 프롬프트에 얹으면 장당 몇 초가 답변 시간에 더해지는데,
+    # 그 내용은 색인할 때 만들어둔 설명으로 이미 검색을 태웠다.
     #
     # 초안에는 외부 데이터를 주지 않는다. DRAFT_PROVIDER 가 로컬 모델이라 API 응답
     # 원문이 붙으면 게이트웨이가 413 으로 자른다(실측 32KB). 최종 답변은 다듬기
@@ -683,8 +735,8 @@ def answer_function(*args, **kwargs):
     # 같은 대화를 보고 있어야 한다(ragmodul arefine 의 설명). 실은 만큼 맥락 예산에서
     # 빼주므로 로컬이 넘치지 않는다.
     draft = rag.answer(query, contexts, provider=DRAFT_PROVIDER,
-                       history=history, summary=summary, images=payload)
-    print(f"[answer_function] 초안 {DRAFT_PROVIDER} {len(draft):,}자 (내부용)")
+                       history=history, summary=summary)
+    logger.info(f"[answer_function] 초안 {DRAFT_PROVIDER} {len(draft):,}자 (내부용)")
 
     # 클라이언트가 고른 모델. 배열로 온다 — 비교 화면에서 여러 개를 고르면 여럿,
     # 하나만 고르면 하나짜리 배열이다. 문자열도 받아준다.
@@ -710,11 +762,10 @@ def answer_function(*args, **kwargs):
     # 그 줄을 그대로 실어주므로, 응답 원문까지 붙여 보낸다.
     external = [_format_api_ref(ref) for ref in refs]
     answers = rag.refine_all(query, contexts, draft, providers,
-                             external=external, history=history, summary=summary,
-                             images=payload)
+                             external=external, history=history, summary=summary)
     for name in providers:
         mark = f"{len(answers[name]):,}자" if name in answers else "실패"
-        print(f"[answer_function] 다듬기 {name} {mark}")
+        logger.info(f"[answer_function] 다듬기 {name} {mark}")
 
     if not answers:
         raise RuntimeError(f"다듬기가 전부 실패했습니다: {providers}")
@@ -723,7 +774,7 @@ def answer_function(*args, **kwargs):
     # 출처를 필요로 한다. 요청 봉투(req)에 얹지 않고 함께 넘긴다 — 봉투는 통신부가
     # 만든 것이라 우리 중간 결과를 섞지 않는다.
     sources = _to_sources(contexts)
-    print(f"[answer_function] 출처 {len(sources)}건")
+    logger.info(f"[answer_function] 출처 {len(sources)}건")
 
     return (req,
             [{"provider": name, "answer": text} for name, text in answers.items()],
@@ -764,7 +815,7 @@ def merge_function(*args, **kwargs):
     provider = payload.get("provider") or MERGE_WITH
 
     merged = get_controller().merge(query, [a["answer"] for a in answers], provider=provider)
-    print(f"[merge_function] {provider} 병합 {len(merged):,}자")
+    logger.info(f"[merge_function] {provider} 병합 {len(merged):,}자")
     # 합친 답변의 출처는 재료가 된 답변들의 출처를 합집합으로 둔다 — 같은 질의에
     # 대한 답변들이라 근거 문서도 그 답변들이 본 것 전부다. 질의 체인 뒤에 붙었을
     # 때는(test_레그질의병합) 앞 단계가 준 것을 그대로 쓴다.
@@ -792,7 +843,7 @@ def compress_session(*args, **kwargs):
                    limit_count=COMPRESS_SCAN_TURNS) or []
     dropped = rows[:-KEEP_TURNS] if len(rows) > KEEP_TURNS else []
     if not dropped:
-        print(f"[compress_session] 밀려난 차례 없음 ({len(rows)}차례)")
+        logger.info(f"[compress_session] 밀려난 차례 없음 ({len(rows)}차례)")
         return "", 0
 
     context = db_call("get_session_context", session_id=session_id) or {}
@@ -809,7 +860,7 @@ def compress_session(*args, **kwargs):
     if topic:
         db_call("update_current_topic", session_id=session_id, topic=topic)
 
-    print(f"[compress_session] {len(dropped)}차례 압축 -> {len(summary)}자, 주제={topic!r}")
+    logger.info(f"[compress_session] {len(dropped)}차례 압축 -> {len(summary)}자, 주제={topic!r}")
     return summary, len(dropped)
 
 
@@ -849,7 +900,7 @@ def describe_images_function(*args, **kwargs):
         return _step_out(meta, (document_id, chunks, []))
 
     described = _describe_images(rows)
-    print(f"[describe_images_function] 설명 {len(described)}/{len(rows)}장 "
+    logger.info(f"[describe_images_function] 설명 {len(described)}/{len(rows)}장 "
           f"(provider={IMAGE_PROVIDER}, 동시 {IMAGE_CONCURRENCY})")
     return _step_out(meta, (document_id, chunks, described))
 
@@ -874,12 +925,12 @@ def _describe_images(rows: list) -> list:
     for row in rows:
         path = _resolve_image_path(row.get("image_path") or "")
         if path is None:
-            print(f"[describe_images] 파일 없음: {row.get('image_path')}")
+            logger.info(f"[describe_images] 파일 없음: {row.get('image_path')}")
             continue
         try:
             targets.append((row, path, path.read_bytes()))
         except OSError as e:
-            print(f"[describe_images] {path.name} 읽기 실패: {type(e).__name__} - {e}")
+            logger.warning(f"[describe_images] {path.name} 읽기 실패: {type(e).__name__} - {e}")
     if not targets:
         return []
 
@@ -891,7 +942,7 @@ def _describe_images(rows: list) -> list:
     for (row, path, _data), desc in zip(targets, descriptions):
         text = " ".join([desc.ai_summary, *desc.key_facts, *desc.key_phrases]).strip()
         if not text:
-            print(f"[describe_images] {path.name} 설명 없음 — 건너뜀")
+            logger.info(f"[describe_images] {path.name} 설명 없음 — 건너뜀")
             continue
         # image_name·image_path 는 update 가 필수로 받는다. 안 넘기면 NULL 로 덮인다.
         db_call("update_document_image", id=row["id"],
@@ -923,7 +974,7 @@ def embed_images_function(*args, **kwargs):
                    embedding=to_plain_vector(vector)):
             saved += 1
 
-    print(f"[embed_images_function] 이미지 벡터 {saved}/{len(described)}개 저장")
+    logger.info(f"[embed_images_function] 이미지 벡터 {saved}/{len(described)}개 저장")
     # 뒤 단계(file_upload_register)는 등록 전 모양을 기대한다. 이미지 정보는 여기서 끝난다.
     return _step_out(meta, (document_id, chunks))
 
@@ -936,8 +987,8 @@ def _resolve_image_path(image_path: str):
     if path.exists():
         return path
     parts = path.parts
-    if parts and parts[0] != IMAGE_PATH and len(parts) > 1:
-        candidate = Path(IMAGE_PATH).joinpath(*parts[1:])
+    if parts and parts[0] != IMAGE_DIR and len(parts) > 1:
+        candidate = Path(IMAGE_DIR).joinpath(*parts[1:])
         if candidate.exists():
             return candidate
     return None
@@ -972,13 +1023,13 @@ def search_api_function(*args, **kwargs):
             top_k=TOP_K_API,
         ) or []
     except Exception as e:
-        print(f"[search_api_function] 건너뜀: {type(e).__name__} - {e}")
+        logger.warning(f"[search_api_function] 건너뜀: {type(e).__name__} - {e}")
 
     for ref in refs:
-        print(f"[search_api_function] {ref['title']} "
+        logger.info(f"[search_api_function] {ref['title']} "
               f"({ref['source']}) sim={ref['similarity']:.4f}")
     if not refs:
-        print("[search_api_function] 관련 외부 데이터 없음")
+        logger.info("[search_api_function] 관련 외부 데이터 없음")
     return req, query, contexts, refs
 
 @work_regist("embed_api_function")
@@ -1003,14 +1054,14 @@ def embed_api_function(*args, **kwargs):
     """
     row = args[0] if args else None
     if not row or not row.get("url"):
-        print("[embed_api_function] 등록된 행이 없어 건너뜁니다")
+        logger.warning("[embed_api_function] 등록된 행이 없어 건너뜁니다")
         return None
 
     text = f"{row['title']} · {row['source']}"
     vector = get_controller().embed_texts([text])[0]
     db_call("save_api_data_vector", url=row["url"], embedding=vector)
 
-    print(f"[embed_api_function] 벡터 저장: {text}")
+    logger.info(f"[embed_api_function] 벡터 저장: {text}")
     return row["url"]
 
 #────────────────────────────────────────────────┌> 통신부 task (명세 task_type)
@@ -1053,7 +1104,7 @@ def user_query_output(*args, **kwargs):
         "images": [
             {
                 "id": str(image.get("image_id") or ""),
-                "url": static_url(image.get("image_path") or "", IMAGE_PATH, "/api/images"),
+                "url": static_url(image.get("image_path") or "", IMAGE_DIR, "/api/images"),
                 "name": image.get("image_name"),
                 "caption": image.get("caption"),
                 "aiSummary": image.get("ai_summary"),
@@ -1085,7 +1136,7 @@ def save_merged(*args, **kwargs):
 
     session_id = req.get("session_id") or payload.get("sessionId")
     if not session_id:
-        print("[save_merged] sessionId 가 없어 저장 건너뜀")
+        logger.warning("[save_merged] sessionId 가 없어 저장 건너뜀")
         return req, merged
 
     try:
@@ -1096,9 +1147,9 @@ def save_merged(*args, **kwargs):
                 # 병합에 쓴 모델을 남긴다. "merged" 같은 종류 표시가 아니라 실제로
                 # 그 답변을 만든 모델이다 — 컬럼이 그 값을 담게 되어 있다.
                 provider=merged.get("provider"))
-        print(f"[save_merged] 세션 {session_id} 에 병합 답변 저장")
+        logger.info(f"[save_merged] 세션 {session_id} 에 병합 답변 저장")
     except Exception as e:                                   # noqa: BLE001
-        print(f"[save_merged] 저장 실패, 답변은 그대로 보냄: {type(e).__name__} - {e}")
+        logger.warning(f"[save_merged] 저장 실패, 답변은 그대로 보냄: {type(e).__name__} - {e}")
 
     return req, merged
 
@@ -1142,9 +1193,9 @@ def _register_images(document, document_id: int) -> list:
 
     try:
         stem = Path(getattr(document.file, "filename", "") or "document").stem
-        folder = Path(IMAGE_PATH) / stem
+        folder = Path(IMAGE_DIR) / stem
         if not folder.is_dir():
-            print(f"[_register_images] 이미지 폴더 없음: {folder}")
+            logger.info(f"[_register_images] 이미지 폴더 없음: {folder}")
             return []
 
         names = sorted(p.name for p in folder.iterdir() if p.is_file())
@@ -1154,8 +1205,8 @@ def _register_images(document, document_id: int) -> list:
                           image_name=name, image_path=str(folder / name).replace("\\", "/"))
             if row:
                 saved.append(row)
-        print(f"[_register_images] 이미지 {len(saved)}/{len(names)}개 등록 (document_id={document_id})")
+        logger.info(f"[_register_images] 이미지 {len(saved)}/{len(names)}개 등록 (document_id={document_id})")
         return saved
     except Exception as e:                                   # noqa: BLE001
-        print(f"[_register_images] 등록 실패, 건너뜀: {type(e).__name__} - {e}")
+        logger.warning(f"[_register_images] 등록 실패, 건너뜀: {type(e).__name__} - {e}")
         return []

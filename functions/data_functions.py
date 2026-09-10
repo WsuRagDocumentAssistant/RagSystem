@@ -18,6 +18,8 @@ import db_manager
 from functions.exception_functions import safe_call
 from utils import from_jsonb
 
+logger = logging.getLogger(__name__)
+
 #────────────────────────────────────────────────┌> 테스트 태스크
 
 # session-data
@@ -187,7 +189,7 @@ def api_data(*args, **kwargs) -> ApiEntity:
     )
     if not request.url:
         raise ValueError("payload 에 url 이 없습니다.")
-    print(f"[create_api_data] 수집: {request.title} ({request.url[:60]})")
+    logger.info(f"[create_api_data] 수집: {request.title} ({request.url[:60]})")
     return asyncio.run(collect(request))
 
 # DB에 저장, API 결과 리스트 반환
@@ -310,7 +312,7 @@ def chat_session_list_input(*args, **kwargs):
     try:
         uuid.UUID(str(user_id))
     except (ValueError, AttributeError, TypeError):
-        print(f"[chat_session_list_input] user_id 가 아닌 토큰({user_id!r}) — 빈 목록으로 처리")
+        logger.warning(f"[chat_session_list_input] user_id 가 아닌 토큰({user_id!r}) — 빈 목록으로 처리")
         return None
 
     return user_id
@@ -499,7 +501,7 @@ def save_db_words(*args, **kwargs):
         else:
             if db_call("insert_word", word=term, replacement=synonyms) is not None:
                 added += 1
-    print(f"[save_db_words] 추가 {added}개, 수정 {updated}개")
+    logger.info(f"[save_db_words] 추가 {added}개, 수정 {updated}개")
     return added, updated
 
 
@@ -567,7 +569,7 @@ def ensure_session(*args, **kwargs):
 
     user_id = req.get("token")
     if not _is_uuid(user_id):
-        print(f"[ensure_session] user_id 가 아닌 토큰({user_id!r}) — 세션 없이 진행")
+        logger.warning(f"[ensure_session] user_id 가 아닌 토큰({user_id!r}) — 세션 없이 진행")
         return req
 
     # create_new_session 은 "새채팅" 전용이라 시간과 무관하게 항상 새로 만든다.
@@ -576,7 +578,7 @@ def ensure_session(*args, **kwargs):
     created = db_call("create_new_session", user_id=user_id)
     session_id = created.get("session_id") if isinstance(created, dict) else created
     if not session_id:
-        print("[ensure_session] 세션 생성 실패 — 세션 없이 진행")
+        logger.warning("[ensure_session] 세션 생성 실패 — 세션 없이 진행")
         return req
 
     req["session_id"] = str(session_id)
@@ -589,7 +591,7 @@ def ensure_session(*args, **kwargs):
     if title:
         db_call("update_session_title", session_id=req["session_id"], title=title[:30])
 
-    print(f"[ensure_session] 새 세션 {req['session_id']} 제목={title[:30]!r}")
+    logger.info(f"[ensure_session] 새 세션 {req['session_id']} 제목={title[:30]!r}")
     return req
 
 @work_regist("delete_session")
@@ -609,7 +611,7 @@ def delete_session(*args, **kwargs):
         raise ValueError(f"올바른 sessionId 가 아닙니다: {session_id!r}")
 
     deleted = db_call("delete_session", session_id=session_id)
-    print(f"[delete_session] {session_id} 삭제 결과: {deleted}")
+    logger.info(f"[delete_session] {session_id} 삭제 결과: {deleted}")
     if not deleted:
         raise ValueError("대화를 삭제하지 못했습니다. 이미 삭제됐거나 메시지가 남아 있습니다.")
     return {}
@@ -661,7 +663,7 @@ def save_answer(*args, **kwargs):
     if not saved:
         raise ValueError("답변을 저장하지 못했습니다.")
 
-    print(f"[save_answer] 세션 {fields['session_id']} 에 저장 "
+    logger.info(f"[save_answer] 세션 {fields['session_id']} 에 저장 "
           f"(provider={fields['provider']!r}, 출처 {len(fields['sources'])}건)")
     return saved
 
@@ -699,7 +701,7 @@ def save_conversation(*args, **kwargs):
     chosen = (req.get("payload") or {}).get("provider")
     requested = len(chosen) if isinstance(chosen, (list, tuple)) else 1
     if requested > 1 or len(answers) > 1:
-        print(f"[save_conversation] 비교 질의(요청 {requested}개, 답변 {len(answers)}개)"
+        logger.info(f"[save_conversation] 비교 질의(요청 {requested}개, 답변 {len(answers)}개)"
               f" — 병합·선택 때 저장한다")
         return value
 
@@ -712,9 +714,9 @@ def save_conversation(*args, **kwargs):
         db_call("insert_message", session_id=session_id, user_query=query,
                 ai_response=reply, sources=sources,
                 provider=answers[0]["provider"] if answers else None)
-        print(f"[save_conversation] 세션 {session_id} 에 저장")
+        logger.info(f"[save_conversation] 세션 {session_id} 에 저장")
     except Exception as e:                                   # noqa: BLE001
-        print(f"[save_conversation] 저장 실패, 답변은 그대로 보냄: {type(e).__name__} - {e}")
+        logger.warning(f"[save_conversation] 저장 실패, 답변은 그대로 보냄: {type(e).__name__} - {e}")
 
     return value
 
@@ -738,7 +740,7 @@ def sync_db_api_data(*args, **kwargs):
         source=row.get("source"), key=row.get("key"))))
 
     db_call("update_api_data_date", url=url, data=entity.data)
-    print(f"[sync_db_api_data] 갱신: {row.get('title')}")
+    logger.info(f"[sync_db_api_data] 갱신: {row.get('title')}")
 
     # 갱신된 date 를 읽어야 하므로 다시 조회한다
     rows = db_call("select_all_api_data") or []

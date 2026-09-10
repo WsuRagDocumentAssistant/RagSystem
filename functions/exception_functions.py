@@ -8,6 +8,9 @@ work 이 예외를 그대로 올리면 TaskExecutor 가 TaskExecutionError 로 �
 트레이스백 수십 줄이 화면을 덮고, 여러 건을 도는 작업은 그 회차 전체가 중단된다.
 여기서 잡아 한 줄로 요약하고 None 을 돌려준다.
 """
+import logging
+
+logger = logging.getLogger(__name__)
 
 #────────────────────────────────────────────────
 
@@ -37,5 +40,5 @@ def safe_call(func, *args, label="", **kwargs):
     try:
         return func(*args, **kwargs)
     except Exception as e:
-        print(f"[실패] {label} : {error_message(e)}")
+        logger.warning(f"[실패] {label} : {error_message(e)}")
         return None

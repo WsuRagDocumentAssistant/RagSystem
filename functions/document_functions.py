@@ -3,10 +3,13 @@
 # document_functions.py
 #================================================
 
+import logging
 from taskcontroller import work_regist, tasks
 from functions.data_functions import db_call, _to_millis   # DB 호출은 예외처리까지 묶여 있다
-from functions.rag_functions import UploadStep, _step_in
-from utils import static_url as _static_url       # 업로드 체인이 meta 를 나르는 방법
+from functions.rag_functions import UploadStep, _step_in       # 업로드 체인이 meta 를 나르는 방법
+from utils import static_url as _static_url, IMAGE_DIR, DOCUMENT_DIR
+
+logger = logging.getLogger(__name__)
 
 #────────────────────────────────────────────────┌> 태스크
 
@@ -36,7 +39,9 @@ tasks["get_report_type_options"]       = ["get_report_type_options"]
 
 tasks["FILE_LIST"]     = ["list_documents", "file_list_output"]   # payload 없음
 
-tasks["FILE_DELETE"]   = ["file_id_input", "delete_document", "file_delete_output"]
+# 행을 먼저 읽는다. 지운 뒤에는 어느 파일을 치워야 하는지 알 수 없다.
+tasks["FILE_DELETE"]   = ["file_id_input", "get_document", "delete_document_row",
+                          "delete_document_files", "file_delete_output"]
 
 tasks["FILE_DOWNLOAD"] = ["file_id_input", "get_document", "file_download_output"]
 
@@ -138,7 +143,7 @@ def get_document(*args, **kwargs):
 @work_regist("list_documents")
 def list_documents(*args, **kwargs):
     document_list = db_call("list_documents")
-    print(f" db 적용됐는지 확인하는 코드입니다{document_list}")
+    logger.info(f" db 적용됐는지 확인하는 코드입니다{document_list}")
     return document_list
 
 # 파일명 부분일치 검색
@@ -241,6 +246,77 @@ def file_list_output(*args, **kwargs):
     ]
 
 
+@work_regist("delete_document_row")
+def delete_document_row(*args, **kwargs):
+    """문서 행을 지우고, 파일을 치울 수 있게 행을 그대로 넘긴다.
+
+    DB 를 먼저 지운다. 파일을 먼저 지우면 그 뒤 DB 삭제가 실패했을 때 행은 남았는데
+    파일이 없는 상태가 된다 — 목록에 보이는데 다운로드도 그림도 안 되는 문서가 생긴다.
+    반대 순서면 남는 건 아무도 안 보는 파일뿐이라 되돌리기도 쉽다.
+    """
+    row = args[0] or {}
+    if not row.get("id"):
+        raise ValueError("삭제할 문서를 찾지 못했습니다.")
+
+    deleted = db_call("delete_document", id=row["id"])
+    logger.info(f"[delete_document_row] id={row['id']} 삭제 결과: {deleted}")
+    if not deleted:
+        raise ValueError("문서를 삭제하지 못했습니다.")
+    return row
+
+
+@work_regist("delete_document_files")
+def delete_document_files(*args, **kwargs):
+    """문서에 딸린 파일을 치운다. 원본 하나와 이미지 폴더 하나다.
+
+    DB 는 파일시스템을 모르니 이건 우리 몫이다. 안 치우면 문서를 지워도 원본과
+    이미지가 그대로 남는다 — 그림이 많은 문서는 폴더 하나가 수백 MB 다.
+
+    이미지 폴더 이름은 문서명의 stem 이다(parse 가 images/<문서명>/ 으로 넣는다).
+    원본도 같은 stem 으로 찾는다 — DB 의 source_path 는 hwpx 내부 이름이라 확장자가
+    없어서, 폴더에서 이름이 같은 파일을 찾는 방식을 그대로 쓴다.
+
+    실패해도 삭제를 실패로 만들지 않는다. 행은 이미 지워져서 사용자에게는 사라진
+    문서다 — 파일이 남은 것은 우리가 나중에 치울 문제다.
+    """
+    from pathlib import Path
+    import shutil
+
+    row = args[0] or {}
+
+    path = _find_document_file(row)
+    if path is not None:
+        try:
+            path.unlink()
+            logger.info(f"[delete_document_files] 원본 삭제: {path.name}")
+        except OSError as e:
+            logger.warning(f"[delete_document_files] 원본 삭제 실패: {type(e).__name__} - {e}")
+
+    stem = Path((row.get("source_path") or row.get("filename") or "").strip()).stem
+    if not stem:
+        return row
+
+    folder = Path(IMAGE_DIR) / stem
+    # 상위 이동이 섞인 이름으로 폴더 밖을 지우는 것을 막는다. stem 은 DB 값이지만
+    # 그 값의 출처는 문서 내부 이름이라 우리가 정한 것이 아니다.
+    try:
+        inside = folder.resolve().parent == Path(IMAGE_DIR).resolve()
+    except OSError:
+        inside = False
+    if not inside:
+        logger.warning(f"[delete_document_files] 이미지 폴더가 아님, 건너뜀: {folder}")
+        return row
+
+    if folder.is_dir():
+        try:
+            count = sum(1 for _ in folder.iterdir())
+            shutil.rmtree(folder)
+            logger.info(f"[delete_document_files] 이미지 폴더 삭제: {folder} ({count}개)")
+        except OSError as e:
+            logger.warning(f"[delete_document_files] 이미지 폴더 삭제 실패: {type(e).__name__} - {e}")
+    return row
+
+
 @work_regist("file_delete_output")
 def file_delete_output(*args, **kwargs):
     """삭제된 id -> {}.
@@ -258,8 +334,6 @@ import base64
 import os
 import re
 
-# 업로드된 원본이 쌓이는 곳. TEST_FILE_PATH 가 가리키던 자리와 같다.
-DOCUMENT_DIR = os.environ.get("RAG_DOCUMENT_DIR", "documents")
 
 
 def _safe_name(name: str) -> str:
@@ -294,7 +368,7 @@ def file_upload_input(*args, **kwargs):
     raw = base64.b64decode(content)
     with open(path, "wb") as f:
         f.write(raw)
-    print(f"[file_upload_input] 저장: {path} ({len(raw):,} bytes)")
+    logger.info(f"[file_upload_input] 저장: {path} ({len(raw):,} bytes)")
 
     # 이 뒤로는 meta 를 UploadStep 에 실어 나른다. 체인이 값 하나만 넘기는데
     # 마지막 단계(register_document)가 분류값을 필요로 하기 때문이다.
@@ -339,7 +413,7 @@ def file_upload_register(*args, **kwargs):
     meta = {**meta, "source_path": source_path}
 
     if not db_call("register_document", **meta):
-        print(f"[file_upload_register] 분류값 등록 실패(source_path={source_path!r}) — 색인은 완료됨")
+        logger.warning(f"[file_upload_register] 분류값 등록 실패(source_path={source_path!r}) — 색인은 완료됨")
     return {"fileId": str(document_id), "status": "ready", "chunks": chunks}
 
 
@@ -360,13 +434,12 @@ def list_all_words(*args, **kwargs):
     search = ((req.get("payload") or {}).get("search") or "").strip()
 
     vocab = load_vocab() or {}
-    print(f"[get_vocab] 사전 {len(vocab)}개" + (f" / 검색 {search!r}" if search else ""))
+    logger.info(f"[get_vocab] 사전 {len(vocab)}개" + (f" / 검색 {search!r}" if search else ""))
     return {"entries": vocab, "search": search}
 
 
 #────────────────────────────────────────────────┌> 다운로드 / 이미지
 
-IMAGE_DIR = os.environ.get("RAG_IMAGE_DIR", "images")
 
 
 def _document_files_by_stem() -> dict:
@@ -445,7 +518,7 @@ def file_download_output(*args, **kwargs):
     row = args[0] or {}
     path = _find_document_file(row)
     if path is None:
-        print(f"[file_download_output] 원본 파일 없음: {row.get('source_path')!r}")
+        logger.info(f"[file_download_output] 원본 파일 없음: {row.get('source_path')!r}")
         return {"url": None}
 
     return {"url": _static_url(str(path), DOCUMENT_DIR, "/api/documents")}
@@ -484,7 +557,7 @@ def file_image_list_output(*args, **kwargs):
         }
         for index, r in enumerate(rows)
     ]
-    print(f"[file_image_list_output] 이미지 {len(images)}개 (document_id={document_id})")
+    logger.info(f"[file_image_list_output] 이미지 {len(images)}개 (document_id={document_id})")
     return {"images": images}
 
 
@@ -577,7 +650,7 @@ def save_document_image(*args, **kwargs):
     saved = db_call("update_document_image", **fields)
     if not saved:
         raise ValueError("이미지 설명을 저장하지 못했습니다.")
-    print(f"[save_document_image] id={fields['id']} 저장 필드={list(fields)}")
+    logger.info(f"[save_document_image] id={fields['id']} 저장 필드={list(fields)}")
     return saved
 
 
@@ -637,12 +710,12 @@ def replace_image_file(*args, **kwargs):
 
     if new != old and old.exists():
         os.remove(old)
-        print(f"[replace_image_file] 옛 파일 삭제: {old.name}")
+        logger.info(f"[replace_image_file] 옛 파일 삭제: {old.name}")
 
     # DB 에는 저장할 때와 같은 상대 경로 모양으로 넣는다.
     fields["image_name"] = new.name
     fields["image_path"] = old_path.rsplit("/", 1)[0] + "/" + new.name if "/" in old_path else new.name
-    print(f"[replace_image_file] {old.name} -> {new.name} ({new.stat().st_size:,} bytes)")
+    logger.info(f"[replace_image_file] {old.name} -> {new.name} ({new.stat().st_size:,} bytes)")
     return fields
 
 
