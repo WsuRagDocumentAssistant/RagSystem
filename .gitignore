@@ -12,3 +12,5 @@ images/
 rag-app-secret.yaml
 
 models/
+
+docs/
