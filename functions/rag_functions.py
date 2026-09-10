@@ -704,6 +704,24 @@ def _to_sources(contexts) -> list:
                           for c in contexts if c.document_id is not None)
 
 
+def _image_answer(images: list) -> list:
+    """찾은 그림들 -> 답변 하나. LLM 을 부르지 않는다.
+
+    색인할 때 만들어둔 설명(ai_summary)을 그대로 쓴다. 문구는 고정이라 같은 질의에
+    같은 답이 나오고, 없는 사실이 끼어들 자리도 없다.
+
+    provider 는 비운다. 어느 모델도 부르지 않았으니 이름을 붙이면 거짓이 된다 —
+    클라이언트는 provider 가 없으면 일반 말풍선으로 그린다(대화 내역과 같은 규칙).
+    """
+    lines = [f"요청하신 그림 {len(images)}장을 찾았습니다.", ""]
+    for index, image in enumerate(images, 1):
+        summary = (image.get("ai_summary") or image.get("caption")
+                   or image.get("image_name") or "").strip()
+        title = image.get("document_title")
+        lines.append(f"{index}. {summary}" + (f" — {title}" if title else ""))
+    return [{"provider": None, "answer": chr(10).join(lines)}]
+
+
 @work_regist("answer_function")
 def answer_function(*args, **kwargs):
     """초안을 만들고 고른 모델들이 각자 다듬는다. [{provider, answer}, ...].
@@ -721,6 +739,17 @@ def answer_function(*args, **kwargs):
     req, query, contexts, refs, session = value[:5]
     images = value[5] if len(value) > 5 else []
     history, summary = session["history"], session["summary"]
+
+    # 그림을 찾는 질의였고 실제로 찾았으면 LLM 을 타지 않는다. 사용자가 원한 것은
+    # 그림이고 그 설명은 색인할 때 이미 만들어 뒀다 — 같은 내용을 모델에게 다시
+    # 쓰게 하면 시간과 돈만 든다.
+    #
+    # 그리고 지금 구조에서는 모델이 그림을 못 본다(이미지를 안 넘긴다). 그래서
+    # 그냥 두면 "사진 파일은 확인되지 않았습니다" 라고 답하면서 화면 옆에는 그림이
+    # 떠 있는 모순이 생긴다 — 실제로 그렇게 나왔다.
+    if images:
+        return req, _image_answer(images), _to_sources(contexts), images
+
     rag = get_controller()
 
     # 그림은 모델에 넘기지 않는다. 찾은 그림은 응답에만 실어 사용자가 보게 한다
