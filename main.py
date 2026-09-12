@@ -133,6 +133,16 @@ def bridge_collect_loop(executor, stop_event):
         done_task, result = outcome
         job_id = (getattr(done_task, "params", None) or {}).get("job_id")
 
+        # job_id 가 없으면 우리가 직접 넣은 작업이다(기동 시 warmup). 돌려보낼 곳이
+        # 없으니 결과만 확인하고 버린다. 실패를 조용히 넘기지는 않는다 — 모델 로딩이
+        # 실패하면 첫 질의가 올 때까지 모른 채로 있게 된다.
+        if job_id is None:
+            if isinstance(result, TaskExecutionError):
+                logger.error("내부 작업 실패: %s", result.tb)
+            else:
+                logger.info("워커 준비 완료: %r", result)
+            continue
+
         with _pending_lock:
             task = _pending.pop(job_id, None)
 
@@ -196,6 +206,18 @@ if __name__ == "__main__":
         ex.result_queue = shared_result_queue
     for ex in gwexecutors:
         ex.start()
+
+    # 워커마다 모델을 미리 올린다. get_controller() 는 실행부 프로세스 안에서만
+    # 불려야 해서(모델이 거기 올라간다) 작업으로 넣는 수밖에 없다 — 부모에서 부르면
+    # 부모에 올라가고 워커는 자기 것을 또 올린다. 그냥 두면 첫 요청이 모델 로딩
+    # 몇십 초를 기다리는데, 그게 모델을 쓰지도 않는 작업일 수 있다.
+    #
+    # 워커 수만큼 넣지만 어느 워커가 무엇을 집을지는 정해져 있지 않다. 하나가 둘을
+    # 집으면 다른 하나는 첫 요청 때 올린다 — 워커가 하나면 정확히 맞는다.
+    #
+    # 결과는 브릿지가 job_id 없는 것으로 알아보고 흘려보낸다.
+    for _ in gwexecutors:
+        shared_task_queue.put(Task(["warmup_function"], None))
 
     gwcontroller = TaskController(shared_task_queue)
     gwcontroller.start()

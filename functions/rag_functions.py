@@ -29,7 +29,7 @@ from taskcontroller import work_regist, tasks
 from ragmodul import RagController, chunk, parse
 from ragmodul.util import document_to_payload, to_plain_sparse, to_plain_vector
 from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
-from utils import from_jsonb, static_url, IMAGE_DIR, UNPACK_DIR
+from utils import from_jsonb, static_url, resolve_image_path, IMAGE_DIR, UNPACK_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +132,10 @@ IMAGE_PROVIDER = os.environ.get("RAG_IMAGE_PROVIDER", "gemini")
 # 동시에 몇 장을 보낼지. 큰 요청 여럿이 같은 순간에 나가면 429 가 난다(ragmodul 실측).
 # extract_vocab_all 이 쓰는 값과 같은 수준으로 잡았다. 429 가 보이면 줄인다.
 IMAGE_CONCURRENCY = int(os.environ.get("RAG_IMAGE_CONCURRENCY", "4"))
+
+# 그림을 SVG 로 바꿀 provider. 설명과 같은 이유로 gemini 다 — 문서 그림 절반이 bmp 고
+# 그걸 읽는 건 gemini 와 로컬뿐인데, 로컬은 SVG 를 그릴 만큼은 아니다.
+VECTORIZE_PROVIDER = os.environ.get("RAG_VECTORIZE_PROVIDER", "gemini")
 
 
 # 질의에 붙일 그림. 검색은 넉넉히 뽑고 그중 몇 장만 모델에 실어 보낸다.
@@ -268,14 +272,18 @@ def parse_function(*args, **kwargs):
 
 
 def _clear_unpacked() -> None:
-    """압축을 푼 자리를 비운다. 폴더째로 지운다.
+    """압축을 푼 자리를 비운다. 폴더는 남기고 안의 것만 지운다.
 
     그 문서 것만 골라 지우지 않는 이유는 배치를 우리가 모르기 때문이다. parse 안에서도
     "BinData 를 가진 폴더를 찾는" 방식으로 더듬어 찾고 있다(라이브러리가 바뀌면 규칙이
-    달라진다는 뜻이다). 통째로 지우는 편이 그 규칙에 기대지 않는다.
+    달라진다는 뜻이다). 안을 통째로 비우는 편이 그 규칙에 기대지 않는다.
 
-    통째로 지워도 되는 전제는 "같은 순간에 두 문서를 파싱하지 않는다" 다. 실행부가
-    프로세스 하나로 큐를 처리하고 있어서 지금은 성립한다(그 개수는 main.py 의
+    폴더 자체는 남긴다. UNPACK_DIR 은 환경변수로 바뀔 수 있고, 나중에 거기에 볼륨이
+    붙을 수도 있다 — 폴더를 통째로 지우면 마운트 지점을 지우는 셈이 되고, 잘못된 값이
+    들어왔을 때 피해가 커진다.
+
+    비워도 되는 전제는 "같은 순간에 두 문서를 파싱하지 않는다" 다. 실행부가 프로세스
+    하나로 큐를 처리하고 있어서 지금은 성립한다(그 개수는 main.py 의
     RAG_GATEWAY_WORKERS 가 정한다 — 이 파일에는 손잡이가 없다).
 
     그 전제가 깨지면(실행부가 여럿이 되면) 남의 문서 파싱 중간 산출물을 지울 수 있다.
@@ -284,14 +292,24 @@ def _clear_unpacked() -> None:
     지우지 못해도 파싱을 실패로 만들지 않는다. 디스크에 남는 것뿐이다.
     """
     import shutil
+    from pathlib import Path
 
-    try:
-        shutil.rmtree(UNPACK_DIR, ignore_errors=False)
-        logger.info(f"[parse_function] 압축 해제분 삭제: {UNPACK_DIR}")
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        logger.warning(f"[parse_function] 압축 해제분 삭제 실패: {type(e).__name__} - {e}")
+    root = Path(UNPACK_DIR)
+    if not root.is_dir():
+        return
+
+    removed = 0
+    for child in root.iterdir():
+        try:
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+            removed += 1
+        except OSError as e:
+            logger.warning(f"[parse_function] 압축 해제분 삭제 실패({child.name}): "
+                           f"{type(e).__name__} - {e}")
+    logger.info(f"[parse_function] 압축 해제분 삭제: {UNPACK_DIR} ({removed}개)")
 
 
 @work_regist("chunk_function")
@@ -632,7 +650,7 @@ def _search_images(req, query: str) -> list:
         text = " ".join(x for x in (row.get("ai_summary"), row.get("caption")) if x).strip()
         if not text:
             continue
-        if _resolve_image_path(row.get("image_path") or "") is None:
+        if resolve_image_path(row.get("image_path") or "", IMAGE_DIR) is None:
             logger.warning(f"[search_images] 파일 없음: {row.get('image_path')}")
             continue
         candidates.append(row)
@@ -952,7 +970,7 @@ def _describe_images(rows: list) -> list:
     # 파일을 못 읽는 그림은 여기서 뺀다. 목록에 남겨두면 설명 결과와 행의 짝이 어긋난다.
     targets = []
     for row in rows:
-        path = _resolve_image_path(row.get("image_path") or "")
+        path = resolve_image_path(row.get("image_path") or "", IMAGE_DIR)
         if path is None:
             logger.info(f"[describe_images] 파일 없음: {row.get('image_path')}")
             continue
@@ -1008,19 +1026,6 @@ def embed_images_function(*args, **kwargs):
     return _step_out(meta, (document_id, chunks))
 
 
-def _resolve_image_path(image_path: str):
-    """DB 의 image_path -> 실제 파일 경로. 없으면 None."""
-    from pathlib import Path
-
-    path = Path(image_path)
-    if path.exists():
-        return path
-    parts = path.parts
-    if parts and parts[0] != IMAGE_DIR and len(parts) > 1:
-        candidate = Path(IMAGE_DIR).joinpath(*parts[1:])
-        if candidate.exists():
-            return candidate
-    return None
 
 
 def _mime_type(path) -> str:
@@ -1192,6 +1197,22 @@ def merge_output(*args, **kwargs):
             "sources": merged.get("sources") or []}
 
 
+@work_regist("vectorize_image")
+def vectorize_image_function(*args, **kwargs):
+    """그림을 SVG 마크업으로 바꾼다. 문자열 하나를 돌려준다.
+
+    실패는 예외로 올라온다(ragmodul 이 그렇게 만들었다). 사용자가 버튼을 눌러
+    기다리는 결과라, 빈 값을 성공으로 돌려주면 화면이 빈 채로 남는다. 잘린 SVG 도
+    예외라서 깨진 마크업이 화면에 가지 않는다.
+    """
+    data, mime = args[0]
+
+    svg = get_controller().vectorize_image(data, mime, provider=VECTORIZE_PROVIDER)
+    logger.info(f"[vectorize_image] {mime} {len(data):,}바이트 -> SVG {len(svg):,}자 "
+                f"(provider={VECTORIZE_PROVIDER})")
+    return svg
+
+
 @work_regist("register_images")
 def register_images(*args, **kwargs):
     """파서가 빼낸 이미지를 document_images 에 등록한다. 업로드 체인의 한 단계다.
@@ -1206,35 +1227,68 @@ def register_images(*args, **kwargs):
     return _step_out(meta, (document_id, len(document.children()), rows))
 
 
+def _heading_titles(heading_path: list) -> dict:
+    """제목 경로 -> major/mid/minor_title. 앞 세 단계를 쓴다.
+
+    ['Ⅱ. 교육혁신', '2-1 전공 개편', '가. 배정 현황', '(1) 세부']
+      -> major='Ⅱ. 교육혁신', mid='2-1 전공 개편', minor='가. 배정 현황'
+
+    표 셀 안의 그림은 블록이 없어 경로가 비어 있다(ragmodul 설명). 그때는 빈 dict 다.
+    """
+    names = ("major_title", "mid_title", "minor_title")
+    return {name: value for name, value in zip(names, heading_path or []) if value}
+
+
 def _register_images(document, document_id: int) -> list:
     """파서가 빼낸 이미지를 document_images 에 등록한다. 등록된 행 목록.
 
-    parse(image_dir=...) 가 이미 images/<문서명>/ 으로 파일을 복사해뒀다. 그 폴더를
-    읽어 DB 에 이름과 경로만 남긴다 — 파일 자체는 /images 정적 경로로 나간다.
+    parse(image_dir=...) 가 파일을 복사하면서 model.document_images 에 목록을
+    붙여준다 — 저장 경로·문서 순서·제목 경로·캡션이 들어 있다.
 
-    폴더명은 파서가 문서 내부 filename 의 stem 으로 만든다(업로드 파일명이 아니다).
+    폴더를 훑지 않는 이유: 폴더에는 지난 업로드의 잔재가 남는다. 확장자가 바뀐
+    옛 파일(bmp -> png)이나 새 버전에서 없어진 그림까지 등록돼서, 지워진 그림이
+    계속 검색에 걸렸다(실측). 파서가 준 목록은 이번 파싱에서 나온 것만 담고 있다.
+
+    order 순으로 넣는다. 그러면 id 순서가 곧 문서 순서라, list_document_images
+    (ORDER BY id)가 문서에 나온 차례대로 돌려준다 — 파일명순으로 넣으면 image1,
+    image10, image11, image2 로 섞인다.
 
     실패해도 업로드를 실패로 만들지 않는다. 이미지는 본문 검색에 안 쓰이고, 목록이
     비는 것과 색인을 통째로 되돌리는 것은 무게가 다르다.
     """
-    import os
     from pathlib import Path
 
-    try:
-        stem = Path(getattr(document.file, "filename", "") or "document").stem
-        folder = Path(IMAGE_DIR) / stem
-        if not folder.is_dir():
-            logger.info(f"[_register_images] 이미지 폴더 없음: {folder}")
-            return []
+    images = getattr(document, "document_images", None)
+    if not images:
+        # image_dir 를 주지 않고 파싱하면 이 속성이 아예 없다(ragmodul 설명).
+        logger.info("[_register_images] 파서가 넘긴 그림이 없다")
+        return []
 
-        names = sorted(p.name for p in folder.iterdir() if p.is_file())
+    try:
         saved = []
-        for name in names:
+        for image in sorted(images, key=lambda i: i.order):
+            path = str(image.path).replace("\\", "/")
             row = db_call("create_document_image", document_id=document_id,
-                          image_name=name, image_path=str(folder / name).replace("\\", "/"))
-            if row:
-                saved.append(row)
-        logger.info(f"[_register_images] 이미지 {len(saved)}/{len(names)}개 등록 (document_id={document_id})")
+                          image_name=Path(path).name, image_path=path)
+            if not row:
+                continue
+
+            # 제목 경로와 캡션은 create 가 받지 않아 따로 넣는다. update 는 안 넘긴
+            # 설명 컬럼을 NULL 로 덮는데, 방금 만든 행이라 덮을 것이 없다.
+            extra = _heading_titles(image.heading_path)
+            if image.caption:
+                extra["caption"] = image.caption
+            if extra:
+                updated = db_call("update_document_image", id=row["id"],
+                                  image_name=row["image_name"],
+                                  image_path=row["image_path"], **extra)
+                if updated:
+                    row = updated
+            saved.append(row)
+
+        titled = sum(1 for i in images if i.heading_path)
+        logger.info(f"[_register_images] 이미지 {len(saved)}/{len(images)}개 등록 "
+                    f"(document_id={document_id}, 제목 경로 {titled}개)")
         return saved
     except Exception as e:                                   # noqa: BLE001
         logger.warning(f"[_register_images] 등록 실패, 건너뜀: {type(e).__name__} - {e}")

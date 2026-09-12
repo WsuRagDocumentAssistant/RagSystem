@@ -7,7 +7,7 @@ import logging
 from taskcontroller import work_regist, tasks
 from functions.data_functions import db_call, _to_millis   # DB 호출은 예외처리까지 묶여 있다
 from functions.rag_functions import UploadStep, _step_in       # 업로드 체인이 meta 를 나르는 방법
-from utils import static_url as _static_url, IMAGE_DIR, DOCUMENT_DIR
+from utils import static_url as _static_url, local_path, resolve_image_path, IMAGE_DIR, DOCUMENT_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,11 @@ tasks["FILE_IMAGE_SAVE"] = ["file_image_save_input", "get_document_image",
 tasks["FILE_IMAGE_UPLOAD"] = ["file_image_upload_input", "get_document_image",
                               "replace_image_file", "save_document_image",
                               "file_image_upload_output"]
+
+# 그림을 SVG 로. 입구가 둘이다 — 로컬에서 새로 고른 파일(content)과 서버에 이미
+# 있는 그림(imageUrl). 저장은 하지 않는다.
+tasks["IMAGE_VECTORIZE"] = ["image_vectorize_input", "vectorize_image",
+                            "image_vectorize_output"]
 
 # 색인이 먼저다. register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
 # 색인이 먼저다 — register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
@@ -461,24 +466,6 @@ def _display_name(row: dict, disk: dict) -> str:
     return disk.get(stem, stem)
 
 
-def _resolve_image(image_path: str):
-    """DB 의 image_path -> 실제 파일 경로.
-
-    저장할 때 "images/<문서명>/image7.png" 처럼 넣었으므로 대개 그대로 열린다.
-    IMAGE_DIR 이 환경변수로 바뀌었을 때를 대비해 폴더 기준으로도 한 번 찾는다.
-    """
-    from pathlib import Path
-
-    path = Path(image_path)
-    if path.exists():
-        return path
-    # "images/" 접두어가 붙은 채 저장된 경우, 설정된 폴더 기준으로 다시 맞춘다
-    parts = path.parts
-    if parts and parts[0] != IMAGE_DIR:
-        candidate = Path(IMAGE_DIR).joinpath(*parts[1:]) if len(parts) > 1 else Path(IMAGE_DIR) / path.name
-        if candidate.exists():
-            return candidate
-    return path
 
 
 def _find_document_file(row: dict):
@@ -700,7 +687,9 @@ def replace_image_file(*args, **kwargs):
     if not old_path:
         raise ValueError("기존 이미지 경로를 찾지 못했습니다.")
 
-    old = _resolve_image(old_path)
+    # 파일이 없어도 그 자리에 새로 쓴다 — 잃어버린 그림을 교체로 복구하는 셈이다.
+    from pathlib import Path
+    old = resolve_image_path(old_path, IMAGE_DIR) or Path(old_path)
     suffix = fields.pop("_suffix", "") or old.suffix
     new = old.with_suffix(suffix)
 
@@ -717,6 +706,61 @@ def replace_image_file(*args, **kwargs):
     fields["image_path"] = old_path.rsplit("/", 1)[0] + "/" + new.name if "/" in old_path else new.name
     logger.info(f"[replace_image_file] {old.name} -> {new.name} ({new.stat().st_size:,} bytes)")
     return fields
+
+
+# SVG 로 바꿀 그림의 크기 상한. 큰 그림은 base64 로 33% 더 커져서 나가고, 모델이
+# 볼 것도 많아져 응답이 길어진다 — 출력 상한에 걸려 잘린 SVG 가 될 확률이 올라간다.
+VECTORIZE_MAX_BYTES = int(os.environ.get("RAG_VECTORIZE_MAX_BYTES", str(8 * 1024 * 1024)))
+
+
+@work_regist("image_vectorize_input")
+def image_vectorize_input(*args, **kwargs):
+    """payload -> (바이트, mime). 입구가 둘이다(명세의 A/B).
+
+    A. content + mimeType   로컬에서 새로 고른 파일. base64 로 온다
+    B. imageUrl             서버에 이미 있는 그림. 목록이 준 주소를 되돌린다
+
+    imageUrl 은 클라이언트가 보내는 값이라 그대로 열지 않는다. local_path 가
+    images/ 안인지 확인하고, 밖을 가리키면 None 을 준다.
+    """
+    import binascii
+    import mimetypes
+
+    payload = (args[0].get("payload") or {}) if args and isinstance(args[0], dict) else {}
+    content, image_url = payload.get("content"), payload.get("imageUrl")
+
+    if content:
+        try:
+            data = base64.b64decode(content)
+        except (binascii.Error, ValueError):
+            raise ValueError("이미지를 읽지 못했습니다. 파일이 온전한지 확인해주세요.")
+        mime = payload.get("mimeType") or ""
+        if not mime.startswith("image/"):
+            mime = "image/png"
+    elif image_url:
+        path = local_path(image_url, IMAGE_DIR, "/api/images")
+        if path is None:
+            raise ValueError(f"이미지를 찾지 못했습니다: {image_url}")
+        data = path.read_bytes()
+        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    else:
+        raise ValueError("이미지(content) 또는 주소(imageUrl)가 필요합니다.")
+
+    if not data:
+        raise ValueError("이미지가 비어 있습니다.")
+    if len(data) > VECTORIZE_MAX_BYTES:
+        raise ValueError(f"이미지가 너무 큽니다({len(data) / 1048576:.1f}MB). "
+                         f"{VECTORIZE_MAX_BYTES / 1048576:.0f}MB 이하로 줄여주세요.")
+
+    logger.info(f"[image_vectorize_input] {'파일' if content else image_url} "
+                f"{mime} {len(data):,}바이트")
+    return data, mime
+
+
+@work_regist("image_vectorize_output")
+def image_vectorize_output(*args, **kwargs):
+    """SVG 문자열 -> 클라이언트가 읽는 {svg}."""
+    return {"svg": args[0]}
 
 
 @work_regist("file_image_upload_output")
