@@ -51,10 +51,22 @@ GATEWAY_TIMEOUT = 600   # 초. 라우터 기본값 60 은 색인에 턱없이 �
 # 생기므로, 워커 둘이 각각 RAG 작업을 잡으면 임베딩·리랭커가 두 벌 올라간다.
 # GPU 가 한 장이면 두 벌을 올려도 서로 기다릴 뿐이라 이득도 없다.
 #
-# 동시 처리가 필요하면 워커를 늘리는 대신 레인을 나누는 게 맞다 — 모델을 쓰지 않는
-# 작업(로그인·목록 조회 등)은 get_controller() 를 아예 부르지 않으므로, 그쪽 전용
-# 워커를 따로 두면 모델은 한 벌만 유지하면서 무거운 작업에 막히지 않는다.
+# 동시 처리는 프로세스가 아니라 아래 EXECUTOR_THREADS 로 한다.
 GATEWAY_WORKERS = int(os.environ.get("RAG_GATEWAY_WORKERS", "1"))
+
+# 통신부 워커 하나가 동시에 돌리는 작업 수(스레드 풀). 기본 4.
+#
+# 스레드는 프로세스와 달리 모델을 나눠 쓴다 — 싱글턴 하나를 여러 작업이 같이 본다.
+# 그래서 업로드(파싱·임베딩 수백 초)가 도는 동안에도 목록 조회·로그인·질의가 뒤에
+# 줄을 서지 않는다. 1 이면 예전처럼 순차다.
+#
+# 같은 프로세스에서 동시에 불려도 되도록 손본 곳: db_call(DBManager 루프가 하나라
+# 직렬화), get_controller(모델 이중 로딩 방지), parse 의 압축 해제분 정리(ragmodul 이
+# 자기 문서 폴더만 지움). LLM 호출은 ragmodul 이 스레드마다 루프를 따로 둔다.
+#
+# 임베딩·리랭커에는 잠금이 없다. GPU 한 장을 나눠 쓰므로 업로드 임베딩 중의 질의는
+# 느려지지만 막히지는 않는다. 잠그면 질의가 임베딩 뒤에 줄을 서서 1 과 같아진다.
+EXECUTOR_THREADS = int(os.environ.get("RAG_EXECUTOR_THREADS", "4"))
 
 # 정적으로 내보낼 폴더. rag_functions / document_functions 가 파일을 떨구는 곳과 같다.
 from utils import IMAGE_DIR, DOCUMENT_DIR
@@ -67,16 +79,12 @@ def _unwrap(outcome):
     _task, result = outcome
     return result
 
-# 실행부에 넘긴 요청들. job_id -> 라우터 Task.
-_pending: dict = {}
-_pending_lock = threading.Lock()
-
-
 def bridge_submit_loop(controller, stop_event):
     """라우터 큐에서 꺼내 컨트롤러로 넘긴다. 결과를 기다리지 않는다.
 
-    기다리지 않으므로 요청이 실행부에 여러 개 쌓일 수 있다. 짝은 collect 쪽이
-    job_id 로 맞춘다.
+    기다리지 않으므로 요청이 실행부에 여러 개 쌓일 수 있다. 실행부가 결과에 task 를
+    같이 실어 보내고 그 params 에 job_id 가 있어서, collect 쪽은 그것만 보면 된다 —
+    여기서 따로 기억해 둘 것이 없다.
     """
     from rag_router.shared_queues import SharedQueues
     from rag_router.task.task_result import TaskResult
@@ -100,14 +108,14 @@ def bridge_submit_loop(controller, stop_event):
             continue
 
         logger.info("수신 job_id=%s task_type=%s", task.job_id, task.task_type)
-        with _pending_lock:
-            _pending[task.job_id] = task
 
         # payload 만 보내면 session_id 와 token 을 되찾을 방법이 없다. 요청을 통째로
         # 넘기고, 체인이 그걸 흘려보내며 필요한 단계에서 꺼내 쓴다.
-        # job_id 는 결과가 돌아올 때 짝을 맞추는 열쇠다.
+        # job_id 는 결과가 돌아올 때 짝을 맞추는 열쇠다. task_type 은 실패 메시지에
+        # 쓴다 — 결과와 함께 돌아오므로 이 둘만 있으면 요청을 기억해 둘 필요가 없다.
         controller.task_queue.put((task.task_type, {
             "job_id": task.job_id,
+            "task_type": task.task_type,
             "payload": task.payload or {},
             "session_id": task.session_id,
             "token": task.token,
@@ -115,7 +123,11 @@ def bridge_submit_loop(controller, stop_event):
 
 
 def bridge_collect_loop(executor, stop_event):
-    """실행부 결과를 job_id 로 짝지어 라우터 큐에 돌려준다."""
+    """실행부 결과를 라우터 큐에 돌려준다. 짝은 결과에 실린 job_id 가 맞춘다.
+
+    결과가 작업 순서대로 온다고 가정하지 않는다. 실행부가 스레드 풀이면 가벼운
+    작업이 먼저 올라온 무거운 작업보다 먼저 끝난다.
+    """
     from rag_router.shared_queues import SharedQueues
     from rag_router.task.task_result import TaskResult
 
@@ -131,7 +143,8 @@ def bridge_collect_loop(executor, stop_event):
         # 실행부가 성공이든 실패든 (task, result) 로 보낸다. job_id 는 그 task 에
         # 실려 있으므로 결과가 어느 순서로 오든 짝이 맞는다.
         done_task, result = outcome
-        job_id = (getattr(done_task, "params", None) or {}).get("job_id")
+        params = getattr(done_task, "params", None) or {}
+        job_id = params.get("job_id")
 
         # job_id 가 없으면 우리가 직접 넣은 작업이다(기동 시 warmup). 돌려보낼 곳이
         # 없으니 결과만 확인하고 버린다. 실패를 조용히 넘기지는 않는다 — 모델 로딩이
@@ -143,30 +156,26 @@ def bridge_collect_loop(executor, stop_event):
                 logger.info("워커 준비 완료: %r", result)
             continue
 
-        with _pending_lock:
-            task = _pending.pop(job_id, None)
-
-        if task is None:
-            logger.error("짝을 못 찾은 결과 (job_id=%s). 버린다: %r", job_id, result)
-            continue
-
-        result_queue.put(_to_task_result(task, result, TaskResult))
+        # 게이트웨이가 타임아웃으로 이미 포기한 요청이면 그쪽 dispatcher 가 알아서
+        # 버린다. 여기서 살아 있는 요청인지 따로 확인할 필요가 없다.
+        result_queue.put(_to_task_result(job_id, params.get("task_type", ""),
+                                         result, TaskResult))
 
 
-def _to_task_result(task, result, TaskResult):
+def _to_task_result(job_id, task_type, result, TaskResult):
     if isinstance(result, TaskExecutionError):
         # traceback 은 로그로만. HTTP 응답에 실으면 내부 구조가 샌다.
-        logger.error("job_id=%s 작업 실패: %s", task.job_id, result.tb)
-        return TaskResult(task.job_id, False, error=_error_message(result, task))
+        logger.error("job_id=%s 작업 실패: %s", job_id, result.tb)
+        return TaskResult(job_id, False, error=_error_message(result, task_type))
 
     # 응답 모양은 각 task 의 마지막 work 이 맞춘다(user_query_output 등). 여기서는
     # 손대지 않는다. dict/list 가 아닌 값을 돌려주면 TaskResponse 가 거부하므로, 그건
     # 그 task 에 출력 work 이 빠졌다는 뜻이다.
-    logger.info("완료 job_id=%s", task.job_id)
-    return TaskResult(task.job_id, True, data=result)
+    logger.info("완료 job_id=%s", job_id)
+    return TaskResult(job_id, True, data=result)
 
 
-def _error_message(failure, task) -> str:
+def _error_message(failure, task_type: str) -> str:
     """실패를 클라이언트에게 알릴 문장으로 바꾼다.
 
     work 이 던진 ValueError 는 "payload 에 query 가 없습니다" 처럼 사용자에게
@@ -177,7 +186,7 @@ def _error_message(failure, task) -> str:
     head, _, detail = last[0].partition(": ")
     if head.strip() == "ValueError" and detail:
         return detail.strip()
-    return f"작업 실행에 실패했습니다: {task.task_type}"
+    return f"작업 실행에 실패했습니다: {task_type}"
 
 
 if __name__ == "__main__":
@@ -198,7 +207,8 @@ if __name__ == "__main__":
     # 배포는 이 파일이 진입점이다(Dockerfile CMD, containerPort 8000).
     # 워커 여러 개가 같은 큐를 본다. TaskExecutor 는 생성자에서 자기 큐를 만들지만,
     # start() 전에 바꿔 끼우면 그 큐가 자식 프로세스로 함께 넘어간다.
-    gwexecutors = [TaskExecutor() for _ in range(GATEWAY_WORKERS)]
+    gwexecutors = [TaskExecutor(max_workers=EXECUTOR_THREADS)
+                   for _ in range(GATEWAY_WORKERS)]
     shared_task_queue = gwexecutors[0].get_task_queue()
     shared_result_queue = gwexecutors[0].get_result_queue()
     for ex in gwexecutors[1:]:
@@ -215,6 +225,9 @@ if __name__ == "__main__":
     # 워커 수만큼 넣지만 어느 워커가 무엇을 집을지는 정해져 있지 않다. 하나가 둘을
     # 집으면 다른 하나는 첫 요청 때 올린다 — 워커가 하나면 정확히 맞는다.
     #
+    # 스레드 풀이라 warmup 이 도는 동안 다른 요청이 같은 워커에서 먼저 돌 수 있다.
+    # 그 요청이 모델을 쓰면 get_controller 의 잠금에서 warmup 이 끝나기를 기다린다.
+    #
     # 결과는 브릿지가 job_id 없는 것으로 알아보고 흘려보낸다.
     for _ in gwexecutors:
         shared_task_queue.put(Task(["warmup_function"], None))
@@ -229,7 +242,7 @@ if __name__ == "__main__":
                      args=(gwexecutors[0], stop_bridge), daemon=True).start()
 
     # ── 타이머 전용 ───────────────────────────────────
-    timerexecutor = TaskExecutor()
+    timerexecutor = TaskExecutor()   # 타이머는 작업이 하나뿐이라 순차(기본 1)
     timerexecutor.start()
     stop_timer = threading.Event()
     threading.Thread(target=timer_loop, args=(timerexecutor, stop_timer), daemon=True).start()

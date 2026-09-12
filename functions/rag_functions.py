@@ -23,6 +23,7 @@ DB 는 RagController 를 거치지 않는다(use_db=False). 저장 프로시저�
 
 import logging
 import os
+import threading
 import typing
 
 from taskcontroller import work_regist, tasks
@@ -132,6 +133,10 @@ IMAGE_PROVIDER = os.environ.get("RAG_IMAGE_PROVIDER", "gemini")
 # 동시에 몇 장을 보낼지. 큰 요청 여럿이 같은 순간에 나가면 429 가 난다(ragmodul 실측).
 # extract_vocab_all 이 쓰는 값과 같은 수준으로 잡았다. 429 가 보이면 줄인다.
 IMAGE_CONCURRENCY = int(os.environ.get("RAG_IMAGE_CONCURRENCY", "4"))
+# 문서 하나에서 설명을 만들 그림의 상한. 문서 앞에서부터 이 장수까지만 LLM 에 보낸다.
+# 그 뒤 그림은 등록은 되지만(목록에 보이고 설명을 직접 쓸 수 있다) ai_summary 가
+# 없어 이미지 검색에는 안 걸린다. 등록은 LLM 을 안 부르니 비용이 없어 그대로 둔다.
+IMAGE_DESCRIBE_MAX = int(os.environ.get("RAG_IMAGE_DESCRIBE_MAX", "40"))
 
 # 그림을 SVG 로 바꿀 provider. 설명과 같은 이유로 gemini 다 — 문서 그림 절반이 bmp 고
 # 그걸 읽는 건 gemini 와 로컬뿐인데, 로컬은 SVG 를 그릴 만큼은 아니다.
@@ -200,6 +205,9 @@ def _step_out(meta, value):
 #------------------------------------------------┌> 지연 생성
 
 _controller: RagController | None = None
+# 실행부가 스레드 풀이면 첫 요청 여럿이 동시에 여기 들어온다. 잠금이 없으면 모델을
+# 두 벌 올린다(수십 초 × 2, VRAM 도 두 배).
+_controller_lock = threading.Lock()
 
 
 def get_controller() -> RagController:
@@ -214,21 +222,24 @@ def get_controller() -> RagController:
     타임아웃이 거기 다 있어서 여기서 표를 또 만들면 두 곳이 어긋난다.
     """
     global _controller
-    if _controller is None:
-        from ai_rag_comm import load_config
+    if _controller is not None:          # 잠금 없이 먼저 본다. 만들어진 뒤엔 잠글 이유가 없다
+        return _controller
+    with _controller_lock:
+        if _controller is None:
+            from ai_rag_comm import load_config
 
-        cfg = load_config()
-        _controller = RagController(
-            EMBEDDING_MODEL_PATH,
-            RERANKER_MODEL_PATH,
-            device=DEVICE,
-            unpack_dir=UNPACK_DIR,
-            image_dir=IMAGE_DIR,
-            use_db=False,
-            llm_api_config=cfg.llm_api,
-            local_llm_config=cfg.local_llm,
-            llm_default=DRAFT_PROVIDER,
-        )
+            cfg = load_config()
+            _controller = RagController(
+                EMBEDDING_MODEL_PATH,
+                RERANKER_MODEL_PATH,
+                device=DEVICE,
+                unpack_dir=UNPACK_DIR,
+                image_dir=IMAGE_DIR,
+                use_db=False,
+                llm_api_config=cfg.llm_api,
+                local_llm_config=cfg.local_llm,
+                llm_default=DRAFT_PROVIDER,
+            )
     return _controller
 
 
@@ -249,13 +260,11 @@ def parse_function(*args, **kwargs):
     FILE_UPLOAD 는 앞 work 이 방금 저장한 경로를 넘겨준다. 메뉴로 돌리는 test_ 태스크는
     params 가 None 이라 args 가 비고, 그때는 상수로 떨어진다. 문자열만 경로로 인정한다.
 
-    끝나면 압축을 푼 자리를 치운다. 그 폴더를 읽는 건 파싱하는 동안뿐이다 — parse 가
-    hwpx 를 거기 풀고 그림을 images/ 로 복사해 오면 그걸로 끝이고, 뒤 단계(청킹·임베딩·
-    저장)는 메모리의 모델만 본다. 그대로 두면 문서마다 압축 해제분이 쌓인다(219MB
-    문서면 그만큼이다).
-
-    실패했을 때는 남긴다. 무엇을 받았는지 열어봐야 하는 경우가 그때다 — hwp 를 hwpx 로
-    올려서 zip 이 아니라던 일이 있었다. 실패는 드물어서 쌓이지도 않는다.
+    압축을 푼 자리는 parse 가 스스로 치운다(cleanup=True 기본). 파서가 자기가 푼
+    unpacked/<문서명>/ 만 지우므로, 같은 순간에 다른 문서를 파싱하는 스레드의 산출물은
+    건드리지 않는다. 전에는 여기서 UNPACK_DIR 을 통째로 비웠는데, 실행부가 스레드 풀이
+    되면 남의 파싱 중간 산출물까지 지우게 되어 없앴다. 실패했을 때는 parse 가 남긴다 —
+    무엇을 받았는지 열어봐야 하는 경우가 그때다.
     """
     meta, value = _step_in(args)
     file_path = value if isinstance(value, str) and value else HWPX_FILE_PATH
@@ -267,49 +276,9 @@ def parse_function(*args, **kwargs):
     logger.info(f"[parse_function] 파싱 시작: {file_path}")
     parsed = parse(file_path, unpack_dir=UNPACK_DIR, image_dir=IMAGE_DIR)
     logger.info(f"[parse_function] 파싱 종료: block {len(parsed.blocks)}개")
-    _clear_unpacked()
     return _step_out(meta, parsed)
 
 
-def _clear_unpacked() -> None:
-    """압축을 푼 자리를 비운다. 폴더는 남기고 안의 것만 지운다.
-
-    그 문서 것만 골라 지우지 않는 이유는 배치를 우리가 모르기 때문이다. parse 안에서도
-    "BinData 를 가진 폴더를 찾는" 방식으로 더듬어 찾고 있다(라이브러리가 바뀌면 규칙이
-    달라진다는 뜻이다). 안을 통째로 비우는 편이 그 규칙에 기대지 않는다.
-
-    폴더 자체는 남긴다. UNPACK_DIR 은 환경변수로 바뀔 수 있고, 나중에 거기에 볼륨이
-    붙을 수도 있다 — 폴더를 통째로 지우면 마운트 지점을 지우는 셈이 되고, 잘못된 값이
-    들어왔을 때 피해가 커진다.
-
-    비워도 되는 전제는 "같은 순간에 두 문서를 파싱하지 않는다" 다. 실행부가 프로세스
-    하나로 큐를 처리하고 있어서 지금은 성립한다(그 개수는 main.py 의
-    RAG_GATEWAY_WORKERS 가 정한다 — 이 파일에는 손잡이가 없다).
-
-    그 전제가 깨지면(실행부가 여럿이 되면) 남의 문서 파싱 중간 산출물을 지울 수 있다.
-    그때는 parse 쪽에 그 문서 것만 지우는 통로가 필요하다.
-
-    지우지 못해도 파싱을 실패로 만들지 않는다. 디스크에 남는 것뿐이다.
-    """
-    import shutil
-    from pathlib import Path
-
-    root = Path(UNPACK_DIR)
-    if not root.is_dir():
-        return
-
-    removed = 0
-    for child in root.iterdir():
-        try:
-            if child.is_dir() and not child.is_symlink():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-            removed += 1
-        except OSError as e:
-            logger.warning(f"[parse_function] 압축 해제분 삭제 실패({child.name}): "
-                           f"{type(e).__name__} - {e}")
-    logger.info(f"[parse_function] 압축 해제분 삭제: {UNPACK_DIR} ({removed}개)")
 
 
 @work_regist("chunk_function")
@@ -946,9 +915,14 @@ def describe_images_function(*args, **kwargs):
     if not rows:
         return _step_out(meta, (document_id, chunks, []))
 
-    described = _describe_images(rows)
-    logger.info(f"[describe_images_function] 설명 {len(described)}/{len(rows)}장 "
-          f"(provider={IMAGE_PROVIDER}, 동시 {IMAGE_CONCURRENCY})")
+    # rows 는 _register_images 가 문서 순서로 넣은 것이라 앞에서 자르면 앞쪽 그림이 남는다.
+    targets = rows[:IMAGE_DESCRIBE_MAX]
+    skipped = len(rows) - len(targets)
+
+    described = _describe_images(targets)
+    logger.info(f"[describe_images_function] 설명 {len(described)}/{len(targets)}장 "
+          f"(provider={IMAGE_PROVIDER}, 동시 {IMAGE_CONCURRENCY}"
+          + (f", 상한 {IMAGE_DESCRIBE_MAX} — {skipped}장 건너뜀" if skipped else "") + ")")
     return _step_out(meta, (document_id, chunks, described))
 
 

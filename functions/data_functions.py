@@ -7,6 +7,7 @@ import asyncio
 import uuid
 import logging
 import os
+import threading
 from types import SimpleNamespace
 
 from dotenv import load_dotenv
@@ -86,6 +87,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 dbmanager = db_manager.DBManager()
 _inited = False
+# DBManager 는 이벤트 루프 하나에 run_until_complete 를 건다. 실행부가 스레드 풀이 되면
+# 두 work 이 같은 순간에 db_call 을 부르는데, 같은 루프를 두 스레드가 밀어넣으면
+# "This event loop is already running" 으로 터진다. 그래서 DB 호출을 직렬화한다 —
+# 대부분 밀리초라 체감이 없고, 첫 init 의 경쟁도 같은 잠금이 막는다.
+_db_lock = threading.Lock()
 
 
 def db():
@@ -104,7 +110,8 @@ def db():
 
 def db_call(task_name, **kwargs):
     """DB 작업 호출. 실패하면 한 줄 찍고 None 을 돌려준다."""
-    return safe_call(db().call, task_name, **kwargs)
+    with _db_lock:
+        return safe_call(db().call, task_name, **kwargs)
 
 #────────────────────────────────────────────────
 
