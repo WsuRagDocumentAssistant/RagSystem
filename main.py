@@ -44,28 +44,21 @@ def timer_loop(executor, stop_event):
 
 GATEWAY_TIMEOUT = 600   # 초. 라우터 기본값 60 은 색인에 턱없이 모자란다
 
-# 통신부 워커 수. 기본 1 이다.
+# 통신부 실행부가 동시에 돌리는 작업 수(스레드 풀). 기본 4.
 #
-# 늘리면 요청을 동시에 처리하지만, TaskExecutor 는 스레드가 아니라 프로세스라
-# 메모리가 따로다. rag_functions 의 모델 싱글턴(_controller)도 프로세스마다 하나씩
-# 생기므로, 워커 둘이 각각 RAG 작업을 잡으면 임베딩·리랭커가 두 벌 올라간다.
-# GPU 가 한 장이면 두 벌을 올려도 서로 기다릴 뿐이라 이득도 없다.
-#
-# 동시 처리는 프로세스가 아니라 아래 EXECUTOR_THREADS 로 한다.
-GATEWAY_WORKERS = int(os.environ.get("RAG_GATEWAY_WORKERS", "1"))
-
-# 통신부 워커 하나가 동시에 돌리는 작업 수(스레드 풀). 기본 4.
-#
-# 스레드는 프로세스와 달리 모델을 나눠 쓴다 — 싱글턴 하나를 여러 작업이 같이 본다.
-# 그래서 업로드(파싱·임베딩 수백 초)가 도는 동안에도 목록 조회·로그인·질의가 뒤에
-# 줄을 서지 않는다. 1 이면 예전처럼 순차다.
+# 실행부는 프로세스 하나다. 프로세스를 늘리면 rag_functions 의 모델 싱글턴이 프로세스마다
+# 생겨 임베딩·리랭커가 그 수만큼 올라가고, GPU 가 한 장이면 서로 기다릴 뿐이라 이득이
+# 없다. 그래서 동시 처리는 그 안의 스레드로 한다 — 스레드는 모델 하나를 나눠 쓴다.
+# 업로드(파싱·임베딩 수백 초)가 도는 동안에도 목록 조회·로그인·질의가 뒤에 줄을 서지
+# 않는다. 1 이면 예전처럼 순차다.
 #
 # 같은 프로세스에서 동시에 불려도 되도록 손본 곳: db_call(DBManager 루프가 하나라
 # 직렬화), get_controller(모델 이중 로딩 방지), parse 의 압축 해제분 정리(ragmodul 이
 # 자기 문서 폴더만 지움). LLM 호출은 ragmodul 이 스레드마다 루프를 따로 둔다.
 #
-# 임베딩·리랭커에는 잠금이 없다. GPU 한 장을 나눠 쓰므로 업로드 임베딩 중의 질의는
-# 느려지지만 막히지는 않는다. 잠그면 질의가 임베딩 뒤에 줄을 서서 1 과 같아진다.
+# 임베딩·리랭커는 ragmodul 의 RagController 가 RLock 하나로 직렬화한다. GPU 에는 한 번에
+# 한 작업만 올라가므로 VRAM 이 겹치지 않고, 모델을 안 쓰는 작업은 그 잠금과 무관하다.
+# 업로드 임베딩 중의 질의는 검색 단계에서 그것이 끝나기를 기다린 뒤 이어서 돈다.
 EXECUTOR_THREADS = int(os.environ.get("RAG_EXECUTOR_THREADS", "4"))
 
 # 정적으로 내보낼 폴더. rag_functions / document_functions 가 파일을 떨구는 곳과 같다.
@@ -205,41 +198,28 @@ if __name__ == "__main__":
 
     # ── 통신부(HTTP) 전용 ─────────────────────────────
     # 배포는 이 파일이 진입점이다(Dockerfile CMD, containerPort 8000).
-    # 워커 여러 개가 같은 큐를 본다. TaskExecutor 는 생성자에서 자기 큐를 만들지만,
-    # start() 전에 바꿔 끼우면 그 큐가 자식 프로세스로 함께 넘어간다.
-    gwexecutors = [TaskExecutor(max_workers=EXECUTOR_THREADS)
-                   for _ in range(GATEWAY_WORKERS)]
-    shared_task_queue = gwexecutors[0].get_task_queue()
-    shared_result_queue = gwexecutors[0].get_result_queue()
-    for ex in gwexecutors[1:]:
-        ex.task_queue = shared_task_queue
-        ex.result_queue = shared_result_queue
-    for ex in gwexecutors:
-        ex.start()
+    gwexecutor = TaskExecutor(max_workers=EXECUTOR_THREADS)
+    gwexecutor.start()
 
-    # 워커마다 모델을 미리 올린다. get_controller() 는 실행부 프로세스 안에서만
-    # 불려야 해서(모델이 거기 올라간다) 작업으로 넣는 수밖에 없다 — 부모에서 부르면
-    # 부모에 올라가고 워커는 자기 것을 또 올린다. 그냥 두면 첫 요청이 모델 로딩
-    # 몇십 초를 기다리는데, 그게 모델을 쓰지도 않는 작업일 수 있다.
+    # 모델을 미리 올린다. get_controller() 는 실행부 프로세스 안에서만 불려야 해서
+    # (모델이 거기 올라간다) 작업으로 넣는 수밖에 없다 — 부모에서 부르면 부모에 올라가고
+    # 실행부는 자기 것을 또 올린다. 그냥 두면 첫 요청이 모델 로딩 몇십 초를 기다리는데,
+    # 그게 모델을 쓰지도 않는 작업일 수 있다.
     #
-    # 워커 수만큼 넣지만 어느 워커가 무엇을 집을지는 정해져 있지 않다. 하나가 둘을
-    # 집으면 다른 하나는 첫 요청 때 올린다 — 워커가 하나면 정확히 맞는다.
-    #
-    # 스레드 풀이라 warmup 이 도는 동안 다른 요청이 같은 워커에서 먼저 돌 수 있다.
-    # 그 요청이 모델을 쓰면 get_controller 의 잠금에서 warmup 이 끝나기를 기다린다.
+    # 스레드 풀이라 warmup 이 도는 동안 다른 요청이 먼저 돌 수 있다. 그 요청이 모델을
+    # 쓰면 get_controller 의 잠금에서 warmup 이 끝나기를 기다린다.
     #
     # 결과는 브릿지가 job_id 없는 것으로 알아보고 흘려보낸다.
-    for _ in gwexecutors:
-        shared_task_queue.put(Task(["warmup_function"], None))
+    gwexecutor.task_queue.put(Task(["warmup_function"], None))
 
-    gwcontroller = TaskController(shared_task_queue)
+    gwcontroller = TaskController(gwexecutor.get_task_queue())
     gwcontroller.start()
 
     stop_bridge = threading.Event()
     threading.Thread(target=bridge_submit_loop,
                      args=(gwcontroller, stop_bridge), daemon=True).start()
     threading.Thread(target=bridge_collect_loop,
-                     args=(gwexecutors[0], stop_bridge), daemon=True).start()
+                     args=(gwexecutor, stop_bridge), daemon=True).start()
 
     # ── 타이머 전용 ───────────────────────────────────
     timerexecutor = TaskExecutor()   # 타이머는 작업이 하나뿐이라 순차(기본 1)
@@ -279,16 +259,10 @@ if __name__ == "__main__":
         timerexecutor.collect()   # 결과 큐를 비워야 자식이 join 에서 멈추지 않는다
         timerexecutor.join()
 
-        for ex in gwexecutors:
-            ex.stop()             # 워커 하나당 종료 신호 하나가 필요하다
+        gwexecutor.stop()
         # collect 스레드가 멈춘 뒤라 남은 결과를 아무도 안 꺼낸다. 비우지 않으면
         # 자식이 큐 버퍼를 flush 하지 못해 join 에서 멈춘다.
-        while any(ex.is_alive() for ex in gwexecutors):
-            try:
-                gwexecutors[0].get_task_result(timeout=0.1)
-            except queue.Empty:
-                pass
-        for ex in gwexecutors:
-            ex.join()
+        gwexecutor.collect()
+        gwexecutor.join()
         gwcontroller.terminate()  # TaskController 에는 정상 종료 신호가 없다
         gwcontroller.join()

@@ -965,9 +965,15 @@ def _describe_images(rows: list) -> list:
         if not text:
             logger.info(f"[describe_images] {path.name} 설명 없음 — 건너뜀")
             continue
-        # image_name·image_path 는 update 가 필수로 받는다. 안 넘기면 NULL 로 덮인다.
+        # update 는 안 넘긴 컬럼을 전부 NULL 로 덮는다 — image_name·image_path 뿐 아니라
+        # 제목 경로·캡션·note 도 그렇다. 앞 단계(_register_images)가 막 넣은 제목 경로를
+        # 여기서 지워버린 적이 있어서(화면의 대·중·소제목이 비었다), 행이 이미 가진 값을
+        # 그대로 실어 보낸다. get_document_image 가 FILE_IMAGE_SAVE 에서 하는 것과 같다.
         db_call("update_document_image", id=row["id"],
                 image_name=row["image_name"], image_path=row["image_path"],
+                caption=row.get("caption"), major_title=row.get("major_title"),
+                mid_title=row.get("mid_title"), minor_title=row.get("minor_title"),
+                note=row.get("note"),
                 ai_summary=desc.ai_summary, key_facts=list(desc.key_facts),
                 key_phrases=list(desc.key_phrases))
         described.append({**row, "_text": text})
