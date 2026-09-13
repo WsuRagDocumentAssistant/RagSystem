@@ -57,7 +57,7 @@ tasks.update({
 
 # 앞에 ensure_session, 뒤에 save_conversation 을 끼운다. 그래야 대화가 세션으로
 # 묶이고 사이드바 목록과 메시지 내역이 채워진다.
-tasks["USER_QUERY"]    = (["ensure_session"] + QUERY_CHAIN
+tasks["USER_QUERY"]    = (["ensure_session", "attachment_input"] + QUERY_CHAIN
                           + ["search_api_function", "history_function",
                              "search_images_function", "answer_function",
                              "save_conversation", "user_query_output"])
@@ -442,6 +442,84 @@ def load_vocab() -> dict:
     """
     return from_jsonb(db_call("load_vocab"), {})
 
+#------------------------------------------------┌> 질의 첨부
+
+# 질의에 붙일 수 있는 형식. 문서는 pdf 뿐이다 — ragmodul 이 바이트를 provider 문서 입력으로
+# 그대로 넘기는데, 그 경로를 받는 게 pdf 뿐이다. hwpx·docx 는 zip 이라 어느 모델도 못 읽고,
+# txt 계열은 텍스트로 바꿔 프롬프트에 넣는 별도 경로가 있어야 한다 — 둘 다 지금은 없다.
+ATTACH_DOC_TYPES = {"application/pdf"}
+# 그림은 provider 셋이 공통으로 받는 것만. bmp·svg·tiff 는 거절당한다.
+ATTACH_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
+
+def _attach_data(part: dict) -> str:
+    """{content} 에서 순수 base64 만 꺼낸다.
+
+    브라우저 FileReader.readAsDataURL 은 "data:application/pdf;base64,JVBERi0..." 를 준다.
+    클라이언트가 쉼표 뒤만 보내기로 했지만 접두어가 붙어 와도 여기서 벗긴다 — 그대로
+    넘기면 provider 가 400 을 내는데 그 메시지로는 사용자에게 이유를 알려줄 수 없다.
+    """
+    data = (part.get("content") or "").strip()
+    if data.startswith("data:"):
+        _prefix, _, data = data.partition(",")
+    return data
+
+
+def _attach_note(req: dict) -> str:
+    """대화에 남길 '[첨부: 이름] ' 표시. 첨부가 없으면 빈 문자열.
+
+    첨부 자체는 저장하지 않는다(파일을 들고 있지 않다). 표시가 없으면 대화를 다시 열었을 때
+    "이 문서 요약해줘" 라는 질문만 남아 무엇을 보고 답한 것인지 알 수 없다.
+    """
+    names = [a.get("name") or "문서" for a in req.get("attachments") or []]
+    if req.get("attach_image"):
+        names.append("이미지")
+    return f"[첨부: {', '.join(names)}] " if names else ""
+
+
+@work_regist("attachment_input")
+def attachment_input(*args, **kwargs):
+    """payload 의 file·image 를 검사해 req 에 담는다. 질의 체인의 두 번째 단계다.
+
+    크기는 보지 않는다. ragmodul 이 provider 별 상한(DOC_LIMIT_BYTES)으로 막으면서 어느
+    파일이 몇 MB 인지까지 말해주므로, 여기서 또 자르면 상한이 두 곳이 되어 어긋난다.
+
+    형식은 여기서 본다 — 안 되는 형식을 그냥 보내면 provider 가 400 을 내고, 그 메시지로는
+    무엇이 잘못됐는지 사용자에게 알려줄 수 없다.
+
+    체인 앞쪽에 두는 이유는 임베딩·검색(십여 초)을 돌기 전에 거절하기 위해서다.
+
+    req 를 그대로 돌려준다(ensure_session 과 같다). 뒤 단계(embed_query_function)가 받는다.
+    """
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    payload = req.get("payload") or {}
+
+    doc = payload.get("file") or {}
+    data = _attach_data(doc) if isinstance(doc, dict) else ""
+    if data:
+        mime = (doc.get("mimeType") or "").lower()
+        if mime not in ATTACH_DOC_TYPES:
+            raise ValueError(f"지원하지 않는 파일 형식입니다: {mime or '알 수 없음'}. "
+                             f"pdf 만 첨부할 수 있습니다.")
+        req["attachments"] = [{"name": doc.get("name") or "첨부.pdf",
+                               "mime_type": mime, "data": data}]
+
+    image = payload.get("image") or {}
+    data = _attach_data(image) if isinstance(image, dict) else ""
+    if data:
+        mime = (image.get("mimeType") or "").lower()
+        if mime not in ATTACH_IMAGE_TYPES:
+            raise ValueError(f"지원하지 않는 이미지 형식입니다: {mime or '알 수 없음'}. "
+                             f"png, jpeg, gif, webp 만 첨부할 수 있습니다.")
+        req["attach_image"] = {"mime_type": mime, "data": data}
+
+    if req.get("attachments") or req.get("attach_image"):
+        doc_name = (req.get("attachments") or [{}])[0].get("name")
+        logger.info(f"[attachment_input] 문서={doc_name!r}, "
+                    f"그림={'있음' if req.get('attach_image') else '없음'}")
+    return req
+
+
 #------------------------------------------------┌> 질의 검색
 
 
@@ -778,6 +856,13 @@ def answer_function(*args, **kwargs):
     images = value[5] if len(value) > 5 else []
     history, summary = session["history"], session["summary"]
 
+    # 사용자가 이번 질의에 붙인 것(attachment_input 이 담았다). 위의 images 와 다른 것이다 —
+    # 그쪽은 검색으로 찾은 문서 그림이고, 이쪽은 색인된 적이 없어 모델이 직접 읽어야만
+    # 답에 반영된다.
+    attachments = req.get("attachments") or None
+    attach_image = req.get("attach_image")
+    has_attachment = bool(attachments or attach_image)
+
     # 그림을 찾는 질의였고 실제로 찾았으면 LLM 을 타지 않는다. 사용자가 원한 것은
     # 그림이고 그 설명은 색인할 때 이미 만들어 뒀다 — 같은 내용을 모델에게 다시
     # 쓰게 하면 시간과 돈만 든다.
@@ -785,7 +870,9 @@ def answer_function(*args, **kwargs):
     # 그리고 지금 구조에서는 모델이 그림을 못 본다(이미지를 안 넘긴다). 그래서
     # 그냥 두면 "사진 파일은 확인되지 않았습니다" 라고 답하면서 화면 옆에는 그림이
     # 떠 있는 모순이 생긴다 — 실제로 그렇게 나왔다.
-    if images:
+    # 첨부가 있으면 이 지름길을 타지 않는다. 첨부는 색인된 적이 없어 _image_answer 가 쓸
+    # 재료가 없고, 사용자가 묻는 대상은 자기가 올린 그 파일이다.
+    if images and not has_attachment:
         return req, _image_answer(images), _to_sources(contexts), images
 
     rag = get_controller()
@@ -801,6 +888,10 @@ def answer_function(*args, **kwargs):
     # 이력은 초안에도 준다. 다듬는 쪽이 "초안이 대명사를 제대로 짚었는지" 판단하려면
     # 같은 대화를 보고 있어야 한다(ragmodul arefine 의 설명). 실은 만큼 맥락 예산에서
     # 빼주므로 로컬이 넘치지 않는다.
+    #
+    # 첨부도 초안에는 주지 않는다. ragmodul 이 문서·그림을 클라우드 셋에만 보내고 로컬은
+    # 지원하지 않는다. 그래서 초안은 첨부를 못 본 채로 나오고, 첨부를 근거로 한 내용은
+    # 다듬기 단계에서 채워진다.
     draft = rag.answer(query, contexts, provider=DRAFT_PROVIDER,
                        history=history, summary=summary)
     logger.info(f"[answer_function] 초안 {DRAFT_PROVIDER} {len(draft):,}자 (내부용)")
@@ -828,8 +919,12 @@ def answer_function(*args, **kwargs):
     # dict 로 넘기면 ragmodul 이 title·source 만 쓴다(_format_external). 문자열로 넘기면
     # 그 줄을 그대로 실어주므로, 응답 원문까지 붙여 보낸다.
     external = [_format_api_ref(ref) for ref in refs]
+    # 첨부는 고른 모델 전부에게 같은 것이 간다. images 자리에는 검색으로 찾은 문서 그림이
+    # 아니라 사용자가 올린 그림만 싣는다 — 찾은 그림은 응답에만 실어 사용자가 본다.
     answers = rag.refine_all(query, contexts, draft, providers,
-                             external=external, history=history, summary=summary)
+                             external=external, history=history, summary=summary,
+                             images=[attach_image] if attach_image else None,
+                             attachments=attachments)
     for name in providers:
         mark = f"{len(answers[name]):,}자" if name in answers else "실패"
         logger.info(f"[answer_function] 다듬기 {name} {mark}")

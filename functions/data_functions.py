@@ -788,7 +788,12 @@ def save_conversation(*args, **kwargs):
               f" — 병합·선택 때 저장한다")
         return value
 
-    query = (req.get("payload") or {}).get("query") or ""
+    # 첨부는 저장하지 않는다 — 파일을 들고 있지 않고, 대화 기록에 base64 를 남길 이유도
+    # 없다. 대신 이름만 질문 앞에 붙인다. 없으면 대화를 다시 열었을 때 "이 문서 요약해줘"
+    # 만 남아 무엇을 보고 답한 것인지 알 수 없다. 순환 import 를 피해 함수 안에서 가져온다.
+    from functions.rag_functions import _attach_note
+
+    query = _attach_note(req) + ((req.get("payload") or {}).get("query") or "")
     reply = answers[0]["answer"] if answers else ""
 
     try:
