@@ -139,6 +139,16 @@ HISTORY_CHARS = int(os.environ.get("RAG_HISTORY_CHARS", "15000"))
 # 한 차례를 셀 때 더하는 여유. 모듈이 "사용자:" 같은 표시를 붙여 세므로, 서버가 딱 맞춰
 # 넘기면 가장 오래된 차례가 모듈에서 잘릴 수 있다.
 HISTORY_TURN_OVERHEAD = 20
+# 답변에 원문으로 실을 최근 차례 수. 글자 예산과 함께 쓰고, 둘 중 먼저 걸리는 쪽이 창을 닫는다.
+#
+# 접는 양과는 무관하다. 압축은 커서 이후를 전부 접으므로(compress_session) 이 값을 바꿔도
+# 주기마다 접히는 차례 수는 그대로다 — 이 값이 정하는 건 "모델이 원문으로 보는 최근 대화가
+# 몇 차례인가" 뿐이다.
+#
+# 글자 예산만 두지 않는 이유는 짧은 문답이 이어질 때다. 한 차례가 100자면 15,000자 안에
+# 100차례가 들어가서 프롬프트가 쓸데없이 길어진다 — 그만큼 오래된 대화는 요약에 이미
+# 들어가 있으므로 원문으로 또 실을 이유가 없다.
+KEEP_TURNS = int(os.environ.get("RAG_KEEP_TURNS", "10"))
 # 이력·압축이 한 번에 읽는 차례 수. 세션 하나의 전체 대화 상한이기도 하다.
 COMPRESS_SCAN_TURNS = int(os.environ.get("RAG_COMPRESS_SCAN_TURNS", "100"))
 SUMMARY_PROVIDER = os.environ.get("RAG_SUMMARY_PROVIDER", "claude")
@@ -635,17 +645,23 @@ def _turn_chars(row: dict) -> int:
 
 
 def _split_recent(rows: list) -> tuple[list, list]:
-    """오래된 순 차례 목록 -> (원문으로 실을 최근 차례, 요약에 접을 앞쪽 차례).
+    """오래된 순 차례 목록 -> (원문으로 실을 최근 차례, 그 앞의 차례).
 
-    최근 것부터 거꾸로 더해 HISTORY_CHARS 안에 드는 만큼을 원문으로 둔다. 가장 최근 한
-    차례는 예산을 넘어도 원문에 둔다 — 직전 대화가 통째로 빠지면 대명사를 못 푼다.
-    history_function 과 compress_session 이 같은 함수를 써야 "어디에도 안 실리는 구간" 이
-    안 생긴다.
+    최근 것부터 거꾸로 담되 **KEEP_TURNS 차례** 와 **HISTORY_CHARS 글자** 중 먼저 걸리는
+    쪽에서 멈춘다. 글자 예산은 ragmodul 이 이력을 자르는 기준과 같은 값이라, 여기서 통과한
+    것은 모듈에서 잘리지 않는다 — 모듈이 자르면 그 차례는 서버가 "원문으로 실었다" 고 여기는
+    사이에 사라진다.
+
+    가장 최근 한 차례는 어느 한도도 적용하지 않는다 — 직전 대화가 통째로 빠지면 대명사를
+    못 푼다.
+
+    history_function 전용이다. 압축(compress_session)은 이 창을 보지 않고 커서 이후를 전부
+    접는다 — 창 안의 차례를 접어도 중복일 뿐이고, 창 밖인데 요약에도 없는 구간만 없으면 된다.
     """
     kept, used = [], 0
     for row in reversed(rows):
         size = _turn_chars(row)
-        if kept and used + size > HISTORY_CHARS:
+        if kept and (len(kept) >= KEEP_TURNS or used + size > HISTORY_CHARS):
             break
         kept.append(row)
         used += size
@@ -1060,21 +1076,24 @@ def session_compact_status(*args, **kwargs):
 
 @work_regist("compress_session")
 def compress_session(*args, **kwargs):
-    """창 밖으로 밀려난 대화를 요약에 접어 넣는다. (요약, 접어 넣은 차례 수).
+    """아직 요약하지 않은 차례를 전부 요약에 접어 넣는다. (요약, 접어 넣은 차례 수).
 
-    HISTORY_CHARS 안에 드는 최근 차례는 원문으로 실리므로 압축 대상이 아니다(history_function
-    과 같은 _split_recent 로 가른다). 그보다 앞의 차례 중 **아직 접지 않은 것만** 넘긴다 —
-    ragmodul 이 '기존 요약 + 새로 밀려난 차례' 로 누적 갱신한다. 어디까지 접었는지는
-    sessions.summarized_turn(없으면 메모리 표)이 turn_index 로 기억한다.
+    커서(sessions.summarized_turn, 없으면 메모리 표) 이후의 차례를 전부 넘긴다 — ragmodul 이
+    '기존 요약 + 새로 접는 차례' 로 누적 갱신한다. 주기가 20차례면 매번 20차례씩 접힌다.
 
-    밀려난 차례가 없으면 ragmodul 이 LLM 을 부르지 않고 기존 요약을 그대로 돌려준다.
+    **원문 창(_split_recent)과 겹치는 것을 꺼리지 않는다.** 방금 접은 차례가 당분간
+    history_function 에 원문으로도 실리는데, 그건 중복일 뿐 손해가 아니다. 피해야 하는 건
+    반대쪽 — 원문 창 밖인데 요약에도 없는 차례이고, 창보다 넓게 접으면 그게 생길 수 없다.
+    (전에는 이 함수도 _split_recent 로 갈라서 '원문으로 남길 차례' 만큼 접는 양이 깎였다.
+    짧은 대화에서는 창이 전부를 덮어 한 차례도 안 접혔다 — 실측으로 20차례에 0차례.)
+
+    접을 것이 없으면 ragmodul 이 LLM 을 부르지 않고 기존 요약을 그대로 돌려준다.
     그래도 여기서 먼저 걸러 DB 쓰기까지 건너뛴다.
     """
     session_id = args[0]
 
     rows = db_call("get_recent_messages", session_id=session_id,
                    limit_count=COMPRESS_SCAN_TURNS) or []
-    _kept, candidates = _split_recent(rows)
 
     context = db_call("get_session_context", session_id=session_id) or {}
     previous = context.get("overall_summary") or ""
@@ -1084,9 +1103,9 @@ def compress_session(*args, **kwargs):
         folded_until = max(int(context.get("summarized_turn") or 0),
                            _compress_cursor.get(session_id, 0))
 
-    dropped = [r for r in candidates if (r.get("turn_index") or 0) > folded_until]
+    dropped = [r for r in rows if (r.get("turn_index") or 0) > folded_until]
     if not dropped:
-        logger.info(f"[compress_session] 새로 밀려난 차례 없음 "
+        logger.info(f"[compress_session] 새로 접을 차례 없음 "
                     f"({len(rows)}차례, 접힌 turn_index {folded_until}까지)")
         return "", 0
 
