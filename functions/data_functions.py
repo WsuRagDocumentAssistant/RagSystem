@@ -61,7 +61,10 @@ tasks["DICTIONARY_SAVE"]       = ["dictionary_save_input", "save_db_words",
 
 tasks["EXTERNAL_API_LIST"]     = ["select_all_db_api_data", "external_api_list_output"]
 
-tasks["EXTERNAL_API_SAVE"]     = ["create_api_data", "insert_db_api_data",
+# payload 에 id(=url) 가 있으면 수정, 없으면 수집 후 신규 등록. 둘 다 행을 돌려주므로 뒤의
+# 임베딩·응답 단계는 같다. 수정 때도 title·source 가 바뀌면 벡터를 다시 만든다
+# (save_api_data_vector 가 UPSERT 라 행이 늘지 않는다).
+tasks["EXTERNAL_API_SAVE"]     = ["save_external_api",
                                   "embed_api_function", "external_api_save_output"]
 
 tasks["EXTERNAL_API_SYNC"]     = ["api_id_input", "sync_db_api_data",
@@ -204,7 +207,60 @@ def api_data(*args, **kwargs) -> ApiEntity:
     logger.info(f"[create_api_data] 수집: {request.title} ({request.url[:60]})")
     return asyncio.run(collect(request))
 
-# DB에 저장, API 결과 리스트 반환
+def _refresh_minutes(payload) -> int | None:
+    """payload 의 refreshIntervalMinutes -> int 또는 None. 클라이언트가 문자열로 보낼 수 있다."""
+    value = payload.get("refreshIntervalMinutes")
+    return int(value) if value not in (None, "") and str(value).isdigit() else None
+
+
+@work_regist("save_external_api")
+def save_external_api(*args, **kwargs):
+    """EXTERNAL_API_SAVE 의 첫 단계. 수정이면 메타만 고치고, 신규면 수집해서 넣는다. DB 행을 돌려준다.
+
+    명세: "id 있으면 수정, 없으면 신규". id 는 url 이다(목록이 url 을 id 로 내보낸다).
+
+    수정은 수집하지 않는다 — 데이터 갱신은 EXTERNAL_API_SYNC 와 타이머가 한다. url 은 PK 라
+    못 바꾼다. 전에는 수정 요청도 신규 경로를 타서 url 충돌로 조용히 실패하고
+    "등록된 외부 API 를 찾지 못했습니다" 가 나갔다.
+
+    신규 등록 실패(같은 url 이 이미 있음)는 예외로 올린다. db_call 이 None 을 주면 그대로
+    흘러가서 뒤 단계가 엉뚱한 메시지를 내기 때문이다.
+    """
+    payload = (args[0].get("payload") or {}) if args and isinstance(args[0], dict) else {}
+    refresh = _refresh_minutes(payload)
+    api_id = payload.get("id")
+
+    if api_id:
+        if payload.get("url") and payload["url"] != api_id:
+            raise ValueError("url 은 바꿀 수 없습니다. 삭제 후 다시 등록해주세요.")
+        row = db_call("update_api_data_meta", url=api_id,
+                      title=payload.get("title"), source=payload.get("source"),
+                      key=payload.get("apiKey") or payload.get("key"),
+                      refresh_interval_minutes=refresh)
+        if not row:
+            raise ValueError(f"등록되지 않은 외부 API 입니다: {api_id}")
+        logger.info(f"[save_external_api] 수정: {row.get('title')} (주기 {refresh}분)")
+        return row
+
+    request = ApiEntity(
+        title=payload.get("title"),
+        url=payload.get("url"),
+        source=payload.get("source"),
+        key=payload.get("apiKey") or payload.get("key"),
+    )
+    if not request.url:
+        raise ValueError("payload 에 url 이 없습니다.")
+    entity = asyncio.run(collect(request))
+    row = db_call("insert_api_data", title=entity.title, url=entity.url, source=entity.source,
+                  key=entity.key, data=entity.data, data_type=entity.data_type,
+                  refresh_interval_minutes=refresh)
+    if not row:
+        raise ValueError("외부 API 를 등록하지 못했습니다. 같은 url 이 이미 등록되어 있는지 확인해주세요.")
+    logger.info(f"[save_external_api] 등록: {entity.title} ({entity.url[:60]}, 주기 {refresh}분)")
+    return row
+
+
+# DB에 저장, API 결과 리스트 반환 (api_insert 테스트 task 용. 통신부는 save_external_api 를 쓴다)
 @work_regist("insert_db_api_data")
 def insert_db_api_data(*args, **kwargs):
     inserted_api_data = db_call("insert_api_data", title=args[0].title, url=args[0].url, source=args[0].source, key=args[0].key, data=args[0].data, data_type=args[0].data_type)
@@ -534,7 +590,6 @@ def external_api_save_output(*args, **kwargs):
     목록에서 찾아 돌려준다 — insert 반환값을 그대로 쓰면 컬럼 이름이 DB 쪽이라
     클라이언트가 못 읽는다.
 
-    refreshIntervalMinutes 는 api_datas 에 컬럼이 없어 비워 보낸다.
     """
     url = args[0] if args and isinstance(args[0], str) else None
     rows = db_call("select_all_api_data") or []
@@ -549,7 +604,7 @@ def external_api_save_output(*args, **kwargs):
         "source": row.get("source"),
         "apiKey": row.get("key") or row.get("api_key"),
         "fetchedAt": str(row.get("date") or row.get("fetched_at") or "") or None,
-        "refreshIntervalMinutes": None,
+        "refreshIntervalMinutes": row.get("refresh_interval_minutes"),
     }}
 
 
