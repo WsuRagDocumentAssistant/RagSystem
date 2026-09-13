@@ -17,7 +17,7 @@ from session_data import build_session, Session
 from api_data import collect, ApiEntity
 import db_manager
 from functions.exception_functions import safe_call
-from utils import from_jsonb
+from utils import from_jsonb, image_summaries, IMAGE_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -387,7 +387,10 @@ def chat_session_messages_output(*args, **kwargs):
                              # 예전 대화는 NULL 이다. 클라이언트가 없으면 일반 말풍선으로 그린다.
                              "provider": row.get("provider"),
                              # 저장 안 된 예전 대화는 NULL 이라 빈 목록이 된다.
-                             "sources": from_jsonb(row.get("sources"), [])})
+                             "sources": from_jsonb(row.get("sources"), []),
+                             # 답변에 붙었던 그림. USER_QUERY 응답의 images 와 같은 모양이다.
+                             # 그림 컬럼이 생기기 전 대화와 그림 없는 답변은 빈 목록이다.
+                             "images": from_jsonb(row.get("images"), [])})
     return {"messages": messages}
 
 
@@ -698,6 +701,7 @@ def save_conversation(*args, **kwargs):
     # answer_function 이 그림까지 실어 보낸다(4칸). test_ 태스크에서는 3칸이다.
     value = args[0]
     req, answers, sources = value[:3]
+    images = value[3] if len(value) > 3 else []
     session_id = req.get("session_id")
     if not session_id:
         return value
@@ -723,10 +727,13 @@ def save_conversation(*args, **kwargs):
     try:
         # 출처는 answer_function 이 함께 넘겨준 것이다. jsonb 컬럼이라 목록을 그대로
         # 넘기면 db_manager 가 json 문자열로 만들어 보낸다.
+        # 그림도 함께 남긴다. 응답(user_query_output)과 같은 모양이라 대화를 다시 열 때
+        # 클라이언트가 같은 코드로 그린다. 없으면 NULL — 옛 대화와 같다.
         db_call("insert_message", session_id=session_id, user_query=query,
                 ai_response=reply, sources=sources,
-                provider=answers[0]["provider"] if answers else None)
-        logger.info(f"[save_conversation] 세션 {session_id} 에 저장")
+                provider=answers[0]["provider"] if answers else None,
+                images=image_summaries(images, IMAGE_DIR, "/api/images") or None)
+        logger.info(f"[save_conversation] 세션 {session_id} 에 저장 (그림 {len(images)}장)")
     except Exception as e:                                   # noqa: BLE001
         logger.warning(f"[save_conversation] 저장 실패, 답변은 그대로 보냄: {type(e).__name__} - {e}")
 

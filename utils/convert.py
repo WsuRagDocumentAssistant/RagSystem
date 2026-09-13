@@ -110,3 +110,27 @@ def resolve_image_path(image_path: str, root: str):
         if candidate.is_file():
             return candidate
     return None
+
+
+def image_summaries(rows, root: str, prefix: str) -> list:
+    """document_images 검색 행들 -> 클라이언트가 읽는 [{id, url, name, caption, aiSummary, documentId, documentTitle}].
+
+    USER_QUERY 응답의 images 와 messages.images 에 저장하는 값이 같은 모양이어야 해서
+    한 곳에 둔다 — 대화를 다시 열었을 때 클라이언트가 같은 코드로 그린다.
+
+    그림 파일이 아니라 경로(URL)다. base64 를 넣으면 대화 한 행이 MB 단위가 되고, 파일은
+    /api/images 로 이미 나간다. 문서를 지우면 그림도 지워져 옛 대화의 링크는 깨진다 —
+    sources 가 문서를 지우면 출처가 없어지는 것과 같은 성격이라 그대로 둔다.
+    """
+    return [
+        {
+            "id": str(row.get("image_id") or ""),
+            "url": static_url(row.get("image_path") or "", root, prefix),
+            "name": row.get("image_name"),
+            "caption": row.get("caption"),
+            "aiSummary": row.get("ai_summary"),
+            "documentId": str(row.get("document_id") or ""),
+            "documentTitle": row.get("document_title"),
+        }
+        for row in (rows or [])
+    ]

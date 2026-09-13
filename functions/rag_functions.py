@@ -30,7 +30,7 @@ from taskcontroller import work_regist, tasks
 from ragmodul import RagController, chunk, parse
 from ragmodul.util import document_to_payload, to_plain_sparse, to_plain_vector
 from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
-from utils import from_jsonb, static_url, resolve_image_path, IMAGE_DIR, UNPACK_DIR
+from utils import from_jsonb, static_url, resolve_image_path, image_summaries, IMAGE_DIR, UNPACK_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -1119,20 +1119,9 @@ def user_query_output(*args, **kwargs):
                      "sources": sources} for a in answers],
         "sessionId": req.get("session_id"),
         "sources": sources,
-        # 모델이 본 그림을 사용자도 본다. base64 는 빼고 URL 로 준다 — 응답에 실으면
-        # 방금 보낸 것을 되돌려주는 셈이라 무겁고, 파일은 /api/images 로 이미 나간다.
-        "images": [
-            {
-                "id": str(image.get("image_id") or ""),
-                "url": static_url(image.get("image_path") or "", IMAGE_DIR, "/api/images"),
-                "name": image.get("image_name"),
-                "caption": image.get("caption"),
-                "aiSummary": image.get("ai_summary"),
-                "documentId": str(image.get("document_id") or ""),
-                "documentTitle": image.get("document_title"),
-            }
-            for image in images
-        ],
+        # 찾은 그림을 사용자가 본다. 모양은 save_conversation 이 messages.images 에 넣는 것과
+        # 같다(utils.image_summaries) — 대화를 다시 열어도 같은 코드로 그려진다.
+        "images": image_summaries(images, IMAGE_DIR, "/api/images"),
     }
 
 
