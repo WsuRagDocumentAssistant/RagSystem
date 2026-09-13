@@ -9,7 +9,6 @@ import logging
 import os
 import queue
 import threading
-import time
 
 from taskcontroller import work_lst, TaskController,tasks, Task
 from taskexecutor import TaskExecutor
@@ -62,23 +61,6 @@ GATEWAY_TIMEOUT = 600   # 초. 라우터 기본값 60 은 색인에 턱없이 �
 # 업로드 임베딩 중의 질의는 검색 단계에서 그것이 끝나기를 기다린 뒤 이어서 돈다.
 EXECUTOR_THREADS = int(os.environ.get("RAG_EXECUTOR_THREADS", "4"))
 
-# 접수만 하고 바로 답하는 task_type. 색인은 몇 분 걸리는데 클라이언트 XHR 타임아웃이
-# 60초라 응답 하나에 매달 수 없다. 여기 든 task 는 실행부에 넣는 즉시
-# {jobId, status: processing} 으로 답하고, 결과는 JOB_STATUS 로 조회한다.
-#
-# 비워두면 지금과 똑같이 동작한다. 클라이언트가 jobId 응답과 JOB_STATUS 폴링을 붙이기
-# 전에는 비워둔 채 배포한다 — 안 그러면 클라이언트가 fileId 자리에서 jobId 를 읽는다.
-DETACHED_TASKS = {"FILE_UPLOAD"}
-
-# 끝난 작업을 클라이언트가 확인하러 오지 않을 때 표에서 지우기까지의 초.
-JOB_TTL = 3600
-
-# job_id -> {"status": processing|ready|error, "result"|"error", "done_at"}
-# 브릿지(이 프로세스)에만 있다. 실행부 결과는 전부 여기로 오므로 성공·실패를 다 적을 수 있다.
-# 서버가 재시작되면 비므로 그때는 unknown 이 된다 — 색인도 같이 죽으니 다시 올려야 한다.
-_jobs: dict = {}
-_jobs_lock = threading.Lock()
-
 # 정적으로 내보낼 폴더. rag_functions / document_functions 가 파일을 떨구는 곳과 같다.
 from utils import IMAGE_DIR, DOCUMENT_DIR
 
@@ -120,12 +102,6 @@ def bridge_submit_loop(controller, stop_event):
 
         logger.info("수신 job_id=%s task_type=%s", task.job_id, task.task_type)
 
-        # JOB_STATUS 는 실행부를 거치지 않는다. 표가 여기 있고, 실행부 스레드가 전부
-        # 긴 작업에 잡혀 있어도 조회는 막히지 않아야 한다.
-        if task.task_type == "JOB_STATUS":
-            result_queue.put(TaskResult(task.job_id, True, data=_job_status(task.payload)))
-            continue
-
         # payload 만 보내면 session_id 와 token 을 되찾을 방법이 없다. 요청을 통째로
         # 넘기고, 체인이 그걸 흘려보내며 필요한 단계에서 꺼내 쓴다.
         # job_id 는 결과가 돌아올 때 짝을 맞추는 열쇠다. task_type 은 실패 메시지에
@@ -138,19 +114,16 @@ def bridge_submit_loop(controller, stop_event):
             "token": task.token,
         }))
 
-        # 접수형이면 여기서 바로 답한다. 실제 결과는 collect 가 표에 적는다.
-        if task.task_type in DETACHED_TASKS:
-            with _jobs_lock:
-                _jobs[task.job_id] = {"status": "processing"}
-            result_queue.put(TaskResult(task.job_id, True,
-                                        data={"jobId": task.job_id, "status": "processing"}))
-
 
 def bridge_collect_loop(executor, stop_event):
     """실행부 결과를 라우터 큐에 돌려준다. 짝은 결과에 실린 job_id 가 맞춘다.
 
     결과가 작업 순서대로 온다고 가정하지 않는다. 실행부가 스레드 풀이면 가벼운
     작업이 먼저 올라온 무거운 작업보다 먼저 끝난다.
+
+    "접수만 하고 먼저 답하는" 작업(FILE_UPLOAD)도 여기서는 특별하지 않다. 그 work 이
+    제너레이터라 실행부가 첫 yield 값을 결과로 보내고, 나머지는 실행부 안에서 이어진다.
+    브릿지는 그 첫 값을 보통 결과처럼 돌려줄 뿐이다.
     """
     from rag_router.shared_queues import SharedQueues
     from rag_router.task.task_result import TaskResult
@@ -180,52 +153,11 @@ def bridge_collect_loop(executor, stop_event):
                 logger.info("워커 준비 완료: %r", result)
             continue
 
-        # 접수형은 이미 답했다. 라우터로 보내면 dispatcher 가 모르는 job_id 라 버릴 뿐이고,
-        # 그 대신 표에 적어 JOB_STATUS 가 읽게 한다.
-        if params.get("task_type") in DETACHED_TASKS:
-            _finish_job(job_id, params.get("task_type", ""), result)
-            # 색인 실패면 문서 행을 error 로 표시한다. file_upload_input 이 요청 dict 에
-            # document_id 를 적어두고, 실행부는 실패해도 그 dict 를 결과와 함께 돌려준다.
-            # 브릿지에는 DB 연결이 없어 실행부에 작업으로 넣는다(warmup 과 같은 통로).
-            if isinstance(result, TaskExecutionError) and params.get("document_id"):
-                executor.task_queue.put(Task(["mark_document_error"],
-                                             {"document_id": params["document_id"]}))
-            continue
-
         # 게이트웨이가 타임아웃으로 이미 포기한 요청이면 그쪽 dispatcher 가 알아서
         # 버린다. 여기서 살아 있는 요청인지 따로 확인할 필요가 없다.
         result_queue.put(_to_task_result(job_id, params.get("task_type", ""),
                                          result, TaskResult))
 
-
-def _finish_job(job_id, task_type, result):
-    """실행부 결과를 표에 적는다. 성공·실패 판정은 _to_task_result 와 같은 규칙이다."""
-    if isinstance(result, TaskExecutionError):
-        logger.error("job_id=%s 작업 실패: %s", job_id, result.tb)
-        entry = {"status": "error", "error": _error_message(result, task_type)}
-    else:
-        logger.info("완료 job_id=%s", job_id)
-        entry = {"status": "ready", "result": result}
-    entry["done_at"] = time.time()
-    with _jobs_lock:
-        _jobs[job_id] = entry
-
-
-def _job_status(payload) -> dict:
-    """JOB_STATUS 응답. 끝난 항목은 돌려주면서 지운다 — 클라이언트가 확인한 것이다."""
-    job_id = (payload or {}).get("jobId")
-    now = time.time()
-    with _jobs_lock:
-        # 확인하러 오지 않은 완료 항목 정리. 조회 때마다 곁들이므로 타이머가 필요 없다.
-        for key in [k for k, v in _jobs.items()
-                    if v.get("done_at") and now - v["done_at"] > JOB_TTL]:
-            del _jobs[key]
-        job = _jobs.get(job_id)
-        if job is None:
-            return {"status": "unknown"}
-        if job["status"] != "processing":
-            del _jobs[job_id]
-    return {k: v for k, v in job.items() if k in ("status", "result", "error")}
 
 
 def _to_task_result(job_id, task_type, result, TaskResult):

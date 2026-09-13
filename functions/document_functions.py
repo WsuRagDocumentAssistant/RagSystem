@@ -4,7 +4,7 @@
 #================================================
 
 import logging
-from taskcontroller import work_regist, tasks
+from taskcontroller import work_regist, tasks, works
 from functions.data_functions import db_call, _to_millis   # DB 호출은 예외처리까지 묶여 있다
 from functions.rag_functions import UploadStep, _step_in       # 업로드 체인이 meta 를 나르는 방법
 from utils import static_url as _static_url, local_path, resolve_image_path, IMAGE_DIR, DOCUMENT_DIR
@@ -66,24 +66,19 @@ tasks["FILE_IMAGE_UPLOAD"] = ["file_image_upload_input", "get_document_image",
 tasks["IMAGE_VECTORIZE"] = ["image_vectorize_input", "vectorize_image",
                             "image_vectorize_output"]
 
-# 색인이 먼저다. register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
-# 색인이 먼저다 — register_document 는 임베딩된 문서에만 분류값을 붙일 수 있다.
-# 업무 분류값(meta)은 UploadStep 에 실려 단계 사이를 통과한다(rag_functions).
-tasks["FILE_UPLOAD"] = ["file_upload_input",
-                        "parse_function", "chunk_function",
-                        "vocab_function", "filter_vocab_function", "save_vocab_function",
-                        "embed_function", "save_function", "register_images",
-                        "describe_images_function", "embed_images_function",
-                        "file_upload_register"]
+# 색인 체인. 업무 분류값(meta)은 UploadStep 에 실려 단계 사이를 통과한다(rag_functions).
+# 접수 work(file_upload_job)이 안에서 순서대로 부른다 — 통신부 task 로 직접 걸지 않는다.
+_FILE_UPLOAD_CHAIN = ["parse_function", "chunk_function",
+                      "vocab_function", "filter_vocab_function", "save_vocab_function",
+                      "embed_function", "save_function", "register_images",
+                      "describe_images_function", "embed_images_function",
+                      "file_upload_register"]
 
-# 브릿지(main.py)가 가로채 실행부를 거치지 않고 답한다. 여기 두는 이유는 라우터의
-# "등록된 task_type 인가" 검사를 통과시키기 위해서다. 아래 work 은 실제로 돌지 않는다.
-tasks["JOB_STATUS"] = ["job_status_never_runs"]
-
-
-@work_regist("job_status_never_runs")
-def job_status_never_runs(*args, **kwargs):
-    raise RuntimeError("JOB_STATUS 는 브릿지가 처리한다. 여기까지 왔으면 main.py 의 가로채기가 빠진 것이다.")
+# 접수만 하고 바로 답한다. 색인은 몇 분 걸리는데 클라이언트 XHR 타임아웃이 60초라 응답 하나에
+# 매달 수 없다. file_upload_job 이 제너레이터라 실행부가 첫 yield({jobId, processing})를 바로
+# 응답으로 보내고, 색인은 같은 스레드에서 이어진다. 결과는 JOB_STATUS 로 조회한다.
+tasks["FILE_UPLOAD"] = ["file_upload_job"]
+tasks["JOB_STATUS"]  = ["job_status"]
 
 
 # get_vocab 은 DB 원본(word/replacement)을 그대로 준다. 클라이언트는 term/synonyms 로
@@ -438,19 +433,91 @@ def file_upload_register(*args, **kwargs):
     return {"fileId": str(document_id), "status": "ready", "chunks": chunks}
 
 
-@work_regist("mark_document_error")
-def mark_document_error(*args, **kwargs):
-    """색인이 실패한 문서 행을 error 로 표시한다. 브릿지가 실패 결과를 보고 넣는 작업이다.
+#────────────────────────────────────────────────┌> 업로드 접수·조회
 
-    브릿지(부모 프로세스)에는 DB 연결이 없어서 실행부에 시킨다. 결과는 job_id 가 없어
-    브릿지가 흘려보낸다.
+import threading
+import time
+
+# 끝난 작업을 클라이언트가 확인하러 오지 않을 때 표에서 지우기까지의 초.
+JOB_TTL = int(os.environ.get("RAG_JOB_TTL", "3600"))
+
+# job_id -> {"status": processing|ready|error, "result"|"error", "done_at"}
+# 실행부 프로세스 메모리에만 있다. 접수 work 과 job_status 가 같은 프로세스라 충분하다.
+# 서버가 재시작되면 비므로 그때는 unknown 이 된다 — 색인도 같이 죽고, 문서 행은
+# mark_stale_uploads 가 error 로 바꾼다.
+_jobs: dict = {}
+_jobs_lock = threading.Lock()
+
+
+def _job_error_message(e: Exception) -> str:
+    """ValueError 는 사용자에게 보여주려고 쓴 문장이라 그대로, 그 밖은 한 문장으로 덮는다.
+    브릿지가 보통 실패에 쓰는 규칙(main._error_message)과 같다."""
+    if isinstance(e, ValueError) and str(e):
+        return str(e)
+    return "작업 실행에 실패했습니다: FILE_UPLOAD"
+
+
+@work_regist("file_upload_job")
+def file_upload_job(*args, **kwargs):
+    """FILE_UPLOAD 접수. 응답을 먼저 보내고 같은 스레드에서 색인을 이어서 돌린다.
+
+    제너레이터다. 실행부가 첫 yield 값을 바로 응답으로 보낸다. 그 전(file_upload_input)에서
+    난 예외는 보통 실패처럼 즉시 오류 응답이 된다 — payload 가 잘못된 것은 접수 단계에서
+    알려야 한다. yield 뒤의 예외는 응답이 이미 나갔으므로 여기서 잡아 표에 적는다.
+
+    Task 를 만들지 않는다. 체인의 work 들을 works 표에서 꺼내 순서대로 부를 뿐이다 —
+    Task.__call__ 이 하는 일과 같고, Task 는 컨트롤러만 만든다는 원칙을 지킨다.
     """
-    document_id = (args[0] or {}).get("document_id") if args else None
-    if not document_id:
-        return None
-    updated = db_call("set_document_status", id=int(document_id), status="error")
-    logger.info(f"[mark_document_error] id={document_id} -> error ({'ok' if updated else '실패'})")
-    return updated
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    job_id = req.get("job_id")
+    if not job_id:
+        raise ValueError("job_id 가 없습니다. 통신부를 거치지 않은 호출입니다.")
+
+    value = works["file_upload_input"](req)          # 검사·파일 저장·processing 행. 실패면 즉시 오류
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "processing"}
+    yield {"jobId": job_id, "status": "processing"}  # ── 여기까지가 응답
+
+    try:
+        for name in _FILE_UPLOAD_CHAIN:
+            value = works[name](value)
+        entry = {"status": "ready", "result": value}
+        logger.info(f"[file_upload_job] {job_id} 완료: {value}")
+    except Exception as e:                           # noqa: BLE001
+        entry = {"status": "error", "error": _job_error_message(e)}
+        logger.exception(f"[file_upload_job] {job_id} 색인 실패")
+        # 문서 행도 error 로. 안 그러면 목록에 영영 '처리 중' 으로 남는다.
+        document_id = req.get("document_id")
+        if document_id:
+            db_call("set_document_status", id=int(document_id), status="error")
+    entry["done_at"] = time.time()
+    with _jobs_lock:
+        _jobs[job_id] = entry
+
+
+@work_regist("job_status")
+def job_status(*args, **kwargs):
+    """payload {jobId} -> {status, result|error}. 끝난 항목은 돌려주면서 지운다.
+
+    processing | ready(+result) | error(+error) | unknown(모르는 id — 만료 또는 재시작).
+    확인하러 오지 않은 완료 항목은 조회 때마다 곁들여 정리하므로 타이머가 필요 없다.
+    """
+    payload = (args[0].get("payload") or {}) if args and isinstance(args[0], dict) else {}
+    job_id = payload.get("jobId")
+    if not job_id:
+        raise ValueError("payload 에 jobId 가 없습니다.")
+
+    now = time.time()
+    with _jobs_lock:
+        for key in [k for k, v in _jobs.items()
+                    if v.get("done_at") and now - v["done_at"] > JOB_TTL]:
+            del _jobs[key]
+        job = _jobs.get(job_id)
+        if job is None:
+            return {"status": "unknown"}
+        if job["status"] != "processing":
+            del _jobs[job_id]                        # 클라이언트가 확인했다
+    return {k: v for k, v in job.items() if k in ("status", "result", "error")}
 
 
 @work_regist("mark_stale_uploads")

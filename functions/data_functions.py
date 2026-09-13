@@ -84,7 +84,7 @@ tasks["CHAT_ANSWER_SAVE"] = ["answer_save_input", "save_answer",
 load_dotenv()   # .env를 os.environ에 올린다 (없으면 조용히 넘어감)
 
 # 대화 내역 화면(CHAT_SESSION_MESSAGES)에 돌려줄 최근 차례 수. 프로시저 기본값이 5 라
-# 그대로 부르면 화면에 다섯 차례만 보인다. LLM 에 실을 이력(KEEP_TURNS)과는 다른 값이다 —
+# 그대로 부르면 화면에 다섯 차례만 보인다. LLM 에 실을 이력(HISTORY_CHARS, 글자 예산)과는 다른 값이다 —
 # 그쪽은 맥락 예산 때문에 작게, 이쪽은 사용자가 지난 대화를 읽는 용도라 넉넉히 둔다.
 CHAT_HISTORY_LIMIT = int(os.environ.get("RAG_CHAT_HISTORY_LIMIT", "100"))
 
@@ -734,14 +734,26 @@ def save_answer(*args, **kwargs):
         raise ValueError("답변을 저장하지 못했습니다.")
 
     logger.info(f"[save_answer] 세션 {fields['session_id']} 에 저장 "
-          f"(provider={fields['provider']!r}, 출처 {len(fields['sources'])}건)")
-    return saved
+          f"(provider={fields['provider']!r}, 출처 {len(fields['sources'])}건, "
+          f"차례 {saved.get('out_turn_index') if isinstance(saved, dict) else None})")
+    # 다음 단계가 turn 을 응답에 싣고 압축 주기를 잰다. 요청 dict 와 같은 모양으로 넘긴다.
+    return {"session_id": fields["session_id"],
+            "turn_index": int(saved["out_turn_index"])
+            if isinstance(saved, dict) and saved.get("out_turn_index") is not None else None}
 
 
 @work_regist("answer_save_output")
 def answer_save_output(*args, **kwargs):
-    """명세대로 빈 객체. 클라이언트가 필드를 읽지 않는다."""
-    return {}
+    """{turn}. 선택한 답변이 그 차례의 기록이므로 번호는 여기서 나간다.
+
+    제너레이터다. user_query_output 과 같이 응답을 먼저 보내고 주기에 걸리면 압축한다.
+    압축 헬퍼는 rag_functions 에 있다 — 순환 import 를 피해 함수 안에서 가져온다.
+    """
+    from functions.rag_functions import _turn_info, _compact_after_reply
+
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    yield {"turn": _turn_info(req)}
+    _compact_after_reply(req)
 
 
 @work_regist("save_conversation")
@@ -784,11 +796,15 @@ def save_conversation(*args, **kwargs):
         # 넘기면 db_manager 가 json 문자열로 만들어 보낸다.
         # 그림도 함께 남긴다. 응답(user_query_output)과 같은 모양이라 대화를 다시 열 때
         # 클라이언트가 같은 코드로 그린다. 없으면 NULL — 옛 대화와 같다.
-        db_call("insert_message", session_id=session_id, user_query=query,
-                ai_response=reply, sources=sources,
-                provider=answers[0]["provider"] if answers else None,
-                images=image_summaries(images, IMAGE_DIR, "/api/images") or None)
-        logger.info(f"[save_conversation] 세션 {session_id} 에 저장 (그림 {len(images)}장)")
+        saved = db_call("insert_message", session_id=session_id, user_query=query,
+                        ai_response=reply, sources=sources,
+                        provider=answers[0]["provider"] if answers else None,
+                        images=image_summaries(images, IMAGE_DIR, "/api/images") or None)
+        # DB 가 채번한 차례 번호. 뒤 단계(user_query_output)가 압축 주기를 재는 데 쓴다.
+        if isinstance(saved, dict) and saved.get("out_turn_index") is not None:
+            req["turn_index"] = int(saved["out_turn_index"])
+        logger.info(f"[save_conversation] 세션 {session_id} 에 저장 "
+                    f"(차례 {req.get('turn_index')}, 그림 {len(images)}장)")
     except Exception as e:                                   # noqa: BLE001
         logger.warning(f"[save_conversation] 저장 실패, 답변은 그대로 보냄: {type(e).__name__} - {e}")
 

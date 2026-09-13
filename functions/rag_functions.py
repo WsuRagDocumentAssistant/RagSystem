@@ -66,6 +66,10 @@ tasks["MERGE_RESULTS"] = ["merge_function", "save_merged", "merge_output"]
 
 # 클라이언트가 대화 차례를 세어 창을 넘기면 부른다. 질의와 별도 요청이라 답변이
 # 늦어지지 않는다.
+# 클라이언트가 답변 응답의 turn.compacting 을 보고 압축이 끝났는지 묻는다. JOB_STATUS 와 같은
+# 폴링 구조다. 상태 표가 실행부에 있으므로 보통 work 으로 답한다(브릿지 무변경).
+tasks["SESSION_COMPACT_STATUS"] = ["session_compact_status"]
+
 tasks["CHAT_SESSION_COMPRESS"] = ["session_id_input", "compress_session",
                                   "compress_output"]
 
@@ -119,13 +123,29 @@ VOCAB_PROVIDER = os.environ.get("RAG_VOCAB_PROVIDER", "claude")
 # llm_api.timeout(config.json) 에 걸린다 — claude 로 88,000자를 한 번에 보내다 겪었다.
 VOCAB_CHUNK_CHARS = int(os.environ.get("RAG_VOCAB_CHUNK_CHARS", "30000"))
 
-# 대화 압축. 최근 KEEP_TURNS 차례는 원문으로 남기고 그보다 앞은 요약에 접어 넣는다.
-# history_function 이 읽어 넘기는 차례 수와 같아야 한다 — 다르면 어느 쪽에도 안 실리는
-# 구간이 생긴다.
-KEEP_TURNS = int(os.environ.get("RAG_KEEP_TURNS", "5"))
-# 압축 대상을 찾으려면 창보다 많이 읽어야 한다. 세션 하나의 전체 대화 상한이기도 하다.
+# 대화 이력을 원문으로 싣는 상한(글자). 이 안에 드는 최근 차례는 원문으로 넘기고, 넘치는
+# 앞쪽은 CHAT_SESSION_COMPRESS 가 요약에 접어 넣는다.
+#
+# 차례 수가 아니라 글자 수인 이유: ragmodul 이 이력을 글자 예산으로 자른다. 서버가 차례
+# 수로 잘라 넘기면 답변이 긴 대화에서 서버는 "원문으로 싣는 중" 인데 모듈은 이미 버린
+# 차례가 생기고, 그 구간은 요약에도 안 들어가 어디에도 안 실린다. 같은 기준으로 자르면
+# 서버가 넘긴 것은 모듈에서 잘리지 않는다.
+#
+# 15,000 은 ragmodul 에서 나온 값이다: 로컬 초안의 맥락 상한 45,000자(llm_service
+# context_chars) 를 맥락:이력 = 2:1 로 나눈 몫(_split_budget). 로컬 초안은 매 질의마다
+# 돌기 때문에 클라우드 예산(30,000)이 아니라 이쪽이 실제 제약이다. ragmodul 의 그 두 값이
+# 바뀌면 여기도 같이 바꿔야 한다.
+HISTORY_CHARS = int(os.environ.get("RAG_HISTORY_CHARS", "15000"))
+# 한 차례를 셀 때 더하는 여유. 모듈이 "사용자:" 같은 표시를 붙여 세므로, 서버가 딱 맞춰
+# 넘기면 가장 오래된 차례가 모듈에서 잘릴 수 있다.
+HISTORY_TURN_OVERHEAD = 20
+# 이력·압축이 한 번에 읽는 차례 수. 세션 하나의 전체 대화 상한이기도 하다.
 COMPRESS_SCAN_TURNS = int(os.environ.get("RAG_COMPRESS_SCAN_TURNS", "100"))
 SUMMARY_PROVIDER = os.environ.get("RAG_SUMMARY_PROVIDER", "claude")
+# 몇 차례마다 압축을 돌릴지. 답변을 보낸 뒤 같은 스레드에서 이어서 돈다(user_query_output).
+# 매번 확인해도 비용은 DB 조회 두 번뿐이지만, 주기를 두면 그 사이 예산 밖으로 밀린 차례가
+# 다음 압축 때까지 답변 맥락에서 빠져 있다. 10 이면 최대 9차례가 그 상태일 수 있다.
+COMPRESS_EVERY_TURNS = int(os.environ.get("RAG_COMPRESS_EVERY_TURNS", "20"))
 
 # 이미지 설명. hwpx 문서 그림은 절반쯤이 bmp 인데(실측 243장 중 117장) gpt·claude 는
 # bmp 를 400 으로 거절한다 — gemini 만 읽는다. 다른 걸 고르면 그 그림들이 통째로 빠진다.
@@ -532,6 +552,29 @@ def rerank_function(*args, **kwargs):
 #------------------------------------------------┌> 답변
 
 
+def _turn_chars(row: dict) -> int:
+    return len(row.get("user_query") or "") + len(row.get("ai_response") or "") + HISTORY_TURN_OVERHEAD
+
+
+def _split_recent(rows: list) -> tuple[list, list]:
+    """오래된 순 차례 목록 -> (원문으로 실을 최근 차례, 요약에 접을 앞쪽 차례).
+
+    최근 것부터 거꾸로 더해 HISTORY_CHARS 안에 드는 만큼을 원문으로 둔다. 가장 최근 한
+    차례는 예산을 넘어도 원문에 둔다 — 직전 대화가 통째로 빠지면 대명사를 못 푼다.
+    history_function 과 compress_session 이 같은 함수를 써야 "어디에도 안 실리는 구간" 이
+    안 생긴다.
+    """
+    kept, used = [], 0
+    for row in reversed(rows):
+        size = _turn_chars(row)
+        if kept and used + size > HISTORY_CHARS:
+            break
+        kept.append(row)
+        used += size
+    kept.reverse()
+    return kept, rows[:len(rows) - len(kept)]
+
+
 @work_regist("history_function")
 def history_function(*args, **kwargs):
     """이전 대화와 요약을 읽어 함께 넘긴다. (req, 질의, 맥락, 외부, 세션맥락).
@@ -553,13 +596,15 @@ def history_function(*args, **kwargs):
     if not session_id:
         return req, query, contexts, refs, {"history": [], "summary": ""}
 
-    history = db_call("get_recent_messages", session_id=session_id,
-                      limit_count=KEEP_TURNS) or []
+    rows = db_call("get_recent_messages", session_id=session_id,
+                   limit_count=COMPRESS_SCAN_TURNS) or []
+    history, _dropped = _split_recent(rows)
     # 창 밖으로 밀려난 대화는 요약으로만 남는다(CHAT_SESSION_COMPRESS 가 채운다).
     context = db_call("get_session_context", session_id=session_id) or {}
     summary = context.get("overall_summary") or ""
 
-    logger.info(f"[history_function] 이전 대화 {len(history)}차례, 요약 {len(summary)}자")
+    logger.info(f"[history_function] 이전 대화 {len(history)}/{len(rows)}차례 "
+                f"({sum(_turn_chars(r) for r in history):,}자), 요약 {len(summary)}자")
     return req, query, contexts, refs, {"history": history, "summary": summary}
 
 
@@ -849,12 +894,83 @@ def merge_function(*args, **kwargs):
 #------------------------------------------------┌> 대화 압축
 
 
+# 세션별로 "어디까지 요약에 접었는지"(마지막 turn_index). 없으면 부를 때마다 밀려난 모든
+# 차례를 기존 요약과 함께 다시 보내게 된다 — 이미 접힌 내용을 매번 또 요약하는 셈이라
+# 대화가 길수록 호출이 커지고 요약이 매번 새로 써진다.
+#
+# 진짜 값은 DB 의 sessions.summarized_turn 이다(get_session_context 로 읽고
+# update_overall_summary 로 요약과 함께 저장). 아래 메모리 표는 DB 가 그 컬럼을 아직 안
+# 줄 때(옛 db_manager)의 예비이고, 재시작하면 빈다.
+_compress_cursor: dict[str, int] = {}
+_compress_lock = threading.Lock()
+
+# 세션별 압축 진행 상태: "compacting" | "done". 답변 응답이 turn.compacting=true 를 보낸 뒤
+# 클라이언트가 SESSION_COMPACT_STATUS 로 묻는다. 실행부 메모리에만 있다 — 재시작하면 비고,
+# 없는 세션은 done 으로 답한다(압축 중일 수가 없다).
+_compact_state: dict[str, str] = {}
+
+
+def _turn_info(req: dict) -> dict | None:
+    """응답에 실을 {count, compacting}. 저장된 차례가 없으면 None.
+
+    count 는 save_* 가 DB 채번 번호(out_turn_index)를 요청에 적어둔 것이다. 비교 질의의
+    USER_QUERY 는 저장이 없어 None 이고, 그 차례의 번호는 병합·선택 응답에서 온다.
+
+    compacting 은 "이번 차례가 주기에 걸려 압축을 시작한다" 는 뜻이다. 접을 것이 실제로
+    있는지는 압축 작업이 시작돼야 알므로, 주기에 걸리면 무조건 true 다 — 접을 게 없으면
+    작업이 바로 끝나 다음 폴링에서 done 이 온다.
+
+    상태를 여기서 compacting 으로 미리 바꾼다. 응답이 나간 직후 폴링이 와도 done 으로
+    잘못 답하지 않게 하려는 것이다.
+    """
+    turn, session_id = req.get("turn_index"), req.get("session_id")
+    if not turn or not session_id:
+        return None
+    due = turn % COMPRESS_EVERY_TURNS == 0
+    if due:
+        with _compress_lock:
+            _compact_state[session_id] = "compacting"
+    return {"count": int(turn), "compacting": due}
+
+
+def _compact_after_reply(req: dict) -> None:
+    """응답을 yield 한 뒤에 부른다. 주기에 걸린 차례면 같은 스레드에서 압축을 돌린다.
+
+    실패해도 done 으로 바꾼다 — 클라이언트가 할 수 있는 게 없고, 커서가 안 올라갔으니
+    다음 주기에 같은 차례를 다시 접는다. Task 를 만들지 않고 compress_session 을 직접 부른다.
+    """
+    turn, session_id = req.get("turn_index"), req.get("session_id")
+    if not turn or not session_id or turn % COMPRESS_EVERY_TURNS:
+        return
+    try:
+        _summary, folded = compress_session(session_id)
+        logger.info(f"[compact] {turn}번째 차례 뒤 압축: {folded}차례 접음 (세션 {session_id})")
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning(f"[compact] 압축 실패(다음 주기에 다시 시도): {type(e).__name__} - {e}")
+    finally:
+        with _compress_lock:
+            _compact_state[session_id] = "done"
+
+
+@work_regist("session_compact_status")
+def session_compact_status(*args, **kwargs):
+    """payload {sessionId} -> {status: compacting | done}. 모르는 세션은 done."""
+    payload = (args[0].get("payload") or {}) if args and isinstance(args[0], dict) else {}
+    session_id = payload.get("sessionId")
+    if not session_id:
+        raise ValueError("payload 에 sessionId 가 없습니다.")
+    with _compress_lock:
+        return {"status": _compact_state.get(session_id, "done")}
+
+
 @work_regist("compress_session")
 def compress_session(*args, **kwargs):
     """창 밖으로 밀려난 대화를 요약에 접어 넣는다. (요약, 접어 넣은 차례 수).
 
-    최근 KEEP_TURNS 차례는 원문으로 실리므로 압축 대상이 아니다. 그보다 앞의 차례만
-    넘긴다 — ragmodul 이 '기존 요약 + 밀려난 차례' 로 누적 갱신한다.
+    HISTORY_CHARS 안에 드는 최근 차례는 원문으로 실리므로 압축 대상이 아니다(history_function
+    과 같은 _split_recent 로 가른다). 그보다 앞의 차례 중 **아직 접지 않은 것만** 넘긴다 —
+    ragmodul 이 '기존 요약 + 새로 밀려난 차례' 로 누적 갱신한다. 어디까지 접었는지는
+    sessions.summarized_turn(없으면 메모리 표)이 turn_index 로 기억한다.
 
     밀려난 차례가 없으면 ragmodul 이 LLM 을 부르지 않고 기존 요약을 그대로 돌려준다.
     그래도 여기서 먼저 걸러 DB 쓰기까지 건너뛴다.
@@ -863,26 +979,42 @@ def compress_session(*args, **kwargs):
 
     rows = db_call("get_recent_messages", session_id=session_id,
                    limit_count=COMPRESS_SCAN_TURNS) or []
-    dropped = rows[:-KEEP_TURNS] if len(rows) > KEEP_TURNS else []
-    if not dropped:
-        logger.info(f"[compress_session] 밀려난 차례 없음 ({len(rows)}차례)")
-        return "", 0
+    _kept, candidates = _split_recent(rows)
 
     context = db_call("get_session_context", session_id=session_id) or {}
     previous = context.get("overall_summary") or ""
+    # DB 커서가 있으면 그것, 없으면(옛 db_manager) 메모리 표. 둘 다 있으면 큰 쪽 —
+    # DB 저장이 실패한 직후라면 메모리가 앞서 있을 수 있다.
+    with _compress_lock:
+        folded_until = max(int(context.get("summarized_turn") or 0),
+                           _compress_cursor.get(session_id, 0))
+
+    dropped = [r for r in candidates if (r.get("turn_index") or 0) > folded_until]
+    if not dropped:
+        logger.info(f"[compress_session] 새로 밀려난 차례 없음 "
+                    f"({len(rows)}차례, 접힌 turn_index {folded_until}까지)")
+        return "", 0
 
     summary, topic = get_controller().summarize_session(previous, dropped,
                                                         provider=SUMMARY_PROVIDER)
     if not summary:
         raise ValueError("대화 요약에 실패했습니다.")
 
-    db_call("update_overall_summary", session_id=session_id, summary=summary)
+    # 요약과 커서를 한 번에 저장한다. 따로 저장하면 요약만 남고 커서가 안 올라가
+    # 다음 호출이 같은 차례를 또 접는다. 요약이 실패하면 여기까지 안 오므로 커서도 그대로다.
+    newest = max((r.get("turn_index") or 0) for r in dropped)
+    db_call("update_overall_summary", session_id=session_id, summary=summary,
+            summarized_turn=newest)
     # 주제는 빈 문자열로 올 수 있다(밀려난 차례가 없어 LLM 을 안 부른 경우).
     # 그때 덮어쓰면 쓰던 주제를 지우는 셈이라 건너뛴다.
     if topic:
         db_call("update_current_topic", session_id=session_id, topic=topic)
 
-    logger.info(f"[compress_session] {len(dropped)}차례 압축 -> {len(summary)}자, 주제={topic!r}")
+    with _compress_lock:
+        _compress_cursor[session_id] = max(folded_until, newest)
+
+    logger.info(f"[compress_session] {len(dropped)}차례 압축 -> {len(summary)}자, "
+                f"주제={topic!r}, 접힌 turn_index {newest}까지")
     return summary, len(dropped)
 
 
@@ -1108,12 +1240,20 @@ def user_query_output(*args, **kwargs):
 
     sources 는 검색 결과라 답변마다 같다. 최상위와 각 답변에 같은 값을 넣어 클라이언트가
     어느 쪽을 읽어도 되게 한다.
+
+    turn 은 {count, compacting} 이다(_turn_info). 비교 질의는 저장이 없어 null 이고, 그 차례의
+    번호는 병합·선택 응답에서 온다.
+
+    제너레이터다. 응답을 먼저 yield 하면 실행부가 그 값을 바로 클라이언트에 보내고, 그 뒤
+    같은 스레드에서 압축이 이어진다(_compact_after_reply) — 사용자는 압축을 기다리지 않는다.
+    COMPRESS_EVERY_TURNS 차례마다 한 번이고, 클라이언트는 turn.compacting 을 보고
+    SESSION_COMPACT_STATUS 로 끝났는지 묻는다.
     """
     value = args[0]
     req, answers, sources = value[:3]
     images = value[3] if len(value) > 3 else []
     sources = sources or []
-    return {
+    yield {
         "reply": answers[0]["answer"] if answers else "",
         "answers": [{"provider": a["provider"], "content": a["answer"],
                      "sources": sources} for a in answers],
@@ -1122,7 +1262,9 @@ def user_query_output(*args, **kwargs):
         # 찾은 그림을 사용자가 본다. 모양은 save_conversation 이 messages.images 에 넣는 것과
         # 같다(utils.image_summaries) — 대화를 다시 열어도 같은 코드로 그려진다.
         "images": image_summaries(images, IMAGE_DIR, "/api/images"),
+        "turn": _turn_info(req),
     }
+    _compact_after_reply(req)          # 응답이 나간 뒤
 
 
 @work_regist("save_merged")
@@ -1149,14 +1291,19 @@ def save_merged(*args, **kwargs):
         return req, merged
 
     try:
-        db_call("insert_message", session_id=session_id,
-                user_query=payload.get("query") or "",
-                ai_response=merged.get("answer") or "",
-                sources=merged.get("sources"),
-                # 병합에 쓴 모델을 남긴다. "merged" 같은 종류 표시가 아니라 실제로
-                # 그 답변을 만든 모델이다 — 컬럼이 그 값을 담게 되어 있다.
-                provider=merged.get("provider"))
-        logger.info(f"[save_merged] 세션 {session_id} 에 병합 답변 저장")
+        saved = db_call("insert_message", session_id=session_id,
+                        user_query=payload.get("query") or "",
+                        ai_response=merged.get("answer") or "",
+                        sources=merged.get("sources"),
+                        # 병합에 쓴 모델을 남긴다. "merged" 같은 종류 표시가 아니라 실제로
+                        # 그 답변을 만든 모델이다 — 컬럼이 그 값을 담게 되어 있다.
+                        provider=merged.get("provider"))
+        # 응답의 turn.count 와 압축 주기에 쓴다. session_id 도 같이 둔다 — payload 에서 온
+        # 경우 봉투에는 없을 수 있다.
+        if isinstance(saved, dict) and saved.get("out_turn_index") is not None:
+            req["turn_index"] = int(saved["out_turn_index"])
+            req["session_id"] = str(session_id)
+        logger.info(f"[save_merged] 세션 {session_id} 에 병합 답변 저장 (차례 {req.get('turn_index')})")
     except Exception as e:                                   # noqa: BLE001
         logger.warning(f"[save_merged] 저장 실패, 답변은 그대로 보냄: {type(e).__name__} - {e}")
 
@@ -1165,11 +1312,17 @@ def save_merged(*args, **kwargs):
 
 @work_regist("merge_output")
 def merge_output(*args, **kwargs):
-    """(req, 병합결과) -> 클라이언트가 읽는 {reply, sources}."""
-    _req, merged = args[0]
-    return {"reply": merged.get("answer", ""),
-            "provider": merged.get("provider"),
-            "sources": merged.get("sources") or []}
+    """(req, 병합결과) -> 클라이언트가 읽는 {reply, sources, turn}.
+
+    제너레이터다. user_query_output 과 같다 — 응답을 먼저 보내고 주기에 걸리면 압축한다.
+    비교 질의의 차례 번호는 여기서 처음 나간다(USER_QUERY 는 저장이 없어 null 이었다).
+    """
+    req, merged = args[0]
+    yield {"reply": merged.get("answer", ""),
+           "provider": merged.get("provider"),
+           "sources": merged.get("sources") or [],
+           "turn": _turn_info(req)}
+    _compact_after_reply(req)
 
 
 @work_regist("vectorize_image")
