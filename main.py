@@ -184,6 +184,12 @@ def bridge_collect_loop(executor, stop_event):
         # 그 대신 표에 적어 JOB_STATUS 가 읽게 한다.
         if params.get("task_type") in DETACHED_TASKS:
             _finish_job(job_id, params.get("task_type", ""), result)
+            # 색인 실패면 문서 행을 error 로 표시한다. file_upload_input 이 요청 dict 에
+            # document_id 를 적어두고, 실행부는 실패해도 그 dict 를 결과와 함께 돌려준다.
+            # 브릿지에는 DB 연결이 없어 실행부에 작업으로 넣는다(warmup 과 같은 통로).
+            if isinstance(result, TaskExecutionError) and params.get("document_id"):
+                executor.task_queue.put(Task(["mark_document_error"],
+                                             {"document_id": params["document_id"]}))
             continue
 
         # 게이트웨이가 타임아웃으로 이미 포기한 요청이면 그쪽 dispatcher 가 알아서
@@ -278,6 +284,8 @@ if __name__ == "__main__":
     #
     # 결과는 브릿지가 job_id 없는 것으로 알아보고 흘려보낸다.
     gwexecutor.task_queue.put(Task(["warmup_function"], None))
+    # 재시작으로 끊긴 업로드(processing 으로 남은 행)를 error 로. warmup 뒤에 돈다.
+    gwexecutor.task_queue.put(Task(["mark_stale_uploads"], None))
 
     gwcontroller = TaskController(gwexecutor.get_task_queue())
     gwcontroller.start()

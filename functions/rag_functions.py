@@ -326,6 +326,11 @@ def save_function(*args, **kwargs):
     for key in ("size", "mime_type"):
         if meta and meta.get(key) is not None:
             payload[key] = meta[key]
+    # 업로드 경로는 file_upload_input 이 만든 'processing' 행을 채운다. document_id 가
+    # 있으면 프로시저가 그 행의 RAG 컬럼만 갱신하고 status 를 ready 로 바꾼다. 없으면
+    # (RAG 테스트 task) 예전처럼 source_path 로 UPSERT 한다.
+    if meta and meta.get("document_id"):
+        payload["document_id"] = meta["document_id"]
 
     document_id = db_call(
         "index_document",

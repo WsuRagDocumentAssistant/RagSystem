@@ -254,8 +254,11 @@ def file_list_output(*args, **kwargs):
             "mimeType": row.get("mime_type"),
             # save_document_json 이 색인 끝에 child_chunk 개수를 세어 채운다.
             "chunks": row.get("chunks"),
-            # status 는 명세상 선택이고 저장할 값이 없다. 목록에 있으면 색인이 끝난
-            # 문서라 ready 말고 다른 값이 될 수 없다 — 클라이언트 기본값에 맡긴다.
+            # processing | ready | error. 색인 전에 행을 만들므로 처리 중인 문서도 목록에
+            # 나온다. 없으면(옛 DB) 클라이언트 기본값 ready 에 맡긴다.
+            "status": row.get("status") or "ready",
+            # 실패 사유는 DB 에 안 둔다(JOB_STATUS 응답과 로그에 있다). 명세 자리만 채운다.
+            "errorMessage": None,
         }
         for row in rows
     ]
@@ -385,14 +388,13 @@ def file_upload_input(*args, **kwargs):
         f.write(raw)
     logger.info(f"[file_upload_input] 저장: {path} ({len(raw):,} bytes)")
 
-    # 이 뒤로는 meta 를 UploadStep 에 실어 나른다. 체인이 값 하나만 넘기는데
-    # 마지막 단계(register_document)가 분류값을 필요로 하기 때문이다.
-    # register_document 가 **kwargs 로 받는 키 이름에 맞춘다(클라이언트는 camelCase).
     # production_year 는 프로시저가 정수로 받는다. 클라이언트는 문자열로 보내는데
     # 그대로 넘기면 db_call 이 예외를 삼키고 None 을 돌려줘 조용히 등록이 안 된다.
     year = payload.get("productionYear")
     year = int(year) if year not in (None, "") and str(year).isdigit() else None
 
+    # create_pending_document 가 **kwargs 로 받는 키 이름에 맞춘다(클라이언트는 camelCase).
+    # size 는 클라이언트가 보낸 값 대신 디코딩한 실제 바이트 수를 쓴다.
     meta = {
         "production_year": year,
         "source_path": path.replace("\\", "/"),
@@ -400,36 +402,71 @@ def file_upload_input(*args, **kwargs):
         "task": payload.get("task"),
         "department": payload.get("department"),
         "report_type": payload.get("reportType"),
-        # 색인 프로시저가 JSON 에서 찾는 값이다(save_document_json). register_document
-        # 는 이 두 키를 안 읽으므로 함께 실어 보내도 무해하다.
-        # size 는 클라이언트가 보낸 값 대신 디코딩한 실제 바이트 수를 쓴다.
         "size": len(raw),
         "mime_type": payload.get("mimeType") or None,
     }
+
+    # 색인 전에 문서 행을 'processing' 으로 먼저 만든다. 그래야 색인이 도는 동안에도
+    # FILE_LIST 에 보이고, 서버가 재시작돼도 행이 남는다. 분류값도 여기서 넣는다 —
+    # save_document_json 은 document_id 로 그 행의 RAG 컬럼만 채우고 분류값은 보존한다.
+    # 같은 source_path 가 이미 있으면 DB 가 그 행을 다시 processing 으로 되돌린다(재업로드).
+    document_id = db_call("create_pending_document", filename=name, **meta)
+    if not document_id:
+        raise ValueError("문서를 등록하지 못했습니다. 잠시 후 다시 시도해주세요.")
+    meta["document_id"] = int(document_id)
+
+    # 요청 dict 에도 남긴다. 실행부는 실패해도 이 dict 를 결과와 함께 돌려주므로,
+    # 브릿지가 어느 문서를 error 로 표시해야 하는지 여기서 알 수 있다.
+    if args and isinstance(args[0], dict):
+        args[0]["document_id"] = meta["document_id"]
+    logger.info(f"[file_upload_input] 문서 행 생성: id={document_id} (processing)")
+
     # 다음 단계는 parse_function 이다. 값 자리에 파싱할 경로를 넣는다.
     return UploadStep(meta, meta["source_path"])
 
 
 @work_regist("file_upload_register")
 def file_upload_register(*args, **kwargs):
-    """색인된 문서에 업무 분류값을 붙이고, 클라이언트가 읽는 {fileId, status, chunks} 로 만든다.
+    """색인 결과 -> 클라이언트가 읽는 {fileId, status, chunks}.
 
-    분류값 등록이 실패해도 업로드를 실패로 만들지 않는다. 색인은 이미 끝났고 문서는
-    검색된다 — 분류값이 비어 있을 뿐이라 나중에 수정 화면에서 채우면 된다.
+    분류값은 file_upload_input 이 행을 만들 때 이미 넣었고, save_document_json 이
+    document_id 로 그 행을 채우며 status 를 ready 로 바꾼다. 여기서 더 할 DB 작업은 없다.
+    (전에는 register_document 로 분류값을 뒤에 붙였는데, 색인이 저장하는 source_path 가
+    hwpx 내부 제목이라 업로드 경로와 안 맞아 행을 다시 읽어 우회했었다.)
     """
     meta, (document_id, chunks) = _step_in(args)
-
-    # register_document 는 source_path 로 색인된 문서를 찾는다. 그런데 색인이 저장하는
-    # source_path 는 우리가 넘긴 업로드 경로가 아니라 hwpx 문서 내부의 제목이다
-    # (ragmodul/util.py: file.filename or file.title). 그대로 넘기면 "임베딩된 문서를
-    # 찾을 수 없습니다" 로 거절당한다 — 그래서 방금 색인한 행에서 실제 값을 읽어 쓴다.
-    row = db_call("get_document", id=document_id) or {}
-    source_path = row.get("source_path") or meta.get("source_path")
-    meta = {**meta, "source_path": source_path}
-
-    if not db_call("register_document", **meta):
-        logger.warning(f"[file_upload_register] 분류값 등록 실패(source_path={source_path!r}) — 색인은 완료됨")
     return {"fileId": str(document_id), "status": "ready", "chunks": chunks}
+
+
+@work_regist("mark_document_error")
+def mark_document_error(*args, **kwargs):
+    """색인이 실패한 문서 행을 error 로 표시한다. 브릿지가 실패 결과를 보고 넣는 작업이다.
+
+    브릿지(부모 프로세스)에는 DB 연결이 없어서 실행부에 시킨다. 결과는 job_id 가 없어
+    브릿지가 흘려보낸다.
+    """
+    document_id = (args[0] or {}).get("document_id") if args else None
+    if not document_id:
+        return None
+    updated = db_call("set_document_status", id=int(document_id), status="error")
+    logger.info(f"[mark_document_error] id={document_id} -> error ({'ok' if updated else '실패'})")
+    return updated
+
+
+@work_regist("mark_stale_uploads")
+def mark_stale_uploads(*args, **kwargs):
+    """기동 때 processing 으로 남은 문서를 error 로 바꾼다.
+
+    기동 시점에는 도는 색인이 없으므로 processing 은 전부 재시작으로 끊긴 것이다.
+    그대로 두면 목록에 영영 '처리 중' 으로 남는다. 다시 올리면 같은 source_path 라
+    그 행이 재사용된다.
+    """
+    rows = db_call("list_documents", limit=1000) or []
+    stale = [r["id"] for r in rows if r.get("status") == "processing"]
+    for document_id in stale:
+        db_call("set_document_status", id=document_id, status="error")
+    logger.info(f"[mark_stale_uploads] 끊긴 업로드 {len(stale)}건 -> error")
+    return len(stale)
 
 
 
