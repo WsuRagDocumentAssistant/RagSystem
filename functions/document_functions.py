@@ -76,6 +76,16 @@ tasks["FILE_UPLOAD"] = ["file_upload_input",
                         "describe_images_function", "embed_images_function",
                         "file_upload_register"]
 
+# 브릿지(main.py)가 가로채 실행부를 거치지 않고 답한다. 여기 두는 이유는 라우터의
+# "등록된 task_type 인가" 검사를 통과시키기 위해서다. 아래 work 은 실제로 돌지 않는다.
+tasks["JOB_STATUS"] = ["job_status_never_runs"]
+
+
+@work_regist("job_status_never_runs")
+def job_status_never_runs(*args, **kwargs):
+    raise RuntimeError("JOB_STATUS 는 브릿지가 처리한다. 여기까지 왔으면 main.py 의 가로채기가 빠진 것이다.")
+
+
 # get_vocab 은 DB 원본(word/replacement)을 그대로 준다. 클라이언트는 term/synonyms 로
 # 읽으므로 변환 단계를 뒤에 붙인다(data_functions 의 dictionary_list_output).
 tasks["DICTIONARY_LIST"] = ["get_vocab", "dictionary_list_output"]

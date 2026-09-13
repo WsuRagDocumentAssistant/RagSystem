@@ -143,14 +143,15 @@ IMAGE_DESCRIBE_MAX = int(os.environ.get("RAG_IMAGE_DESCRIBE_MAX", "40"))
 VECTORIZE_PROVIDER = os.environ.get("RAG_VECTORIZE_PROVIDER", "gemini")
 
 
-# 질의에 붙일 그림. 검색은 넉넉히 뽑고 그중 몇 장만 모델에 실어 보낸다.
+# 질의에 붙일 그림. 검색은 넉넉히 뽑고 그중 몇 장만 응답에 싣는다.
 #
-# 두 장인 이유: 로컬에 1MB 그림 한 장을 붙이면 초안이 3초쯤 걸린다(실측). 장수만큼
-# 늘어나므로, 답변을 기다리는 시간과 맞바꾸는 값이다.
+# 그림은 모델에 보내지 않는다(색인 때 만든 설명으로 검색만 하고 사용자에게 보여준다).
+# 그래서 장수는 답변 시간과 무관하고, 화면에 몇 장까지 보여줄지의 문제다. 전에는 그림을
+# 모델에도 실어서 장당 3초씩 늘어나 2장으로 묶어 뒀었다.
 # 후보는 넉넉히 뽑고 리랭커가 줄인다. 문서 검색과 같은 방식이다 — 약한 신호(유사도)로
 # 미리 자른 뒤 강한 신호(리랭커)에게 남은 것만 주는 건 순서가 거꾸로다.
 IMAGE_SEARCH_TOP_K = int(os.environ.get("RAG_IMAGE_SEARCH_TOP_K", "20"))
-IMAGE_ATTACH_MAX = int(os.environ.get("RAG_IMAGE_ATTACH_MAX", "2"))
+IMAGE_ATTACH_MAX = int(os.environ.get("RAG_IMAGE_ATTACH_MAX", "5"))
 
 # 이 아래 점수는 버린다. 유사도 검색은 질의가 무엇이든 상위 몇 개를 돌려주므로
 # 문턱이 없으면 상관없는 그림이 딸려 나온다.

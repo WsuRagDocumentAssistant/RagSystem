@@ -80,6 +80,11 @@ tasks["CHAT_ANSWER_SAVE"] = ["answer_save_input", "save_answer",
 
 load_dotenv()   # .env를 os.environ에 올린다 (없으면 조용히 넘어감)
 
+# 대화 내역 화면(CHAT_SESSION_MESSAGES)에 돌려줄 최근 차례 수. 프로시저 기본값이 5 라
+# 그대로 부르면 화면에 다섯 차례만 보인다. LLM 에 실을 이력(KEEP_TURNS)과는 다른 값이다 —
+# 그쪽은 맥락 예산 때문에 작게, 이쪽은 사용자가 지난 대화를 읽는 용도라 넉넉히 둔다.
+CHAT_HISTORY_LIMIT = int(os.environ.get("RAG_CHAT_HISTORY_LIMIT", "100"))
+
 # 워커가 basicConfig(level=INFO) 로 루트 로거를 열기 때문에 httpx 가 요청마다
 # url 을 통째로 찍는다. url 에 인증키가 들어 있어 콘솔에 그대로 노출된다.
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -356,7 +361,7 @@ def session_id_input(*args, **kwargs):
 
 @work_regist("get_recent_db_messages")
 def get_recent_db_messages(*args, **kwargs):
-    return db_call("get_recent_messages", session_id=args[0])
+    return db_call("get_recent_messages", session_id=args[0], limit_count=CHAT_HISTORY_LIMIT)
 
 
 @work_regist("chat_session_messages_output")
