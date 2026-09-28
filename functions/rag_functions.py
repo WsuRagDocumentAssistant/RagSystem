@@ -148,13 +148,16 @@ HISTORY_TURN_OVERHEAD = 20
 # 글자 예산만 두지 않는 이유는 짧은 문답이 이어질 때다. 한 차례가 100자면 15,000자 안에
 # 100차례가 들어가서 프롬프트가 쓸데없이 길어진다 — 그만큼 오래된 대화는 요약에 이미
 # 들어가 있으므로 원문으로 또 실을 이유가 없다.
-KEEP_TURNS = int(os.environ.get("RAG_KEEP_TURNS", "10"))
+KEEP_TURNS = int(os.environ.get("RAG_KEEP_TURNS", "5"))
 # 이력·압축이 한 번에 읽는 차례 수. 세션 하나의 전체 대화 상한이기도 하다.
 COMPRESS_SCAN_TURNS = int(os.environ.get("RAG_COMPRESS_SCAN_TURNS", "100"))
 SUMMARY_PROVIDER = os.environ.get("RAG_SUMMARY_PROVIDER", "claude")
 # 몇 차례마다 압축을 돌릴지. 답변을 보낸 뒤 같은 스레드에서 이어서 돈다(user_query_output).
-# 매번 확인해도 비용은 DB 조회 두 번뿐이지만, 주기를 두면 그 사이 예산 밖으로 밀린 차례가
-# 다음 압축 때까지 답변 맥락에서 빠져 있다. 10 이면 최대 9차례가 그 상태일 수 있다.
+#
+# 주기가 창(KEEP_TURNS)보다 크면 그 차이만큼 "원문 창 밖인데 아직 요약에도 없는" 구간이
+# 생긴다. 지금 값(주기 20, 창 5)이면 최대 15차례가 그 상태이고, 그 대화는 다음 압축 전까지
+# 모델에게 안 보인다. 없애려면 주기를 창과 같게(5) 내리면 된다 — 요약 호출이 잦아질 뿐
+# 접히는 총량은 같다.
 COMPRESS_EVERY_TURNS = int(os.environ.get("RAG_COMPRESS_EVERY_TURNS", "20"))
 
 # 이미지 설명. hwpx 문서 그림은 절반쯤이 bmp 인데(실측 243장 중 117장) gpt·claude 는
@@ -693,7 +696,8 @@ def history_function(*args, **kwargs):
     rows = db_call("get_recent_messages", session_id=session_id,
                    limit_count=COMPRESS_SCAN_TURNS) or []
     history, _dropped = _split_recent(rows)
-    # 창 밖으로 밀려난 대화는 요약으로만 남는다(CHAT_SESSION_COMPRESS 가 채운다).
+    # 창 밖으로 밀려난 대화는 요약으로만 남는다. 요약은 답변을 보낸 뒤 주기마다 자동으로
+    # 갱신되고(_compact_after_reply), CHAT_SESSION_COMPRESS 로 따로 부를 수도 있다.
     context = db_call("get_session_context", session_id=session_id) or {}
     summary = context.get("overall_summary") or ""
 
@@ -716,9 +720,14 @@ def search_images_function(*args, **kwargs):
     대신 그림이 없는 질의에서도 매번 벡터 검색이 돈다. 지금은 판정을 먼저 둔다 —
     답변이 느려지는 게 보이면 순서를 뒤집으면 된다.
 
-    고른 그림은 두 곳에 쓰인다. 하나는 모델이다(초안·다듬기 양쪽에 실어 보낸다 —
-    로컬도 이미지를 받는다. 실측 png 1MB 3.2초, 두 장도 됨). 다른 하나는 화면이라,
-    사용자가 답변과 같은 그림을 본다.
+    고른 그림은 화면에만 쓴다. 모델에는 넘기지 않는다 — 색인할 때 만들어둔 설명이 이미
+    검색을 태웠고, 그림을 프롬프트에 얹으면 장당 몇 초가 답변 시간에 더해진다(로컬 실측
+    png 1MB 3.2초). 그림을 찾는 질의였고 실제로 찾았으면 answer_function 이 LLM 을 아예
+    타지 않고 그 설명으로 답한다.
+
+    사용자가 파일을 첨부한 질의에서는 그 지름길을 타지 않는다(attachment_input 이 담은
+    첨부는 색인된 적이 없어 모델이 직접 읽어야 한다). 그래서 여기서 고른 그림은 화면에만
+    남고 답변은 첨부를 근거로 나온다.
 
     실패해도 질의를 막지 않는다. 그림은 덤이라 없으면 없는 대로 답하면 된다.
     """

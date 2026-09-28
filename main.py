@@ -32,8 +32,8 @@ TIMER_INTERVAL = 60   # 초. api_all_update 를 이 주기로 반복한다
 def timer_loop(executor, stop_event):
     """전용 워커에 api_all_update 를 넣고 결과를 받아 찍는다.
 
-    수동 실행과 큐를 나눠 쓴다. 같은 큐를 쓰면 [w] 로 실행한 결과를 기다리는
-    동안 타이머 결과가 먼저 도착해 엉뚱한 값이 출력된다.
+    통신부와 큐를 나눠 쓴다. 여기서는 결과를 get 으로 직접 꺼내는데, 같은 큐를 쓰면
+    브릿지(collect)와 서로 남의 결과를 집어간다.
     결과를 받은 뒤에 다음 주기를 세므로 실행이 주기보다 길어도 겹치지 않는다.
     """
     while not stop_event.is_set():
@@ -42,7 +42,10 @@ def timer_loop(executor, stop_event):
         logger.info("타이머 api_all_update 결과: %s", _unwrap(executor.get_task_result()))
         stop_event.wait(TIMER_INTERVAL)
 
-GATEWAY_TIMEOUT = 600   # 초. 라우터 기본값 60 은 색인에 턱없이 모자란다
+# 초. 라우터 기본값 60 은 질의에 모자란다 — 로컬 초안 30~50초에 클라우드 다듬기가 붙어
+# 한 질의가 분 단위로 갈 수 있다(느린 provider 하나가 전체를 기다리게 만든다).
+# 업로드는 접수만 하고 바로 답하므로(FILE_UPLOAD -> jobId) 이 값과 무관하다.
+GATEWAY_TIMEOUT = 600
 
 # 통신부 실행부가 동시에 돌리는 작업 수(스레드 풀). 기본 4.
 #
@@ -237,8 +240,8 @@ if __name__ == "__main__":
     try:
         from rag_router.gateway import gateway
 
-        # 라우터 기본값이 60초인데 FILE_UPLOAD 는 색인(파싱+임베딩)까지 하느라 몇 분
-        # 걸린다. 그대로 두면 작업은 계속 도는데 응답만 timeout 으로 나간다.
+        # 라우터 기본값 60초로는 질의가 끊긴다(GATEWAY_TIMEOUT 설명 참고). 그대로 두면
+        # 작업은 계속 도는데 응답만 timeout 으로 나간다.
         gateway.TIMEOUT_SEC = GATEWAY_TIMEOUT
 
         # 이미지와 원본 문서를 브라우저가 열 수 있게 내보낸다. 라우터는 /api/task 하나만

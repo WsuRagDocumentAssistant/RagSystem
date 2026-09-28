@@ -286,8 +286,8 @@ def delete_document_files(*args, **kwargs):
     이미지가 그대로 남는다 — 그림이 많은 문서는 폴더 하나가 수백 MB 다.
 
     이미지 폴더 이름은 문서명의 stem 이다(parse 가 images/<문서명>/ 으로 넣는다).
-    원본도 같은 stem 으로 찾는다 — DB 의 source_path 는 hwpx 내부 이름이라 확장자가
-    없어서, 폴더에서 이름이 같은 파일을 찾는 방식을 그대로 쓴다.
+    원본도 같은 stem 으로 찾는다 — source_path 가 행마다 "documents/보고서.hwpx" 이거나
+    "보고서"(옛 행의 hwpx 내부 이름)라 형식이 일정하지 않기 때문이다(_find_document_file).
 
     실패해도 삭제를 실패로 만들지 않는다. 행은 이미 지워져서 사용자에게는 사라진
     문서다 — 파일이 남은 것은 우리가 나중에 치울 문제다.
@@ -364,11 +364,14 @@ def _safe_name(name: str) -> str:
 
 @work_regist("file_upload_input")
 def file_upload_input(*args, **kwargs):
-    """payload 의 base64 를 파일로 떨구고, register_document 가 받는 dict 을 만든다.
+    """payload 의 base64 를 파일로 떨구고, 문서 행을 'processing' 으로 만든다.
 
-    색인(파싱·임베딩)은 여기서 하지 않는다. 클라이언트 XHR 타임아웃이 60초인데
-    임베딩만 수백 초라 반드시 실패한다. 등록을 먼저 해두면 나중에 같은 source_path
-    로 색인할 때 프로시저가 그 행의 RAG 컬럼만 채우고 분류값은 보존한다.
+    색인(파싱·임베딩)은 여기서 하지 않는다 — 접수 work(file_upload_job)이 응답을 보낸
+    뒤에 이어서 돌린다. 클라이언트 XHR 타임아웃이 60초인데 임베딩만 수백 초라 한 응답에
+    매달 수 없다.
+
+    행을 먼저 만들어 두면 색인이 도는 동안에도 목록에 'processing' 으로 보이고, 색인이
+    끝날 때 프로시저가 document_id 로 그 행의 RAG 컬럼만 채우므로 분류값이 보존된다.
     """
     payload = args[0].get("payload") or {}
     name = _safe_name(payload.get("name"))
@@ -585,12 +588,13 @@ def _display_name(row: dict, disk: dict) -> str:
 def _find_document_file(row: dict):
     """DB 행에 대응하는 원본 파일을 documents/ 에서 찾는다. 없으면 None.
 
-    경로를 그대로 쓸 수 없다. 색인이 저장하는 source_path 는 우리가 넘긴 업로드
-    경로가 아니라 hwpx 내부 이름이고, 확장자도 폴더도 없다(실측: 파일이
-    "documents/보고서.hwpx" 여도 source_path 는 "보고서").
+    경로를 그대로 쓸 수 없다. source_path 에 두 형식이 섞여 있어서다.
+      - 업로드로 만든 행(file_upload_input): "documents/보고서.hwpx" — 실제 저장 경로
+      - 그 전에 색인이 만든 옛 행: "보고서" — hwpx 내부 이름이라 폴더도 확장자도 없다
+    (행을 색인 전에 미리 만들도록 바뀌면서 새 행은 앞 형식으로 쌓인다.)
 
-    그래서 이름(stem)이 같은 파일을 폴더에서 찾는다. 업로드하지 않고 색인만 된
-    문서는 애초에 원본이 없으므로 None 이 맞다.
+    그래서 이름(stem)만 떼어 폴더에서 같은 이름의 파일을 찾는다 — 두 형식 다 통과한다.
+    업로드하지 않고 색인만 된 문서는 애초에 원본이 없으므로 None 이 맞다.
     """
     from pathlib import Path
 
