@@ -30,7 +30,7 @@ from taskcontroller import work_regist, tasks
 from ragmodul import RagController, chunk, parse
 from ragmodul.util import document_to_payload, to_plain_sparse, to_plain_vector
 from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
-from utils import from_jsonb, static_url, resolve_image_path, image_summaries, IMAGE_DIR, UNPACK_DIR
+from utils import from_jsonb, static_url, resolve_image_path, image_summaries, IMAGE_DIR, UNPACK_DIR, timer
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +46,13 @@ tasks.update({
                     "vocab_function", "filter_vocab_function", "save_vocab_function",
                     "embed_function", "save_function"],
     "test_레그검색": QUERY_CHAIN,          
-    "test_레그질의": QUERY_CHAIN + ["search_api_function", "history_function", "answer_function"],
+    "test_레그질의": QUERY_CHAIN + ["search_api_function", "history_function",
+                                    "search_images_function", "draft_function", "refine_function"],
     "test_레그질의병합": QUERY_CHAIN + ["search_api_function", "history_function",
-                                        "answer_function", "merge_function"],
-    "RAG_Search": QUERY_CHAIN + ["search_api_function", "history_function", "answer_function"],
+                                        "search_images_function", "draft_function", "refine_function",
+                                        "merge_function"],
+    "RAG_Search": QUERY_CHAIN + ["search_api_function", "history_function",
+                                 "search_images_function", "draft_function", "refine_function"],
     "Merge": ["merge_function"],
 })
 
@@ -59,7 +62,7 @@ tasks.update({
 # 묶이고 사이드바 목록과 메시지 내역이 채워진다.
 tasks["USER_QUERY"]    = (["ensure_session", "attachment_input"] + QUERY_CHAIN
                           + ["search_api_function", "history_function",
-                             "search_images_function", "answer_function",
+                             "search_images_function", "draft_function", "refine_function",
                              "save_conversation", "user_query_output"])
 
 tasks["MERGE_RESULTS"] = ["merge_function", "save_merged", "merge_output"]
@@ -556,8 +559,9 @@ def embed_query_function(*args, **kwargs):
     if not query or not query.strip():
         raise ValueError("질의가 비어 있습니다. payload.query 를 보내주세요.")
 
-    vocab = load_vocab()
-    vector, weights = get_controller().embed_query(query, vocab)
+    with timer("질의 임베딩", req):
+        vocab = load_vocab()
+        vector, weights = get_controller().embed_query(query, vocab)
     logger.info(f"[embed_query_function] 사전 {len(vocab)}개 적용 / 질의 {query[:40]!r}")
     return req, query, vector, weights
 
@@ -596,17 +600,20 @@ def hybrid_search_function(*args, **kwargs):
     rag = get_controller()
 
     document_ids = _document_ids(req)
-    hits = db_call(
-        "search_documents_hybrid",
-        query_vector=to_plain_vector(vector),
-        query_weights=to_plain_sparse(weights),
-        sparse_dim=rag.sparse_dimension,
-        top_k=TOP_K_SEARCH,
-        document_ids=document_ids,      # None 이면 전체 검색
-    ) or []
+    with timer("하이브리드 검색", req):
+        hits = db_call(
+            "search_documents_hybrid",
+            query_vector=to_plain_vector(vector),
+            query_weights=to_plain_sparse(weights),
+            sparse_dim=rag.sparse_dimension,
+            top_k=TOP_K_SEARCH,
+            document_ids=document_ids,      # None 이면 전체 검색
+        ) or []
     scope = f"문서 {document_ids} 한정" if document_ids else "전체"
     logger.info(f"[hybrid_search_function] 조각 {len(hits)}개 ({scope})")
-    return req, query, hits
+    # 질의 벡터를 뒤로 넘긴다. 외부 API 검색과 그림 검색이 같은 벡터를 쓴다 — 전에는 각자
+    # 다시 임베딩해서 한 질의에 같은 문장을 세 번 돌렸고, 그 둘은 검색어 사전도 안 탔다.
+    return req, query, hits, vector
 
 
 @work_regist("rerank_function")
@@ -627,18 +634,19 @@ def rerank_function(*args, **kwargs):
     재정렬: 한 부모의 조각이 최종 자리를 독점하지 못하게 개수를 제한한다. 조각들이
     표 머리글을 공유해서 LLM 이 거의 같은 글을 여러 번 보게 된다.
     """
-    req, query, hits = args[0]
+    req, query, hits, vector = args[0]
     rag = get_controller()
 
     contexts = rag.build_contexts(hits)
     logger.info(f"[rerank_function] 맥락 {len(contexts)}개 "
           f"(승격 {sum(1 for c in contexts if c.merged)})")
 
-    ordered = rag.rerank(query, contexts, top_k=TOP_K_FINAL)
+    with timer("리랭킹", req):
+        ordered = rag.rerank(query, contexts, top_k=TOP_K_FINAL)
     for rank, context in enumerate(ordered, 1):
         logger.info(f"[rerank_function] {rank}. score={context.rerank_score:.4f} "
               f"merged={context.merged} {context.breadcrumb[:60]}")
-    return req, query, ordered
+    return req, query, ordered, vector
 
 #------------------------------------------------┌> 답변
 
@@ -687,11 +695,11 @@ def history_function(*args, **kwargs):
     session_id 가 없으면(새 대화·더미 토큰) 빈 목록이다. 읽기에 실패해도 질의를 막지
     않는다 — 이력은 해석 단서일 뿐이라 없으면 없는 대로 답하면 된다.
     """
-    req, query, contexts, refs = args[0]
+    req, query, contexts, refs, vector = args[0]
 
     session_id = req.get("session_id")
     if not session_id:
-        return req, query, contexts, refs, {"history": [], "summary": ""}
+        return req, query, contexts, refs, {"history": [], "summary": ""}, vector
 
     rows = db_call("get_recent_messages", session_id=session_id,
                    limit_count=COMPRESS_SCAN_TURNS) or []
@@ -703,7 +711,7 @@ def history_function(*args, **kwargs):
 
     logger.info(f"[history_function] 이전 대화 {len(history)}/{len(rows)}차례 "
                 f"({sum(_turn_chars(r) for r in history):,}자), 요약 {len(summary)}자")
-    return req, query, contexts, refs, {"history": history, "summary": summary}
+    return req, query, contexts, refs, {"history": history, "summary": summary}, vector
 
 
 
@@ -722,7 +730,7 @@ def search_images_function(*args, **kwargs):
 
     고른 그림은 화면에만 쓴다. 모델에는 넘기지 않는다 — 색인할 때 만들어둔 설명이 이미
     검색을 태웠고, 그림을 프롬프트에 얹으면 장당 몇 초가 답변 시간에 더해진다(로컬 실측
-    png 1MB 3.2초). 그림을 찾는 질의였고 실제로 찾았으면 answer_function 이 LLM 을 아예
+    png 1MB 3.2초). 그림을 찾는 질의였고 실제로 찾았으면 refine_function 이 LLM 을 아예
     타지 않고 그 설명으로 답한다.
 
     사용자가 파일을 첨부한 질의에서는 그 지름길을 타지 않는다(attachment_input 이 담은
@@ -731,18 +739,27 @@ def search_images_function(*args, **kwargs):
 
     실패해도 질의를 막지 않는다. 그림은 덤이라 없으면 없는 대로 답하면 된다.
     """
-    req, query, contexts, refs, session = args[0]
+    # 질의 벡터는 여기서 마지막으로 쓰이고 끝난다. 뒤 단계(draft_function)는 받지 않는다.
+    req, query, contexts, refs, session, vector = args[0]
 
     try:
-        images = _search_images(req, query)
+        with timer("이미지 판정", req):
+            wants_image = get_controller().is_image_query(query)
+        if wants_image:
+            with timer("이미지 검색", req):
+                images = _search_images(req, query, vector)
+        else:
+            logger.info("[search_images] 그림을 찾는 질의가 아니다 — 건너뜀")
+            images = []
     except Exception as e:                                   # noqa: BLE001
         logger.warning(f"[search_images_function] 건너뜀: {type(e).__name__} - {e}")
         images = []
     return req, query, contexts, refs, session, images
 
 
-def _search_images(req, query: str) -> list:
-    """그림 검색. 화면에 띄울 행 목록을 돌려준다.
+def _search_images(req, query: str, vector) -> list:
+    """그림 검색. 화면에 띄울 행 목록을 돌려준다. 그림을 찾는 질의인지는 부르는 쪽이
+    먼저 가른다(search_images_function).
 
     모델에는 그림을 보내지 않는다. 색인할 때 만들어둔 설명(ai_summary)이 이미
     검색을 태웠고, 그림 자체를 다시 실어 보내면 장당 몇 초가 답변 시간에 더해진다
@@ -756,11 +773,8 @@ def _search_images(req, query: str) -> list:
     그림이 뜨고, 그런 걸 리랭킹하는 것도 낭비다.
     """
     rag = get_controller()
-    if not rag.is_image_query(query):
-        logger.info("[search_images] 그림을 찾는 질의가 아니다 — 건너뜀")
-        return []
 
-    vector, _ = rag.embed_query(query)
+    # 벡터는 embed_query_function 이 만든 것을 받아 쓴다(검색어 사전이 적용된 벡터).
     rows = db_call("search_document_image_vector",
                    query_vector=to_plain_vector(vector),
                    top_k=IMAGE_SEARCH_TOP_K,
@@ -863,49 +877,68 @@ def _image_answer(images: list) -> list:
     return [{"provider": None, "answer": chr(10).join(lines)}]
 
 
-@work_regist("answer_function")
-def answer_function(*args, **kwargs):
-    """초안을 만들고 고른 모델들이 각자 다듬는다. [{provider, answer}, ...].
+def _image_shortcut(req: dict, images: list) -> bool:
+    """그림 지름길을 탈지. 그림을 찾았고 첨부가 없으면 LLM 없이 그림 설명으로 답한다.
+
+    그림을 찾는 질의였고 실제로 찾았으면 사용자가 원한 것은 그림이고, 그 설명은 색인할 때
+    이미 만들어 뒀다 — 같은 내용을 모델에게 다시 쓰게 하면 시간과 돈만 든다. 그리고 모델은
+    그 그림을 못 본다(넘기지 않는다). 그냥 두면 "사진 파일은 확인되지 않았습니다" 라고
+    답하면서 화면 옆에는 그림이 떠 있는 모순이 생긴다 — 실제로 그렇게 나왔다.
+
+    첨부가 있으면 타지 않는다. 첨부는 색인된 적이 없어 _image_answer 가 쓸 재료가 없고,
+    사용자가 묻는 대상은 자기가 올린 그 파일이다.
+
+    draft_function 과 refine_function 이 둘 다 부른다. 같은 입력이면 같은 답이라, 판정
+    결과를 튜플에 실어 나르는 것보다 단순하다.
+    """
+    return bool(images) and not (req.get("attachments") or req.get("attach_image"))
+
+
+def _chosen_providers(req: dict) -> list:
+    """클라이언트가 고른 모델들. 배열로 온다 — 비교 화면에서 여러 개를 고르면 여럿,
+    하나만 고르면 하나짜리 배열이다. 문자열도 받아준다.
+
+    배열로 받는 게 중요한 이유: provider 마다 요청을 따로 보내면 같은 질의로 검색·
+    리랭킹·초안 생성이 그 수만큼 반복된다(실측 28초 × N). 한 번에 받으면 그 앞단이
+    한 번만 돌고 다듬기만 병렬로 늘어난다.
+
+    클라이언트가 최소 하나를 강제하므로 빈 값은 오지 않는다. 그래도 확인은 남긴다 —
+    빈 목록을 그대로 넘기면 refine_all 이 아무것도 부르지 않고 "다듬기가 전부
+    실패했습니다: []" 라는 엉뚱한 문장이 사용자에게 간다.
+    """
+    chosen = (req.get("payload") or {}).get("provider")
+    if isinstance(chosen, (list, tuple)):
+        providers = [str(name) for name in chosen if name]
+    elif chosen:
+        providers = [str(chosen)]
+    else:
+        providers = []
+    if not providers:
+        raise ValueError("답변할 모델(provider)이 지정되지 않았습니다.")
+    return providers
+
+
+@work_regist("draft_function")
+def draft_function(*args, **kwargs):
+    """로컬 모델이 답변 초안을 쓴다. 뒤 단계(refine_function)가 그걸 다듬는다.
+
+    (req, 질의, 맥락, 외부, 세션맥락, 그림) -> 그대로 + 초안.
 
     초안은 결과에 안 넣는다 — 내부 단계이고 사용자가 고를 수 있는 모델도 아니다.
-    다듬기가 전부 실패하면 답이 없는 것으로 본다. 대신 초안을 보내면 안 보내기로 한
-    것을 보내는 셈이다.
 
-    다듬기는 서로 독립이고 동시에 나간다. 같은 초안을 각자 받아 따로 고친다 —
-    순차로 넘기면 앞 모델의 판단이 굳어져 뒷 모델이 손댈 여지가 줄어든다.
-    걸리는 시간도 합이 아니라 가장 느린 하나가 된다.
+    그림 지름길이면 초안을 만들지 않고 None 을 넘긴다(_image_shortcut). 로컬 초안이
+    질의에서 가장 오래 걸리는 단계라(실측 30~50초) 쓰지 않을 초안에 그 시간을 쓰지 않는다.
+
+    고른 모델도 여기서 먼저 확인한다. 다듬기 단계에서만 쓰는 값이지만, 거기서 처음
+    확인하면 빠진 요청이 초안 30초를 다 쓰고 나서야 거절된다.
     """
-    # search_images_function 이 붙으면 6칸, 없으면(test_ 태스크) 5칸이다.
-    value = args[0]
-    req, query, contexts, refs, session = value[:5]
-    images = value[5] if len(value) > 5 else []
-    history, summary = session["history"], session["summary"]
+    req, query, contexts, refs, session, images = args[0]
 
-    # 사용자가 이번 질의에 붙인 것(attachment_input 이 담았다). 위의 images 와 다른 것이다 —
-    # 그쪽은 검색으로 찾은 문서 그림이고, 이쪽은 색인된 적이 없어 모델이 직접 읽어야만
-    # 답에 반영된다.
-    attachments = req.get("attachments") or None
-    attach_image = req.get("attach_image")
-    has_attachment = bool(attachments or attach_image)
+    if _image_shortcut(req, images):
+        return req, query, contexts, refs, session, images, None
 
-    # 그림을 찾는 질의였고 실제로 찾았으면 LLM 을 타지 않는다. 사용자가 원한 것은
-    # 그림이고 그 설명은 색인할 때 이미 만들어 뒀다 — 같은 내용을 모델에게 다시
-    # 쓰게 하면 시간과 돈만 든다.
-    #
-    # 그리고 지금 구조에서는 모델이 그림을 못 본다(이미지를 안 넘긴다). 그래서
-    # 그냥 두면 "사진 파일은 확인되지 않았습니다" 라고 답하면서 화면 옆에는 그림이
-    # 떠 있는 모순이 생긴다 — 실제로 그렇게 나왔다.
-    # 첨부가 있으면 이 지름길을 타지 않는다. 첨부는 색인된 적이 없어 _image_answer 가 쓸
-    # 재료가 없고, 사용자가 묻는 대상은 자기가 올린 그 파일이다.
-    if images and not has_attachment:
-        return req, _image_answer(images), _to_sources(contexts), images
+    _chosen_providers(req)          # 빠졌으면 여기서 ValueError
 
-    rag = get_controller()
-
-    # 그림은 모델에 넘기지 않는다. 찾은 그림은 응답에만 실어 사용자가 보게 한다
-    # (user_query_output). 그림을 프롬프트에 얹으면 장당 몇 초가 답변 시간에 더해지는데,
-    # 그 내용은 색인할 때 만들어둔 설명으로 이미 검색을 태웠다.
-    #
     # 초안에는 외부 데이터를 주지 않는다. DRAFT_PROVIDER 가 로컬 모델이라 API 응답
     # 원문이 붙으면 게이트웨이가 413 으로 자른다(실측 32KB). 최종 답변은 다듬기
     # 단계에서 나오므로 거기서만 실어 보내면 된다.
@@ -914,45 +947,58 @@ def answer_function(*args, **kwargs):
     # 같은 대화를 보고 있어야 한다(ragmodul arefine 의 설명). 실은 만큼 맥락 예산에서
     # 빼주므로 로컬이 넘치지 않는다.
     #
-    # 첨부도 초안에는 주지 않는다. ragmodul 이 문서·그림을 클라우드 셋에만 보내고 로컬은
-    # 지원하지 않는다. 그래서 초안은 첨부를 못 본 채로 나오고, 첨부를 근거로 한 내용은
-    # 다듬기 단계에서 채워진다.
-    draft = rag.answer(query, contexts, provider=DRAFT_PROVIDER,
-                       history=history, summary=summary)
-    logger.info(f"[answer_function] 초안 {DRAFT_PROVIDER} {len(draft):,}자 (내부용)")
+    # 그림·첨부도 초안에는 주지 않는다. 검색으로 찾은 그림은 화면에만 쓰고, 사용자가
+    # 첨부한 문서·그림은 ragmodul 이 클라우드 셋에만 보낸다(로컬은 지원하지 않는다).
+    # 그래서 초안은 첨부를 못 본 채로 나오고, 첨부를 근거로 한 내용은 다듬기가 채운다.
+    with timer("초안", req):
+        draft = get_controller().answer(query, contexts, provider=DRAFT_PROVIDER,
+                                        history=session["history"], summary=session["summary"])
+    logger.info(f"[draft_function] 초안 {DRAFT_PROVIDER} {len(draft):,}자 (내부용)")
+    return req, query, contexts, refs, session, images, draft
 
-    # 클라이언트가 고른 모델. 배열로 온다 — 비교 화면에서 여러 개를 고르면 여럿,
-    # 하나만 고르면 하나짜리 배열이다. 문자열도 받아준다.
-    #
-    # 배열로 받는 게 중요한 이유: provider 마다 요청을 따로 보내면 같은 질의로 검색·
-    # 리랭킹·초안 생성이 그 수만큼 반복된다(실측 28초 × N). 한 번에 받으면 그 앞단이
-    # 한 번만 돌고 다듬기만 병렬로 늘어난다.
-    chosen = (req.get("payload") or {}).get("provider")
-    if isinstance(chosen, (list, tuple)):
-        providers = [str(name) for name in chosen if name]
-    elif chosen:
-        providers = [str(chosen)]
-    else:
-        providers = []
 
-    # 클라이언트가 최소 하나를 강제하므로 빈 값은 오지 않는다. 그래도 확인은 남긴다 —
-    # 빈 목록을 그대로 넘기면 refine_all 이 아무것도 부르지 않고
-    # "다듬기가 전부 실패했습니다: []" 라는 엉뚱한 문장이 사용자에게 간다.
-    if not providers:
-        raise ValueError("답변할 모델(provider)이 지정되지 않았습니다.")
+@work_regist("refine_function")
+def refine_function(*args, **kwargs):
+    """고른 모델들이 초안을 각자 다듬는다. (req, [{provider, answer}, ...], 출처, 그림).
+
+    다듬기는 서로 독립이고 동시에 나간다. 같은 초안을 각자 받아 따로 고친다 —
+    순차로 넘기면 앞 모델의 판단이 굳어져 뒷 모델이 손댈 여지가 줄어든다.
+    걸리는 시간도 합이 아니라 가장 느린 하나가 된다.
+
+    다듬기가 전부 실패하면 답이 없는 것으로 본다. 대신 초안을 보내면 안 보내기로 한
+    것을 보내는 셈이다.
+
+    그림 지름길이면(draft_function 이 초안을 안 만들었다) LLM 없이 그림 설명으로 답한다.
+
+    출력 모양은 뒤 단계(save_conversation, user_query_output, merge_function)가 읽는
+    그대로다.
+    """
+    req, query, contexts, refs, session, images, draft = args[0]
+
+    if _image_shortcut(req, images):
+        return req, _image_answer(images), _to_sources(contexts), images
+
+    providers = _chosen_providers(req)
+    # 사용자가 이번 질의에 붙인 것(attachment_input 이 담았다). images 와 다른 것이다 —
+    # 그쪽은 검색으로 찾은 문서 그림이고, 이쪽은 색인된 적이 없어 모델이 직접 읽어야만
+    # 답에 반영된다.
+    attachments = req.get("attachments") or None
+    attach_image = req.get("attach_image")
 
     # dict 로 넘기면 ragmodul 이 title·source 만 쓴다(_format_external). 문자열로 넘기면
     # 그 줄을 그대로 실어주므로, 응답 원문까지 붙여 보낸다.
     external = [_format_api_ref(ref) for ref in refs]
     # 첨부는 고른 모델 전부에게 같은 것이 간다. images 자리에는 검색으로 찾은 문서 그림이
     # 아니라 사용자가 올린 그림만 싣는다 — 찾은 그림은 응답에만 실어 사용자가 본다.
-    answers = rag.refine_all(query, contexts, draft, providers,
-                             external=external, history=history, summary=summary,
-                             images=[attach_image] if attach_image else None,
-                             attachments=attachments)
+    with timer("다듬기", req):
+        answers = get_controller().refine_all(
+            query, contexts, draft, providers,
+            external=external, history=session["history"], summary=session["summary"],
+            images=[attach_image] if attach_image else None,
+            attachments=attachments)
     for name in providers:
         mark = f"{len(answers[name]):,}자" if name in answers else "실패"
-        logger.info(f"[answer_function] 다듬기 {name} {mark}")
+        logger.info(f"[refine_function] 다듬기 {name} {mark}")
 
     if not answers:
         raise RuntimeError(f"다듬기가 전부 실패했습니다: {providers}")
@@ -961,7 +1007,7 @@ def answer_function(*args, **kwargs):
     # 출처를 필요로 한다. 요청 봉투(req)에 얹지 않고 함께 넘긴다 — 봉투는 통신부가
     # 만든 것이라 우리 중간 결과를 섞지 않는다.
     sources = _to_sources(contexts)
-    logger.info(f"[answer_function] 출처 {len(sources)}건")
+    logger.info(f"[refine_function] 출처 {len(sources)}건")
 
     return (req,
             [{"provider": name, "answer": text} for name, text in answers.items()],
@@ -986,7 +1032,7 @@ def merge_function(*args, **kwargs):
     value = args[0] if args else None
     sources = None
     if isinstance(value, tuple):                      # 질의 체인 뒤에 붙었을 때
-        req, answers, sources = value[:3]             # answer_function 이 출처까지 준다
+        req, answers, sources = value[:3]             # refine_function 이 출처까지 준다
     else:                                             # MERGE_RESULTS 로 단독 호출
         req = value if isinstance(value, dict) else {}
         # 명세는 content, 이쪽은 answer 로 읽는다. 여기서 맞춘다.
@@ -1063,7 +1109,8 @@ def _compact_after_reply(req: dict) -> None:
     if not turn or not session_id or turn % COMPRESS_EVERY_TURNS:
         return
     try:
-        _summary, folded = compress_session(session_id)
+        with timer("압축", req):
+            _summary, folded = compress_session(session_id)
         logger.info(f"[compact] {turn}번째 차례 뒤 압축: {folded}차례 접음 (세션 {session_id})")
     except Exception as e:                                   # noqa: BLE001
         logger.warning(f"[compact] 압축 실패(다음 주기에 다시 시도): {type(e).__name__} - {e}")
@@ -1279,24 +1326,24 @@ def _mime_type(path) -> str:
 #------------------------------------------------┌> 외부 데이터
 @work_regist("search_api_function")
 def search_api_function(*args, **kwargs):
-    """질의와 비슷한 외부 API 를 찾는다. (query, contexts, api_refs).
+    """질의와 비슷한 외부 API 를 찾는다. (req, 질의, 맥락, 외부, 질의벡터).
 
-    질의 벡터를 다시 만든다. 앞 단계가 이미 만들었지만 rerank 까지 오면서 버려졌고,
-    가져오려면 체인 중간 두 함수의 반환값을 바꿔야 한다. 질의 한 문장이라 수십 ms 다.
+    질의 벡터는 embed_query_function 이 만든 것을 받아 쓴다(검색어 사전이 적용된 벡터).
+    뒤의 그림 검색도 같은 벡터를 쓰므로 그대로 넘긴다.
 
     실패해도 답변을 막지 않는다. 이건 부가 정보라 없으면 없는 대로 답하면 된다 —
     외부 데이터 테이블이 비었다는 이유로 질의 전체가 죽으면 안 된다.
     """
-    req, query, contexts = args[0]
+    req, query, contexts, vector = args[0]
 
     refs = []
     try:
-        vector, _ = get_controller().embed_query(query)
-        refs = db_call(
-            "search_api_data_vector",
-            query_vector=to_plain_vector(vector),
-            top_k=TOP_K_API,
-        ) or []
+        with timer("외부 API 검색", req):
+            refs = db_call(
+                "search_api_data_vector",
+                query_vector=to_plain_vector(vector),
+                top_k=TOP_K_API,
+            ) or []
     except Exception as e:
         logger.warning(f"[search_api_function] 건너뜀: {type(e).__name__} - {e}")
 
@@ -1305,7 +1352,7 @@ def search_api_function(*args, **kwargs):
               f"({ref['source']}) sim={ref['similarity']:.4f}")
     if not refs:
         logger.info("[search_api_function] 관련 외부 데이터 없음")
-    return req, query, contexts, refs
+    return req, query, contexts, refs, vector
 
 @work_regist("embed_api_function")
 def embed_api_function(*args, **kwargs):

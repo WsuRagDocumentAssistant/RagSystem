@@ -17,7 +17,7 @@ from session_data import build_session, Session
 from api_data import collect, ApiEntity
 import db_manager
 from functions.exception_functions import safe_call
-from utils import from_jsonb, image_summaries, IMAGE_DIR
+from utils import from_jsonb, image_summaries, IMAGE_DIR, timer
 
 logger = logging.getLogger(__name__)
 
@@ -646,7 +646,8 @@ def ensure_session(*args, **kwargs):
     # create_new_session 은 "새채팅" 전용이라 시간과 무관하게 항상 새로 만든다.
     # get_or_create_session 을 쓰면 30분 안에 연 대화가 기존 세션으로 합쳐진다
     # (방을 둘 만들어도 새로고침하면 하나가 됐다).
-    created = db_call("create_new_session", user_id=user_id)
+    with timer("세션 생성", req):
+        created = db_call("create_new_session", user_id=user_id)
     session_id = created.get("session_id") if isinstance(created, dict) else created
     if not session_id:
         logger.warning("[ensure_session] 세션 생성 실패 — 세션 없이 진행")
@@ -766,7 +767,7 @@ def save_conversation(*args, **kwargs):
 
     (req, answers) 를 그대로 흘려보낸다. 다음 단계가 user_query_output 이다.
     """
-    # answer_function 이 그림까지 실어 보낸다(4칸). test_ 태스크에서는 3칸이다.
+    # refine_function 이 그림까지 실어 보낸다(4칸). test_ 태스크에서는 3칸이다.
     value = args[0]
     req, answers, sources = value[:3]
     images = value[3] if len(value) > 3 else []
@@ -798,14 +799,15 @@ def save_conversation(*args, **kwargs):
     reply = answers[0]["answer"] if answers else ""
 
     try:
-        # 출처는 answer_function 이 함께 넘겨준 것이다. jsonb 컬럼이라 목록을 그대로
+        # 출처는 refine_function 이 함께 넘겨준 것이다. jsonb 컬럼이라 목록을 그대로
         # 넘기면 db_manager 가 json 문자열로 만들어 보낸다.
         # 그림도 함께 남긴다. 응답(user_query_output)과 같은 모양이라 대화를 다시 열 때
         # 클라이언트가 같은 코드로 그린다. 없으면 NULL — 옛 대화와 같다.
-        saved = db_call("insert_message", session_id=session_id, user_query=query,
-                        ai_response=reply, sources=sources,
-                        provider=answers[0]["provider"] if answers else None,
-                        images=image_summaries(images, IMAGE_DIR, "/api/images") or None)
+        with timer("대화 저장", req):
+            saved = db_call("insert_message", session_id=session_id, user_query=query,
+                            ai_response=reply, sources=sources,
+                            provider=answers[0]["provider"] if answers else None,
+                            images=image_summaries(images, IMAGE_DIR, "/api/images") or None)
         # DB 가 채번한 차례 번호. 뒤 단계(user_query_output)가 압축 주기를 재는 데 쓴다.
         if isinstance(saved, dict) and saved.get("out_turn_index") is not None:
             req["turn_index"] = int(saved["out_turn_index"])
