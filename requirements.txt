@@ -16,6 +16,7 @@ hwpx @ git+https://github.com/WsuRagDocumentAssistant/HwpxParser_sub.git
 db-manager @ git+https://github.com/WsuRagDocumentAssistant/DBManager.git
 session-data @ git+https://github.com/WsuRagDocumentAssistant/SessionData.git
 api-data @ git+https://github.com/WsuRagDocumentAssistant/ApiData.git
+request-board @ git+https://github.com/WsuRagDocumentAssistant/RequestBoard.git
 # db / claude / gemini 는 선택 의존성이라 그냥 설치하면 안 깔린다.
 #   db     -> asyncpg      (DatabaseService. 없으면 DB 연결이 통째로 안 된다)
 #   claude -> anthropic    (ClaudeService)
