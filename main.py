@@ -17,6 +17,7 @@ import functions.data_functions
 import functions.user_functions as user_functions
 import functions.document_functions as document_functions
 import functions.rag_functions
+import functions.request_functions
 from taskexecutor import TaskExecutionError
 
 #────────────────────────────────────────────────
