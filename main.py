@@ -7,9 +7,9 @@ from multiprocessing import Queue
 import multiprocessing
 import logging
 import os
-import queue
 import threading
 
+from rag_router.task.task_result import TaskResult
 from taskcontroller import work_lst, TaskController,tasks, Task
 from taskexecutor import TaskExecutor
 #import functions
@@ -34,7 +34,7 @@ def timer_loop(executor, stop_event):
     """전용 워커에 api_all_update 를 넣고 결과를 받아 찍는다.
 
     통신부와 큐를 나눠 쓴다. 여기서는 결과를 get 으로 직접 꺼내는데, 같은 큐를 쓰면
-    브릿지(collect)와 서로 남의 결과를 집어간다.
+    라우터(dispatcher)와 서로 남의 결과를 집어간다.
     결과를 받은 뒤에 다음 주기를 세므로 실행이 주기보다 길어도 겹치지 않는다.
     """
     while not stop_event.is_set():
@@ -76,95 +76,63 @@ def _unwrap(outcome):
     _task, result = outcome
     return result
 
-def bridge_submit_loop(controller, stop_event):
-    """라우터 큐에서 꺼내 컨트롤러로 넘긴다. 결과를 기다리지 않는다.
+def to_controller(task):
+    """라우터 Task -> 컨트롤러 입력 큐에 넣을 (task_type, 요청).
 
-    기다리지 않으므로 요청이 실행부에 여러 개 쌓일 수 있다. 실행부가 결과에 task 를
-    같이 실어 보내고 그 params 에 job_id 가 있어서, collect 쪽은 그것만 보면 된다 —
-    여기서 따로 기억해 둘 것이 없다.
+    라우터가 이 값을 컨트롤러 큐에 바로 넣는다(설계: Router → TC → TE → 결과 큐 → Router).
+    예전처럼 라우터 큐와 컨트롤러 큐 사이를 옮겨 담는 브릿지 스레드는 없다.
+
+    없는 이름은 여기서 막는다. 컨트롤러는 예외를 잡아 print 만 하므로 그대로
+    넘기면 결과가 영영 안 오고 요청이 타임아웃까지 매달린다. ValueError 를 올리면
+    라우터가 큐에 넣지 않고 그 메시지로 바로 error 응답한다.
     """
-    from rag_router.shared_queues import SharedQueues
-    from rag_router.task.task_result import TaskResult
+    if task.task_type not in tasks:
+        logger.warning("등록되지 않은 task_type: %s", task.task_type)
+        raise ValueError(f"아직 지원하지 않는 task_type 입니다: {task.task_type}")
 
-    task_queue, result_queue = SharedQueues.get_queues()
-    logger.info("브릿지 submit 시작")
+    logger.info("수신 job_id=%s task_type=%s", task.job_id, task.task_type)
 
-    while not stop_event.is_set():
-        try:
-            task = task_queue.get(timeout=1.0)
-        except queue.Empty:
-            continue
-
-        # 없는 이름은 여기서 막는다. 컨트롤러는 예외를 잡아 print 만 하므로 그대로
-        # 넘기면 결과가 영영 안 오고 요청이 타임아웃까지 매달린다.
-        if task.task_type not in tasks:
-            logger.warning("등록되지 않은 task_type: %s", task.task_type)
-            result_queue.put(TaskResult(
-                task.job_id, False,
-                error=f"아직 지원하지 않는 task_type 입니다: {task.task_type}"))
-            continue
-
-        logger.info("수신 job_id=%s task_type=%s", task.job_id, task.task_type)
-
-        # payload 만 보내면 session_id 와 token 을 되찾을 방법이 없다. 요청을 통째로
-        # 넘기고, 체인이 그걸 흘려보내며 필요한 단계에서 꺼내 쓴다.
-        # job_id 는 결과가 돌아올 때 짝을 맞추는 열쇠다. task_type 은 실패 메시지에
-        # 쓴다 — 결과와 함께 돌아오므로 이 둘만 있으면 요청을 기억해 둘 필요가 없다.
-        controller.task_queue.put((task.task_type, {
-            "job_id": task.job_id,
-            "task_type": task.task_type,
-            "payload": task.payload or {},
-            "session_id": task.session_id,
-            "token": task.token,
-        }))
+    # payload 만 보내면 session_id 와 token 을 되찾을 방법이 없다. 요청을 통째로
+    # 넘기고, 체인이 그걸 흘려보내며 필요한 단계에서 꺼내 쓴다.
+    # job_id 는 결과가 돌아올 때 짝을 맞추는 열쇠다. task_type 은 실패 메시지에
+    # 쓴다 — 결과와 함께 돌아오므로 이 둘만 있으면 요청을 기억해 둘 필요가 없다.
+    return task.task_type, {
+        "job_id": task.job_id,
+        "task_type": task.task_type,
+        "payload": task.payload or {},
+        "session_id": task.session_id,
+        "token": task.token,
+    }
 
 
-def bridge_collect_loop(executor, stop_event):
-    """실행부 결과를 라우터 큐에 돌려준다. 짝은 결과에 실린 job_id 가 맞춘다.
+def from_executor(outcome):
+    """실행부 결과 큐의 (task, result) -> 라우터 TaskResult. 짝은 결과에 실린 job_id 가 맞춘다.
 
     결과가 작업 순서대로 온다고 가정하지 않는다. 실행부가 스레드 풀이면 가벼운
     작업이 먼저 올라온 무거운 작업보다 먼저 끝난다.
 
     "접수만 하고 먼저 답하는" 작업(FILE_UPLOAD)도 여기서는 특별하지 않다. 그 work 이
     제너레이터라 실행부가 첫 yield 값을 결과로 보내고, 나머지는 실행부 안에서 이어진다.
-    브릿지는 그 첫 값을 보통 결과처럼 돌려줄 뿐이다.
     """
-    from rag_router.shared_queues import SharedQueues
-    from rag_router.task.task_result import TaskResult
+    done_task, result = outcome
+    params = getattr(done_task, "params", None) or {}
+    job_id = params.get("job_id")
 
-    _, result_queue = SharedQueues.get_queues()
-    logger.info("브릿지 collect 시작")
+    # job_id 가 없으면 우리가 직접 넣은 작업이다(기동 시 warmup). 돌려보낼 곳이
+    # 없으니 None 으로 버린다. 실패를 조용히 넘기지는 않는다 — 모델 로딩이
+    # 실패하면 첫 질의가 올 때까지 모른 채로 있게 된다.
+    if job_id is None:
+        if isinstance(result, TaskExecutionError):
+            logger.error("내부 작업 실패: %s", result.tb)
+        else:
+            logger.info("워커 준비 완료: %r", result)
+        return None
 
-    while not stop_event.is_set():
-        try:
-            outcome = executor.get_task_result(timeout=1.0)
-        except queue.Empty:
-            continue
-
-        # 실행부가 성공이든 실패든 (task, result) 로 보낸다. job_id 는 그 task 에
-        # 실려 있으므로 결과가 어느 순서로 오든 짝이 맞는다.
-        done_task, result = outcome
-        params = getattr(done_task, "params", None) or {}
-        job_id = params.get("job_id")
-
-        # job_id 가 없으면 우리가 직접 넣은 작업이다(기동 시 warmup). 돌려보낼 곳이
-        # 없으니 결과만 확인하고 버린다. 실패를 조용히 넘기지는 않는다 — 모델 로딩이
-        # 실패하면 첫 질의가 올 때까지 모른 채로 있게 된다.
-        if job_id is None:
-            if isinstance(result, TaskExecutionError):
-                logger.error("내부 작업 실패: %s", result.tb)
-            else:
-                logger.info("워커 준비 완료: %r", result)
-            continue
-
-        # 게이트웨이가 타임아웃으로 이미 포기한 요청이면 그쪽 dispatcher 가 알아서
-        # 버린다. 여기서 살아 있는 요청인지 따로 확인할 필요가 없다.
-        result_queue.put(_to_task_result(job_id, params.get("task_type", ""),
-                                         result, TaskResult))
+    # 게이트웨이가 타임아웃으로 이미 포기한 요청이면 dispatcher 가 알아서 버린다.
+    return _to_task_result(job_id, params.get("task_type", ""), result)
 
 
-
-def _to_task_result(job_id, task_type, result, TaskResult):
+def _to_task_result(job_id, task_type, result):
     if isinstance(result, TaskExecutionError):
         # traceback 은 로그로만. HTTP 응답에 실으면 내부 구조가 샌다.
         logger.error("job_id=%s 작업 실패: %s", job_id, result.tb)
@@ -218,19 +186,13 @@ if __name__ == "__main__":
     # 스레드 풀이라 warmup 이 도는 동안 다른 요청이 먼저 돌 수 있다. 그 요청이 모델을
     # 쓰면 get_controller 의 잠금에서 warmup 이 끝나기를 기다린다.
     #
-    # 결과는 브릿지가 job_id 없는 것으로 알아보고 흘려보낸다.
+    # 결과는 from_executor 가 job_id 없는 것으로 알아보고 흘려보낸다.
     gwexecutor.task_queue.put(Task(["warmup_function"], None))
     # 재시작으로 끊긴 업로드(processing 으로 남은 행)를 error 로. warmup 뒤에 돈다.
     gwexecutor.task_queue.put(Task(["mark_stale_uploads"], None))
 
     gwcontroller = TaskController(gwexecutor.get_task_queue())
     gwcontroller.start()
-
-    stop_bridge = threading.Event()
-    threading.Thread(target=bridge_submit_loop,
-                     args=(gwcontroller, stop_bridge), daemon=True).start()
-    threading.Thread(target=bridge_collect_loop,
-                     args=(gwexecutor, stop_bridge), daemon=True).start()
 
     # ── 타이머 전용 ───────────────────────────────────
     timerexecutor = TaskExecutor()   # 타이머는 작업이 하나뿐이라 순차(기본 1)
@@ -245,7 +207,11 @@ if __name__ == "__main__":
         # 작업은 계속 도는데 응답만 timeout 으로 나간다.
         gateway.TIMEOUT_SEC = GATEWAY_TIMEOUT
 
-        # 이미지와 원본 문서를 브라우저가 열 수 있게 내보낸다. 라우터는 /api/task 하나만
+        # 설계대로 라우터 → 컨트롤러 입력 큐, 실행부 결과 큐 → 라우터로 바로 잇는다.
+        gateway.connect(gwcontroller.task_queue, gwexecutor.get_result_queue(),
+                        encode=to_controller, decode=from_executor)
+
+        # 이미지와 원본 문서를 브라우저가 열 수 있게 내보낸다. 라우터는 /api/task·/api/ws 만
         # 갖고 있어서 파일을 줄 통로가 없다 — 라우터 패키지를 고치는 대신 여기서
         # 그쪽 FastAPI 앱에 정적 경로만 얹는다.
         #
@@ -263,7 +229,6 @@ if __name__ == "__main__":
 
         gateway.run()          # uvicorn. 블로킹이다
     finally:
-        stop_bridge.set()
         stop_timer.set()
 
         timerexecutor.stop()
@@ -271,7 +236,7 @@ if __name__ == "__main__":
         timerexecutor.join()
 
         gwexecutor.stop()
-        # collect 스레드가 멈춘 뒤라 남은 결과를 아무도 안 꺼낸다. 비우지 않으면
+        # 서버가 내려가 남은 결과를 받을 곳이 없다. 비우지 않으면
         # 자식이 큐 버퍼를 flush 하지 못해 join 에서 멈춘다.
         gwexecutor.collect()
         gwexecutor.join()

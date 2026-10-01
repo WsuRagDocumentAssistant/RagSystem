@@ -21,8 +21,9 @@ request-board @ git+https://github.com/WsuRagDocumentAssistant/RequestBoard.git
 #   db     -> asyncpg      (DatabaseService. 없으면 DB 연결이 통째로 안 된다)
 #   claude -> anthropic    (ClaudeService)
 #   gemini -> google-genai (GeminiService)
+#   oracle -> oracledb     (학교 DB 뷰. 없으면 관리자 화면의 소속·사용자 검색만 빈다)
 # openai 는 기본 의존성이라 따로 안 적어도 된다.
-ai-rag-comm[db,claude,gemini] @ git+https://github.com/WsuRagDocumentAssistant/ServerCommunication.git
+ai-rag-comm[db,claude,gemini,oracle] @ git+https://github.com/WsuRagDocumentAssistant/ServerCommunication.git
 
 # anthropic SDK 는 httpx2 를 필수로 쓰고(httpx2<3,>=2.0.0), httpx2 2.12 의 brotli
 # 디코더는 brotli.Decompressor.process(data, output_buffer_limit=...) 를 부른다.

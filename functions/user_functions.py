@@ -30,7 +30,12 @@ tasks["REGISTER"] = ["register_input", "create_account", "register_output"]
 
 tasks["LOGOUT"]   = ["logout_output"]
 
-tasks["USER_LIST"]     = ["list_users", "user_list_output"]
+# 소속·구분은 학교 DB 뷰에서 채운다(계정의 login_id = 학번/교번). 학교 DB 가 꺼져 있으면 빈칸으로 둔다.
+tasks["USER_LIST"]     = ["list_users", "attach_school_info", "user_list_output"]
+
+# 관리자 화면의 "사용자 검색". 학교 구성원을 찾고, 이미 계정이 있으면 그 역할을 같이 준다.
+tasks["SCHOOL_USER_SEARCH"] = ["school_search_input", "search_school_users",
+                               "school_search_output"]
 
 # 클라이언트는 바꿀 대상을 email 로 보낸다(payload {email, role}). DB 는 uuid 를
 # 받으므로 목록에서 email 로 찾아 바꿔준다.
@@ -163,24 +168,118 @@ def list_users(*args, **kwargs):
     return db_call("list_users") or []
 
 
+def _school_index(people) -> dict:
+    """학교 사용자 행을 학번/교번과 이메일(소문자) 둘 다로 찾을 수 있게 한다.
+
+    계정의 login_id 는 학번/교번이 원칙이지만, 예전 계정은 이메일로 만들어져 있다.
+    """
+    index = {}
+    for person in people or []:
+        for key in (person.get("user_id"), (person.get("email") or "").lower()):
+            if key:
+                index.setdefault(key, person)
+    return index
+
+
+def _school_of(index: dict, login_id) -> dict:
+    login_id = login_id or ""
+    return index.get(login_id) or index.get(login_id.lower()) or {}
+
+
+@work_regist("attach_school_info")
+def attach_school_info(*args, **kwargs):
+    """사용자 행 -> (사용자 행, 학교 DB 인덱스).
+
+    학교 DB 가 꺼져 있거나 조회에 실패하면 db_call 이 None 을 돌려준다. 그때는 소속을
+    빈칸으로 두고 목록은 그대로 보여준다 — 소속 때문에 권한 관리 화면이 막히면 안 된다.
+    """
+    rows = args[0] or []
+    login_ids = [row["login_id"] for row in rows if row.get("login_id")]
+    people = db_call("get_school_users", user_ids=login_ids) if login_ids else []
+    return rows, _school_index(people)
+
+
 @work_regist("user_list_output")
 def user_list_output(*args, **kwargs):
-    """사용자 행 -> 클라이언트가 읽는 {users:[{id, email, name, role}]}.
+    """(사용자 행, 학교 인덱스) -> 클라이언트가 읽는 {users:[{id, email, name, department, status, role}]}.
 
-    DB 는 login_id 로 부르고 클라이언트는 email 로 읽는다.
+    DB 는 login_id 로 부르고 클라이언트는 email 로 읽는다(화면 표기는 "교번").
     id 는 uuid 문자열이다 — 클라이언트 타입이 number 로 선언돼 있지만 화면에서
     행 구분에만 쓰므로 문자열이어도 동작한다.
     """
-    rows = args[0] or []
-    return {"users": [
-        {
+    rows, index = args[0]
+    users = []
+    for row in rows:
+        school = _school_of(index, row.get("login_id"))
+        users.append({
             "id": str(row.get("user_id")),
             "email": row.get("login_id"),
-            "name": row.get("name"),
+            "name": row.get("name") or school.get("name"),
+            "department": school.get("department"),
+            "status": school.get("status"),
             "role": row.get("role"),
-        }
-        for row in rows
-    ]}
+        })
+    return {"users": users}
+
+
+def _require_admin(req: dict) -> list:
+    """토큰의 주인이 관리자인지 확인하고, 확인에 쓴 전체 계정 목록을 돌려준다.
+
+    학교 DB 에는 학생 개인정보가 있어서 관리자만 검색할 수 있다. 토큰이 곧 user_id 인
+    임시 구조라 계정 목록에서 그 user_id 의 role 을 본다.
+    """
+    accounts = db_call("list_users") or []
+    me = next((a for a in accounts if str(a.get("user_id")) == req.get("token")), None)
+    if not me or me.get("role") != "admin":
+        raise ValueError("관리자만 사용할 수 있습니다.")
+    return accounts
+
+
+@work_regist("school_search_input")
+def school_search_input(*args, **kwargs):
+    """요청 {payload:{keyword}, token} -> (keyword, 전체 계정 목록).
+
+    한 글자 검색은 뷰를 통째로 훑는 것과 같아서 두 글자부터 받는다.
+    """
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    keyword = ((req.get("payload") or {}).get("keyword") or "").strip()
+    if len(keyword) < 2:
+        raise ValueError("검색어를 두 글자 이상 입력하세요.")
+    return keyword, _require_admin(req)
+
+
+@work_regist("search_school_users")
+def search_school_users(*args, **kwargs):
+    """(keyword, 계정 목록) -> (학교 사용자 행, 계정 목록). 조회 실패면 이유를 알린다."""
+    keyword, accounts = args[0]
+    people = db_call("search_school_users", keyword=keyword)
+    if people is None:
+        raise ValueError("학교 DB에서 사용자를 조회하지 못했습니다.")
+    return people, accounts
+
+
+@work_regist("school_search_output")
+def school_search_output(*args, **kwargs):
+    """-> {users:[{id, name, department, college, status, account}]}.
+
+    account 는 이미 가입한 사람만 {email, role} 이고, 아니면 null 이다. 화면은 account 가
+    있으면 그 email 로 USER_SET_ROLE 을 불러 역할을 바꾼다.
+    """
+    people, accounts = args[0]
+    by_login = {a["login_id"].lower(): a for a in accounts if a.get("login_id")}
+    users = []
+    for person in people:
+        keys = (person.get("user_id"), person.get("email"))
+        account = next((by_login[k.lower()] for k in keys if k and k.lower() in by_login), None)
+        users.append({
+            "id": person["user_id"],
+            "name": person.get("name"),
+            "department": person.get("department"),
+            "college": person.get("college"),
+            "status": person.get("status"),
+            "account": {"email": account["login_id"], "role": account["role"]} if account else None,
+        })
+    return {"users": users}
 
 
 @work_regist("user_set_role_input")
