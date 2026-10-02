@@ -23,12 +23,15 @@ DB 는 RagController 를 거치지 않는다(use_db=False). 저장 프로시저�
 
 import logging
 import os
+import re
 import threading
 import typing
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from taskcontroller import work_regist, tasks
 from ragmodul import RagController, chunk, parse
-from ragmodul.util import document_to_payload, to_plain_sparse, to_plain_vector
+from ragmodul.util import (context_mark, document_to_payload, external_mark,
+                           to_plain_sparse, to_plain_vector)
 from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
 from utils import from_jsonb, static_url, resolve_image_path, image_summaries, IMAGE_DIR, UNPACK_DIR, timer
 
@@ -820,20 +823,47 @@ def _search_images(req, query: str, vector) -> list:
     return picked
 
 
-def _dedup_sources(rows) -> list:
-    """(id, 이름) 쌍들 -> 클라이언트가 읽는 [{id, name}].
+# 각주에 실을 원문 길이. 툴팁(text)은 근거 문장 한두 개, 뷰어(content)는 단락 정도면 된다.
+# 대화 기록(messages.sources)에 그대로 저장되므로 맥락 전체(수천 자)를 싣지 않는다.
+SOURCE_TEXT_CHARS = 300
+SOURCE_CONTENT_CHARS = 3000
 
-    id 로 중복을 걷어내고, id 가 없으면 이름으로 본다 — 클라이언트가 목데이터를
-    섞어 보내도 같은 문서가 두 번 뜨지 않게 한다.
-    """
-    seen, sources = set(), []
-    for source_id, name in rows:
-        key = str(source_id or name or "")
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        sources.append({"id": str(source_id or ""), "name": name or ""})
-    return sources
+# 외부 링크에서 뺄 쿼리 파라미터. 인증값이 url 에 박혀 등록된 API 도 있다.
+_SECRET_PARAM = re.compile(r"key|token|secret|auth|passw", re.IGNORECASE)
+
+
+def _excerpt(text, limit: int) -> str:
+    """공백을 한 칸으로 줄이고 limit 자에서 자른다."""
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _public_url(url) -> str | None:
+    """화면에 띄울 외부 링크. 인증값으로 보이는 쿼리 파라미터는 빼고 돌려준다."""
+    if not url:
+        return None
+    parts = urlsplit(url)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if not _SECRET_PARAM.search(k)]
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def _source_key(source: dict) -> str:
+    """중복 판정 열쇠. 각주 표시(mark)가 있으면 종류+표시, 없으면(옛 기록) id·이름."""
+    if source.get("mark"):
+        return f"{source.get('kind')}:{source['mark']}"
+    return str(source.get("id") or source.get("name") or "")
+
+
+def _unique_sources(sources) -> list:
+    """출처 목록에서 같은 것을 걷어낸다. 순서는 처음 나온 대로다."""
+    seen, unique = set(), []
+    for source in sources:
+        key = _source_key(source)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(source)
+    return unique
 
 
 def _format_api_ref(ref: dict) -> str:
@@ -850,13 +880,49 @@ def _format_api_ref(ref: dict) -> str:
 {data}"""
 
 
-def _to_sources(contexts) -> list:
-    """맥락들 -> [{id, name}]. 문서 하나당 한 줄만 남긴다.
+def _to_sources(contexts, refs=()) -> list:
+    """맥락·외부 데이터 -> 화면 각주 목록.
 
+    [{mark, kind, id, name, heading, text, content?, url?}]
+      mark    : 답변 문장 끝의 표시. 내부 문서 a, b, ... / 외부 데이터 1, 2, ...
+                프롬프트가 붙인 번호와 같은 함수(ragmodul context_mark / external_mark)로
+                만들고, 순번도 프롬프트에 넣은 목록 그대로 센다 — 어긋나면 각주가 엉뚱한
+                문서를 가리킨다.
+      kind    : internal(등록 문서) / external(외부 API)
+      id      : 내부는 문서 id(뷰어가 원본을 연다), 외부는 링크
+      text    : 툴팁에 띄울 근거 문장 — 리랭커가 고른 조각
+      content : 뷰어에 띄울 원문 단락 (내부만)
+      url     : 외부 링크 (인증값 제거)
+
+    맥락은 문서가 같아도 단락마다 따로 둔다. 표시가 단락 단위로 붙기 때문이다.
     document_id 가 없는 맥락은 버린다 — 문서에 붙지 않은 조각이라 출처로 띄울 게 없다.
+    번호는 버리기 전 순번이라 건너뛴 자리는 비어 있다.
     """
-    return _dedup_sources((c.document_id, c.document_title)
-                          for c in contexts if c.document_id is not None)
+    internal = [
+        {
+            "mark": context_mark(i),
+            "kind": "internal",
+            "id": str(c.document_id),
+            "name": c.document_title or "",
+            "heading": c.breadcrumb or c.heading or "",
+            "text": _excerpt(c.rerank_text if c.children else c.content, SOURCE_TEXT_CHARS),
+            "content": _excerpt(c.content, SOURCE_CONTENT_CHARS),
+        }
+        for i, c in enumerate(contexts) if c.document_id is not None
+    ]
+    external = [
+        {
+            "mark": external_mark(i),
+            "kind": "external",
+            "id": _public_url(ref.get("url")) or "",
+            "name": ref.get("title") or "",
+            "heading": ref.get("source") or "",
+            "text": _excerpt(ref.get("data"), SOURCE_TEXT_CHARS),
+            "url": _public_url(ref.get("url")),
+        }
+        for i, ref in enumerate(refs)
+    ]
+    return internal + external
 
 
 def _image_answer(images: list) -> list:
@@ -1006,7 +1072,7 @@ def refine_function(*args, **kwargs):
     # contexts 는 여기서 끊기는데 뒤 단계(save_conversation, user_query_output)가
     # 출처를 필요로 한다. 요청 봉투(req)에 얹지 않고 함께 넘긴다 — 봉투는 통신부가
     # 만든 것이라 우리 중간 결과를 섞지 않는다.
-    sources = _to_sources(contexts)
+    sources = _to_sources(contexts, refs)
     logger.info(f"[refine_function] 출처 {len(sources)}건")
 
     return (req,
@@ -1015,10 +1081,10 @@ def refine_function(*args, **kwargs):
 
 
 def _merge_sources(answers) -> list:
-    """답변들이 실어 온 출처를 하나로 합친다."""
-    return _dedup_sources((source.get("id"), source.get("name"))
-                          for answer in answers
-                          for source in answer.get("sources") or [])
+    """답변들이 실어 온 출처를 하나로 합친다. 같은 질의의 답변들이라 표시(mark)가 같은
+    출처는 같은 것이다."""
+    return _unique_sources(source for answer in answers
+                           for source in answer.get("sources") or [])
 
 
 @work_regist("merge_function")
