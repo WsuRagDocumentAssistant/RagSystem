@@ -21,7 +21,7 @@ request-board @ git+https://github.com/WsuRagDocumentAssistant/RequestBoard.git
 #   db     -> asyncpg      (DatabaseService. 없으면 DB 연결이 통째로 안 된다)
 #   claude -> anthropic    (ClaudeService)
 #   gemini -> google-genai (GeminiService)
-#   oracle -> oracledb     (학교 DB 뷰. 없으면 관리자 화면의 소속·사용자 검색만 빈다)
+#   oracle -> oracledb     (학교 DB 뷰 -> 사본 복사. 없으면 복사만 안 된다)
 # openai 는 기본 의존성이라 따로 안 적어도 된다.
 ai-rag-comm[db,claude,gemini,oracle] @ git+https://github.com/WsuRagDocumentAssistant/ServerCommunication.git
 

@@ -8,6 +8,7 @@ import multiprocessing
 import logging
 import os
 import threading
+import time
 
 from rag_router.task.task_result import TaskResult
 from taskcontroller import work_lst, TaskController,tasks, Task
@@ -28,20 +29,32 @@ tasks.update({
     "rag_test" : ["parse_function", "chunk_function"]
 })
 
-TIMER_INTERVAL = 60   # 초. api_all_update 를 이 주기로 반복한다
+# 타이머가 돌리는 task 와 주기(초).
+#   api_all_update    : 외부 API 갱신. 1분
+#   school_users_sync : 학교 사용자 뷰 -> PostgreSQL 사본. 학적·소속은 자주 바뀌지 않아 기본 1시간
+TIMER_JOBS = {
+    "api_all_update": 60,
+    "school_users_sync": int(os.environ.get("RAG_SCHOOL_SYNC_MINUTES", "60")) * 60,
+}
 
 def timer_loop(executor, stop_event):
-    """전용 워커에 api_all_update 를 넣고 결과를 받아 찍는다.
+    """전용 워커에 TIMER_JOBS 의 task 를 각자 주기마다 넣고 결과를 받아 찍는다.
 
     통신부와 큐를 나눠 쓴다. 여기서는 결과를 get 으로 직접 꺼내는데, 같은 큐를 쓰면
     라우터(dispatcher)와 서로 남의 결과를 집어간다.
-    결과를 받은 뒤에 다음 주기를 세므로 실행이 주기보다 길어도 겹치지 않는다.
+    한 번에 하나씩 넣고 결과를 받은 뒤에 다음 주기를 세므로 실행이 주기보다 길어도 겹치지 않는다.
+    기동 직후에는 모두 한 번씩 돈다.
     """
+    due = dict.fromkeys(TIMER_JOBS, 0.0)
     while not stop_event.is_set():
-        executor.task_queue.put(Task(tasks["api_all_update"], None))
-        # 실행부가 (task, result) 로 돌려준다
-        logger.info("타이머 api_all_update 결과: %s", _unwrap(executor.get_task_result()))
-        stop_event.wait(TIMER_INTERVAL)
+        for name, interval in TIMER_JOBS.items():
+            if time.monotonic() < due[name]:
+                continue
+            executor.task_queue.put(Task(tasks[name], None))
+            # 실행부가 (task, result) 로 돌려준다
+            logger.info("타이머 %s 결과: %s", name, _unwrap(executor.get_task_result()))
+            due[name] = time.monotonic() + interval
+        stop_event.wait(max(0.0, min(due.values()) - time.monotonic()))
 
 # 초. 라우터 기본값 60 은 질의에 모자란다 — 로컬 초안 30~50초에 클라우드 다듬기가 붙어
 # 한 질의가 분 단위로 갈 수 있다(느린 provider 하나가 전체를 기다리게 만든다).

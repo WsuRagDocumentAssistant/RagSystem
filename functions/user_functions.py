@@ -30,7 +30,11 @@ tasks["REGISTER"] = ["register_input", "create_account", "register_output"]
 
 tasks["LOGOUT"]   = ["logout_output"]
 
-# 소속·구분은 학교 DB 뷰에서 채운다(계정의 login_id = 학번/교번). 학교 DB 가 꺼져 있으면 빈칸으로 둔다.
+# 학교 사용자 정보는 타이머가 학교 DB 뷰를 PostgreSQL 사본(school_users)으로 주기적으로 복사하고
+# (main.py TIMER_JOBS), 화면 요청은 그 사본만 읽는다. 학교 DB 가 꺼져도 마지막 사본으로 동작한다.
+tasks["school_users_sync"] = ["sync_school_users"]
+
+# 소속·구분은 사본에서 채운다(계정의 login_id = 학번/교번). 사본에 없으면 빈칸으로 둔다.
 tasks["USER_LIST"]     = ["list_users", "attach_school_info", "user_list_output"]
 
 # 관리자 화면의 "사용자 검색". 학교 구성원을 찾고, 이미 계정이 있으면 그 역할을 같이 준다.
@@ -188,9 +192,9 @@ def _school_of(index: dict, login_id) -> dict:
 
 @work_regist("attach_school_info")
 def attach_school_info(*args, **kwargs):
-    """사용자 행 -> (사용자 행, 학교 DB 인덱스).
+    """사용자 행 -> (사용자 행, 학교 사용자 인덱스). 학교 사용자는 사본(school_users)에서 읽는다.
 
-    학교 DB 가 꺼져 있거나 조회에 실패하면 db_call 이 None 을 돌려준다. 그때는 소속을
+    사본 조회에 실패하면 db_call 이 None 을 돌려준다. 그때는 소속을
     빈칸으로 두고 목록은 그대로 보여준다 — 소속 때문에 권한 관리 화면이 막히면 안 된다.
     """
     rows = args[0] or []
@@ -225,7 +229,7 @@ def user_list_output(*args, **kwargs):
 def _require_admin(req: dict) -> list:
     """토큰의 주인이 관리자인지 확인하고, 확인에 쓴 전체 계정 목록을 돌려준다.
 
-    학교 DB 에는 학생 개인정보가 있어서 관리자만 검색할 수 있다. 토큰이 곧 user_id 인
+    학교 사용자 사본에는 학생 개인정보가 있어서 관리자만 검색할 수 있다. 토큰이 곧 user_id 인
     임시 구조라 계정 목록에서 그 user_id 의 role 을 본다.
     """
     accounts = db_call("list_users") or []
@@ -239,7 +243,7 @@ def _require_admin(req: dict) -> list:
 def school_search_input(*args, **kwargs):
     """요청 {payload:{keyword}, token} -> (keyword, 전체 계정 목록).
 
-    한 글자 검색은 뷰를 통째로 훑는 것과 같아서 두 글자부터 받는다.
+    한 글자 검색은 사본을 통째로 훑는 것과 같아서 두 글자부터 받는다.
     """
     req = args[0] if args and isinstance(args[0], dict) else {}
     keyword = ((req.get("payload") or {}).get("keyword") or "").strip()
@@ -254,8 +258,18 @@ def search_school_users(*args, **kwargs):
     keyword, accounts = args[0]
     people = db_call("search_school_users", keyword=keyword)
     if people is None:
-        raise ValueError("학교 DB에서 사용자를 조회하지 못했습니다.")
+        raise ValueError("학교 사용자 정보를 조회하지 못했습니다.")
     return people, accounts
+
+
+@work_regist("sync_school_users")
+def sync_school_users(*args, **kwargs):
+    """타이머 작업. 학교 DB 뷰 전체를 PostgreSQL 사본에 맞추고 반영한 행 수를 돌려준다.
+
+    학교 DB 가 꺼져 있거나 실패하면 db_call 이 이유를 한 줄 찍고 None 을 돌려준다 — 사본은
+    그대로 남고 다음 주기에 다시 시도한다.
+    """
+    return db_call("sync_school_users")
 
 
 @work_regist("school_search_output")
