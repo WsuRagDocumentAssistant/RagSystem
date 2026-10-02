@@ -8,7 +8,7 @@ import os
 from dotenv import load_dotenv
 
 from taskcontroller import work_regist, tasks
-from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
+from functions.data_functions import db_call, db_call_or_raise   # DB 호출은 예외처리까지 묶여 있다
 
 #────────────────────────────────────────────────┌> 테스트 태스크
 
@@ -43,7 +43,8 @@ tasks["SCHOOL_USER_SEARCH"] = ["school_search_input", "search_school_users",
                                "school_search_output"]
 
 # 관리자 화면의 "지금 동기화" 버튼. 타이머를 기다리지 않고 바로 사본을 맞춘다.
-tasks["SCHOOL_USER_SYNC"] = ["admin_input", "sync_school_users", "school_sync_output"]
+# 실패하면 이유(동기화 꺼짐·접속 정보 없음·접속 거절 등)를 화면에 그대로 보여준다.
+tasks["SCHOOL_USER_SYNC"] = ["admin_input", "sync_school_users_now", "school_sync_output"]
 
 # 역할과 별개인 권한 주기/회수. payload {email, permission, enabled}
 tasks["USER_SET_PERMISSION"] = ["user_set_permission_input", "set_user_permission",
@@ -329,12 +330,18 @@ def sync_school_users(*args, **kwargs):
     return db_call("sync_school_users")
 
 
+@work_regist("sync_school_users_now")
+def sync_school_users_now(*args, **kwargs):
+    """관리자의 "지금 동기화". 타이머 작업과 같지만 실패 이유를 ValueError 로 올린다."""
+    try:
+        return db_call_or_raise("sync_school_users")
+    except ValueError as e:
+        raise ValueError(f"학교 DB에서 사용자를 가져오지 못했습니다 — {e}") from e
+
+
 @work_regist("school_sync_output")
 def school_sync_output(*args, **kwargs):
-    """반영한 행 수 -> {count, syncedAt}. 실패면(학교 DB 미연결 등) 이유를 알린다."""
-    if args[0] is None:
-        raise ValueError("학교 DB에서 사용자를 가져오지 못했습니다. 학교 DB 연결(SCHOOL_SYNC_ENABLED, "
-                         "SCHOOL_ORACLE_*)과 서버 로그를 확인해 주세요.")
+    """반영한 행 수 -> {count, syncedAt}"""
     return _status_output(_school_copy_status())
 
 

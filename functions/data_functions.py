@@ -16,7 +16,7 @@ from taskcontroller import work_regist, tasks
 from session_data import build_session, Session
 from api_data import collect, ApiEntity
 import db_manager
-from functions.exception_functions import safe_call
+from functions.exception_functions import error_message, safe_call
 from utils import from_jsonb, image_summaries, IMAGE_DIR, timer
 
 logger = logging.getLogger(__name__)
@@ -121,6 +121,22 @@ def db_call(task_name, **kwargs):
     """DB 작업 호출. 실패하면 한 줄 찍고 None 을 돌려준다."""
     with _db_lock:
         return safe_call(db().call, task_name, **kwargs)
+
+
+def db_call_or_raise(task_name, **kwargs):
+    """DB 작업 호출. 실패하면 이유를 담은 ValueError 를 올린다.
+
+    db_call 은 실패를 None 으로 바꿔서 화면에는 "실패했습니다" 밖에 못 보여준다. 관리자가
+    원인(설정 꺼짐·접속 거절 등)을 화면에서 바로 봐야 하는 작업에 쓴다. ValueError 는
+    통신부가 그대로 사용자에게 보여주는 예외다.
+    """
+    with _db_lock:
+        try:
+            return db().call(task_name, **kwargs)
+        except Exception as e:
+            reason = str(e) if isinstance(e, RuntimeError) else error_message(e)
+            logger.warning(f"[실패] {task_name} : {reason}")
+            raise ValueError(reason) from e
 
 #────────────────────────────────────────────────
 
