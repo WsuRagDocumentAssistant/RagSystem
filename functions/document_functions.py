@@ -7,6 +7,7 @@ import logging
 from taskcontroller import work_regist, tasks, works
 from functions.data_functions import db_call, _to_millis   # DB 호출은 예외처리까지 묶여 있다
 from functions.rag_functions import UploadStep, _step_in       # 업로드 체인이 meta 를 나르는 방법
+from functions.notification_functions import notify
 from utils import static_url as _static_url, local_path, resolve_image_path, IMAGE_DIR, DOCUMENT_DIR
 
 logger = logging.getLogger(__name__)
@@ -477,6 +478,7 @@ def file_upload_job(*args, **kwargs):
         raise ValueError("job_id 가 없습니다. 통신부를 거치지 않은 호출입니다.")
 
     value = works["file_upload_input"](req)          # 검사·파일 저장·processing 행. 실패면 즉시 오류
+    name = (req.get("payload") or {}).get("name") or "문서"
     with _jobs_lock:
         _jobs[job_id] = {"status": "processing"}
     yield {"jobId": job_id, "status": "processing"}  # ── 여기까지가 응답
@@ -486,6 +488,8 @@ def file_upload_job(*args, **kwargs):
             value = works[name](value)
         entry = {"status": "ready", "result": value}
         logger.info(f"[file_upload_job] {job_id} 완료: {value}")
+        # 올린 사람에게 알린다. 화면을 닫았어도 다음에 들어오면 종 아이콘에 남아 있다.
+        notify(req.get("token"), f"{name} 업로드가 완료되었습니다.", "success", "/documents")
     except Exception as e:                           # noqa: BLE001
         entry = {"status": "error", "error": _job_error_message(e)}
         logger.exception(f"[file_upload_job] {job_id} 색인 실패")
@@ -493,6 +497,7 @@ def file_upload_job(*args, **kwargs):
         document_id = req.get("document_id")
         if document_id:
             db_call("set_document_status", id=int(document_id), status="error")
+        notify(req.get("token"), f"{name} 색인에 실패했습니다: {entry['error']}", "error", "/documents")
     entry["done_at"] = time.time()
     with _jobs_lock:
         _jobs[job_id] = entry

@@ -7,6 +7,7 @@ import uuid
 from taskcontroller import work_regist, tasks
 from request_board import build_request, STATUSES
 from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
+from functions.notification_functions import notify
 
 #────────────────────────────────────────────────┌> 실제 태스크
 #
@@ -237,4 +238,8 @@ def reply_db_request(*args, **kwargs):
                   status=item["status"], answer=item["answer"])
     if not row:
         raise ValueError("답변을 저장하지 못했습니다. 이미 삭제된 요청일 수 있습니다.")
+    # 작성자에게 알린다. 관리자가 자기 글에 답한 경우는 알릴 필요가 없다.
+    if str(row["author_id"]) != item["user_id"]:
+        notify(row["author_id"], f"기능 개선 요청 \"{row['title']}\"에 답변이 등록되었습니다.",
+               "info", "/feature-requests")
     return row, item["user_id"], True

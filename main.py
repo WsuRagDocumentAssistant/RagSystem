@@ -19,6 +19,7 @@ import functions.user_functions as user_functions
 import functions.document_functions as document_functions
 import functions.rag_functions
 import functions.request_functions
+import functions.notification_functions
 from taskexecutor import TaskExecutionError
 
 #────────────────────────────────────────────────
@@ -32,9 +33,11 @@ tasks.update({
 # 타이머가 돌리는 task 와 주기(초).
 #   api_all_update    : 외부 API 갱신. 1분
 #   school_users_sync : 학교 사용자 뷰 -> PostgreSQL 사본. 학적·소속은 자주 바뀌지 않아 기본 1시간
+#   notifications_prune : 사용자마다 최신 알림만 남기고 정리. 하루
 TIMER_JOBS = {
     "api_all_update": 60,
     "school_users_sync": int(os.environ.get("RAG_SCHOOL_SYNC_MINUTES", "60")) * 60,
+    "notifications_prune": 24 * 60 * 60,
 }
 
 def timer_loop(executor, stop_event):
