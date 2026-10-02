@@ -20,6 +20,7 @@ import functions.document_functions as document_functions
 import functions.rag_functions
 import functions.request_functions
 import functions.notification_functions
+import functions.category_functions
 from taskexecutor import TaskExecutionError
 
 #────────────────────────────────────────────────
