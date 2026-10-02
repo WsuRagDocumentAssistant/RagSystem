@@ -35,11 +35,19 @@ tasks["LOGOUT"]   = ["logout_output"]
 tasks["school_users_sync"] = ["sync_school_users"]
 
 # 소속·구분은 사본에서 채운다(계정의 login_id = 학번/교번). 사본에 없으면 빈칸으로 둔다.
-tasks["USER_LIST"]     = ["list_users", "attach_school_info", "user_list_output"]
+# 역할과 별개인 권한(문서 정보 입력 등)도 같이 싣는다.
+tasks["USER_LIST"]     = ["list_users", "attach_user_info", "user_list_output"]
 
 # 관리자 화면의 "사용자 검색". 학교 구성원을 찾고, 이미 계정이 있으면 그 역할을 같이 준다.
 tasks["SCHOOL_USER_SEARCH"] = ["school_search_input", "search_school_users",
                                "school_search_output"]
+
+# 관리자 화면의 "지금 동기화" 버튼. 타이머를 기다리지 않고 바로 사본을 맞춘다.
+tasks["SCHOOL_USER_SYNC"] = ["admin_input", "sync_school_users", "school_sync_output"]
+
+# 역할과 별개인 권한 주기/회수. payload {email, permission, enabled}
+tasks["USER_SET_PERMISSION"] = ["user_set_permission_input", "set_user_permission",
+                                "user_set_permission_output"]
 
 # 클라이언트는 바꿀 대상을 email 로 보낸다(payload {email, role}). DB 는 uuid 를
 # 받으므로 목록에서 email 로 찾아 바꿔준다.
@@ -157,10 +165,24 @@ def login_output(*args, **kwargs):
             "email": row.get("login_id"),
             "name": row.get("name"),
             "role": row.get("role"),
+            "permissions": sorted(_permissions_by_user(user_id).get(user_id, ())),
             "provider": "local",
             "created_at": None,
         },
     }
+
+
+# 역할과 별개로 주는 권한. 이름은 sql/user_permissions.sql 의 CHECK 와 같아야 한다.
+PERMISSIONS = {"document_input"}   # 문서 정보 입력 (문서 등록(비정형) 화면)
+
+
+def _permissions_by_user(user_id=None) -> dict:
+    """{user_id: {권한, ...}}. 조회에 실패하면(테이블이 아직 없는 등) 빈 dict — 권한 표시 때문에
+    로그인·목록이 막히면 안 된다."""
+    by_user = {}
+    for row in db_call("list_user_permissions", user_id=user_id) or []:
+        by_user.setdefault(str(row["user_id"]), set()).add(row["permission"])
+    return by_user
 
 
 
@@ -190,9 +212,9 @@ def _school_of(index: dict, login_id) -> dict:
     return index.get(login_id) or index.get(login_id.lower()) or {}
 
 
-@work_regist("attach_school_info")
-def attach_school_info(*args, **kwargs):
-    """사용자 행 -> (사용자 행, 학교 사용자 인덱스). 학교 사용자는 사본(school_users)에서 읽는다.
+@work_regist("attach_user_info")
+def attach_user_info(*args, **kwargs):
+    """사용자 행 -> (사용자 행, 학교 사용자 인덱스, 권한). 학교 사용자는 사본(school_users)에서 읽는다.
 
     사본 조회에 실패하면 db_call 이 None 을 돌려준다. 그때는 소속을
     빈칸으로 두고 목록은 그대로 보여준다 — 소속 때문에 권한 관리 화면이 막히면 안 된다.
@@ -200,28 +222,31 @@ def attach_school_info(*args, **kwargs):
     rows = args[0] or []
     login_ids = [row["login_id"] for row in rows if row.get("login_id")]
     people = db_call("get_school_users", user_ids=login_ids) if login_ids else []
-    return rows, _school_index(people)
+    return rows, _school_index(people), _permissions_by_user()
 
 
 @work_regist("user_list_output")
 def user_list_output(*args, **kwargs):
-    """(사용자 행, 학교 인덱스) -> 클라이언트가 읽는 {users:[{id, email, name, department, status, role}]}.
+    """(사용자 행, 학교 인덱스, 권한) -> 클라이언트가 읽는
+    {users:[{id, email, name, department, status, role, permissions}]}.
 
     DB 는 login_id 로 부르고 클라이언트는 email 로 읽는다(화면 표기는 "교번").
     id 는 uuid 문자열이다 — 클라이언트 타입이 number 로 선언돼 있지만 화면에서
     행 구분에만 쓰므로 문자열이어도 동작한다.
     """
-    rows, index = args[0]
+    rows, index, permissions = args[0]
     users = []
     for row in rows:
         school = _school_of(index, row.get("login_id"))
+        user_id = str(row.get("user_id"))
         users.append({
-            "id": str(row.get("user_id")),
+            "id": user_id,
             "email": row.get("login_id"),
             "name": row.get("name") or school.get("name"),
             "department": school.get("department"),
             "status": school.get("status"),
             "role": row.get("role"),
+            "permissions": sorted(permissions.get(user_id, ())),
         })
     return {"users": users}
 
@@ -239,27 +264,59 @@ def _require_admin(req: dict) -> list:
     return accounts
 
 
+@work_regist("admin_input")
+def admin_input(*args, **kwargs):
+    """요청 -> 요청 그대로. 관리자가 아니면 ValueError."""
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    _require_admin(req)
+    return req
+
+
 @work_regist("school_search_input")
 def school_search_input(*args, **kwargs):
     """요청 {payload:{keyword}, token} -> (keyword, 전체 계정 목록).
 
-    한 글자 검색은 사본을 통째로 훑는 것과 같아서 두 글자부터 받는다.
+    한 글자도 받는다 — 성씨 하나("김")로 찾는 일이 흔하다. 결과는 50명에서 자른다.
     """
     req = args[0] if args and isinstance(args[0], dict) else {}
     keyword = ((req.get("payload") or {}).get("keyword") or "").strip()
-    if len(keyword) < 2:
-        raise ValueError("검색어를 두 글자 이상 입력하세요.")
+    if not keyword:
+        raise ValueError("검색어를 입력하세요.")
     return keyword, _require_admin(req)
+
+
+def _school_copy_status() -> dict:
+    """사본 상태 {count, synced_at}. 테이블·함수가 없으면(SQL 미적용) 이유를 담아 ValueError."""
+    status = db_call("school_users_status")
+    if status is None:
+        raise ValueError("학교 사용자 사본 테이블이 없습니다. "
+                         "DBManager/sql/school_users.sql 을 DB에 적용해 주세요.")
+    return status
+
+
+def _status_output(status: dict) -> dict:
+    """사본 상태 -> 화면이 읽는 {count, syncedAt}"""
+    synced_at = status.get("synced_at")
+    return {"count": status.get("count") or 0,
+            "syncedAt": synced_at.isoformat() if synced_at else None}
 
 
 @work_regist("search_school_users")
 def search_school_users(*args, **kwargs):
-    """(keyword, 계정 목록) -> (학교 사용자 행, 계정 목록). 조회 실패면 이유를 알린다."""
+    """(keyword, 계정 목록) -> (학교 사용자 행, 계정 목록, 사본 상태).
+
+    검색이 비면 그게 "그런 사람이 없다" 인지 "사본이 아직 비었다" 인지 구분해서 알린다 —
+    둘 다 빈 목록이라 화면에서는 똑같이 "결과 없음" 으로 보인다.
+    """
     keyword, accounts = args[0]
+    status = _school_copy_status()
+    if not status["count"]:
+        raise ValueError("학교 사용자 사본이 비어 있습니다. 학교 DB 연결(SCHOOL_SYNC_ENABLED)을 확인하고 "
+                         "'지금 동기화'를 눌러 주세요.")
     people = db_call("search_school_users", keyword=keyword)
     if people is None:
         raise ValueError("학교 사용자 정보를 조회하지 못했습니다.")
-    return people, accounts
+    return people, accounts, status
 
 
 @work_regist("sync_school_users")
@@ -272,6 +329,15 @@ def sync_school_users(*args, **kwargs):
     return db_call("sync_school_users")
 
 
+@work_regist("school_sync_output")
+def school_sync_output(*args, **kwargs):
+    """반영한 행 수 -> {count, syncedAt}. 실패면(학교 DB 미연결 등) 이유를 알린다."""
+    if args[0] is None:
+        raise ValueError("학교 DB에서 사용자를 가져오지 못했습니다. 학교 DB 연결(SCHOOL_SYNC_ENABLED, "
+                         "SCHOOL_ORACLE_*)과 서버 로그를 확인해 주세요.")
+    return _status_output(_school_copy_status())
+
+
 @work_regist("school_search_output")
 def school_search_output(*args, **kwargs):
     """-> {users:[{id, name, department, college, status, account}]}.
@@ -279,7 +345,7 @@ def school_search_output(*args, **kwargs):
     account 는 이미 가입한 사람만 {email, role} 이고, 아니면 null 이다. 화면은 account 가
     있으면 그 email 로 USER_SET_ROLE 을 불러 역할을 바꾼다.
     """
-    people, accounts = args[0]
+    people, accounts, status = args[0]
     by_login = {a["login_id"].lower(): a for a in accounts if a.get("login_id")}
     users = []
     for person in people:
@@ -293,7 +359,7 @@ def school_search_output(*args, **kwargs):
             "status": person.get("status"),
             "account": {"email": account["login_id"], "role": account["role"]} if account else None,
         })
-    return {"users": users}
+    return {"users": users, "copy": _status_output(status)}
 
 
 @work_regist("user_set_role_input")
@@ -355,4 +421,48 @@ def register_output(*args, **kwargs):
 @work_regist("logout_output")
 def logout_output(*args, **kwargs):
     """서버에 지울 세션 상태가 없다. 토큰은 클라이언트가 localStorage 에서 지운다."""
+    return {}
+
+
+@work_regist("user_set_permission_input")
+def user_set_permission_input(*args, **kwargs):
+    """payload {email, permission, enabled} + 토큰 -> (관리자 uuid, 대상 uuid, 권한, 켜기/끄기).
+
+    대상은 USER_SET_ROLE 처럼 email(=login_id)로 지목한다. 관리자인지는 DB 함수가 다시 확인한다.
+    """
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    payload = req.get("payload") or {}
+    email, permission = payload.get("email"), payload.get("permission")
+
+    if permission not in PERMISSIONS:
+        raise ValueError(f"알 수 없는 권한입니다: {permission!r}")
+
+    admin_user_id = req.get("token")
+    if not admin_user_id:
+        raise ValueError("사용자를 알 수 없습니다. Authorization 헤더가 필요합니다.")
+
+    target = next((r for r in (db_call("list_users") or [])
+                   if r.get("login_id") == email), None)
+    if not target:
+        raise ValueError(f"그런 사용자가 없습니다: {email!r}")
+
+    return admin_user_id, str(target["user_id"]), permission, bool(payload.get("enabled"))
+
+
+@work_regist("set_user_permission")
+def set_user_permission(*args, **kwargs):
+    """권한을 주거나 회수한다. DB 가 {success, message} 를 돌려준다."""
+    admin_user_id, target_user_id, permission, enabled = args[0]
+    return db_call("set_user_permission", admin_user_id=admin_user_id, target_user_id=target_user_id,
+                   permission=permission, enabled=enabled)
+
+
+@work_regist("user_set_permission_output")
+def user_set_permission_output(*args, **kwargs):
+    """{success, message} -> {}. 실패면 이유를 올린다 — 테이블이 없으면 db_call 이 None 을 준다."""
+    result = args[0]
+    if result is None:
+        raise ValueError("권한을 저장하지 못했습니다. DBManager/sql/user_permissions.sql 적용 여부를 확인해 주세요.")
+    if not result.get("success"):
+        raise ValueError(result.get("message") or "권한을 변경하지 못했습니다.")
     return {}
