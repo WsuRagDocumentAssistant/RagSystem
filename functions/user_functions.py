@@ -46,6 +46,9 @@ tasks["SCHOOL_USER_SEARCH"] = ["school_search_input", "search_school_users",
 # 실패하면 이유(동기화 꺼짐·접속 정보 없음·접속 거절 등)를 화면에 그대로 보여준다.
 tasks["SCHOOL_USER_SYNC"] = ["admin_input", "sync_school_users_now", "school_sync_output"]
 
+# 사본 상태 {count, syncedAt}. 화면이 계정 권한 관리를 열 때 불러, 사본이 비었으면 바로 동기화를 시도한다.
+tasks["SCHOOL_USER_STATUS"] = ["admin_input", "school_sync_output"]
+
 # 역할과 별개인 권한 주기/회수. payload {email, permission, enabled}
 tasks["USER_SET_PERMISSION"] = ["user_set_permission_input", "set_user_permission",
                                 "user_set_permission_output"]
@@ -341,7 +344,7 @@ def sync_school_users_now(*args, **kwargs):
 
 @work_regist("school_sync_output")
 def school_sync_output(*args, **kwargs):
-    """반영한 행 수 -> {count, syncedAt}"""
+    """(앞 단계 값은 쓰지 않는다) -> 사본 상태 {count, syncedAt}"""
     return _status_output(_school_copy_status())
 
 
