@@ -8,7 +8,7 @@ from taskcontroller import work_regist, tasks, works
 from functions.data_functions import db_call, _to_millis   # DB 호출은 예외처리까지 묶여 있다
 from functions.rag_functions import UploadStep, _step_in       # 업로드 체인이 meta 를 나르는 방법
 from functions.notification_functions import notify
-from utils import static_url as _static_url, local_path, resolve_image_path, IMAGE_DIR, DOCUMENT_DIR
+from utils import static_url as _static_url, local_path, resolve_image_path, IMAGE_DIR, DOCUMENT_DIR, UNPACK_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,10 @@ tasks["FILE_DELETE"]   = ["file_id_input", "get_document", "delete_document_row"
                           "delete_document_files", "file_delete_output"]
 
 tasks["FILE_DOWNLOAD"] = ["file_id_input", "get_document", "file_download_output"]
+
+# 출처 보기의 문서 뷰어. 원본 문서를 색인할 때와 같은 방식으로 나눈 단락 전체를 순서대로 준다.
+# payload {fileId}
+tasks["FILE_CONTENT"]  = ["file_id_input", "get_document", "file_content_output"]
 
 # get_document 를 거치지 않는다. list_document_images 가 document_id 로 바로 찾는다
 # (제목으로 찾던 우회가 없어졌다).
@@ -631,6 +635,74 @@ def file_download_output(*args, **kwargs):
         return {"url": None}
 
     return {"url": _static_url(str(path), DOCUMENT_DIR, "/api/documents")}
+
+
+#------------------------------------------------┌> 문서 뷰어
+
+# 문서 뷰어 내용 캐시. (경로, 수정 시각) -> 단락 목록. 파싱이 몇 초 걸리는데 같은 답변의
+# 출처를 여러 번 열어보는 일이 흔하다. 파일이 바뀌면 수정 시각이 달라져 다시 파싱한다.
+_CONTENT_CACHE_SIZE = 16
+_content_cache: dict = {}
+_content_lock = threading.Lock()
+
+# 파서가 읽을 수 있는 형식. 나머지(docx·pdf 등)는 아직 색인도 못 하므로 뷰어도 못 연다.
+_VIEWABLE_SUFFIXES = (".hwpx",)
+
+
+def _document_sections(path) -> list:
+    """원본 문서 -> [{heading, breadcrumb, content}] (문서 순서).
+
+    DB 의 단락 테이블을 읽지 않고 원본을 다시 나눈다. 색인할 때와 같은 parse·chunk 라 같은
+    단락이 나오고, 단락 테이블 구조에 기대지 않아도 된다. 그림은 이미 색인 때 뽑아 뒀으므로
+    다시 뽑지 않는다(image_dir 없음).
+    """
+    from ragmodul import chunk, parse
+
+    key = (str(path), path.stat().st_mtime)
+    with _content_lock:
+        if key in _content_cache:
+            return _content_cache[key]
+
+    document = chunk(parse(str(path), unpack_dir=UNPACK_DIR))
+    sections = [{"heading": p.heading or "", "breadcrumb": p.breadcrumb or "", "content": p.content}
+                for p in document.parents]
+
+    with _content_lock:
+        if len(_content_cache) >= _CONTENT_CACHE_SIZE:
+            _content_cache.pop(next(iter(_content_cache)))      # 가장 먼저 넣은 것부터 버린다
+        _content_cache[key] = sections
+    return sections
+
+
+@work_regist("file_content_output")
+def file_content_output(*args, **kwargs):
+    """문서 행 -> {id, name, url, sections, reason}.
+
+    원본이 없거나 읽을 수 없는 형식이면 sections 를 비우고 reason 에 이유를 싣는다 — 실패로
+    돌려보내지 않는다. 뷰어는 그때 인용 단락만 보여주고 이유를 함께 띄운다.
+    """
+    row = args[0]
+    if not row:
+        raise ValueError("문서를 찾을 수 없습니다. 삭제됐을 수 있습니다.")
+
+    info = {"id": str(row.get("id")), "name": row.get("filename") or "", "url": None,
+            "sections": [], "reason": None}
+    path = _find_document_file(row)
+    if path is None:
+        return {**info, "reason": "원본 파일이 서버에 없습니다(색인만 된 문서)."}
+
+    info["url"] = _static_url(str(path), DOCUMENT_DIR, "/api/documents")
+    if path.suffix.lower() not in _VIEWABLE_SUFFIXES:
+        return {**info, "reason": f"{path.suffix} 문서는 아직 뷰어로 열 수 없습니다. 원본을 내려받아 보세요."}
+
+    try:
+        sections = _document_sections(path)
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning(f"[file_content_output] 파싱 실패 {path.name}: {type(e).__name__} - {e}")
+        return {**info, "reason": "문서를 읽지 못했습니다. 원본을 내려받아 보세요."}
+
+    logger.info(f"[file_content_output] {path.name}: 단락 {len(sections)}개")
+    return {**info, "sections": sections}
 
 
 @work_regist("list_document_images")

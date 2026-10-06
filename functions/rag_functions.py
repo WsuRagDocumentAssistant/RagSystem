@@ -33,6 +33,7 @@ from ragmodul import RagController, chunk, parse
 from ragmodul.util import (context_mark, document_to_payload, external_mark,
                            to_plain_sparse, to_plain_vector)
 from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
+import streaming
 from utils import from_jsonb, static_url, resolve_image_path, image_summaries, IMAGE_DIR, UNPACK_DIR, timer
 
 logger = logging.getLogger(__name__)
@@ -562,6 +563,7 @@ def embed_query_function(*args, **kwargs):
     if not query or not query.strip():
         raise ValueError("질의가 비어 있습니다. payload.query 를 보내주세요.")
 
+    streaming.stage(req, "search", "관련 문서를 찾는 중")
     with timer("질의 임베딩", req):
         vocab = load_vocab()
         vector, weights = get_controller().embed_query(query, vocab)
@@ -1016,6 +1018,7 @@ def draft_function(*args, **kwargs):
     # 그림·첨부도 초안에는 주지 않는다. 검색으로 찾은 그림은 화면에만 쓰고, 사용자가
     # 첨부한 문서·그림은 ragmodul 이 클라우드 셋에만 보낸다(로컬은 지원하지 않는다).
     # 그래서 초안은 첨부를 못 본 채로 나오고, 첨부를 근거로 한 내용은 다듬기가 채운다.
+    streaming.stage(req, "draft", "답변 초안을 작성하는 중")
     with timer("초안", req):
         draft = get_controller().answer(query, contexts, provider=DRAFT_PROVIDER,
                                         history=session["history"], summary=session["summary"])
@@ -1054,6 +1057,11 @@ def refine_function(*args, **kwargs):
     # dict 로 넘기면 ragmodul 이 title·source 만 쓴다(_format_external). 문자열로 넘기면
     # 그 줄을 그대로 실어주므로, 응답 원문까지 붙여 보낸다.
     external = [_format_api_ref(ref) for ref in refs]
+    # 다듬는 글은 모델이 쓰는 대로 클라이언트에 흘려보낸다(streaming.py). 사용자가 보는
+    # 최종 답이 이것이라 여기만 스트리밍한다 — 초안은 내부용이라 보내지 않는다.
+    # 각주 목록도 먼저 보낸다. 조각에 [a] 표시가 섞여 오므로 그때부터 위첨자로 그릴 수 있다.
+    streaming.emit(req, "sources", sources=_to_sources(contexts, refs))
+    streaming.stage(req, "answer", "답변을 작성하는 중")
     # 첨부는 고른 모델 전부에게 같은 것이 간다. images 자리에는 검색으로 찾은 문서 그림이
     # 아니라 사용자가 올린 그림만 싣는다 — 찾은 그림은 응답에만 실어 사용자가 본다.
     with timer("다듬기", req):
@@ -1061,7 +1069,8 @@ def refine_function(*args, **kwargs):
             query, contexts, draft, providers,
             external=external, history=session["history"], summary=session["summary"],
             images=[attach_image] if attach_image else None,
-            attachments=attachments)
+            attachments=attachments,
+            on_delta=lambda provider, text: streaming.emit(req, "delta", provider=provider, text=text))
     for name in providers:
         mark = f"{len(answers[name]):,}자" if name in answers else "실패"
         logger.info(f"[refine_function] 다듬기 {name} {mark}")

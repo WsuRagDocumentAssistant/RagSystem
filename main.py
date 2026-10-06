@@ -13,6 +13,7 @@ import time
 from rag_router.task.task_result import TaskResult
 from taskcontroller import work_lst, TaskController,tasks, Task
 from taskexecutor import TaskExecutor
+from streaming import StreamExecutor
 #import functions
 import functions.data_functions
 import functions.user_functions as user_functions
@@ -192,7 +193,12 @@ if __name__ == "__main__":
 
     # ── 통신부(HTTP) 전용 ─────────────────────────────
     # 배포는 이 파일이 진입점이다(Dockerfile CMD, containerPort 8000).
-    gwexecutor = TaskExecutor(max_workers=EXECUTOR_THREADS)
+    #
+    # 스트리밍 큐: 실행부가 LLM 답변 조각과 진행 단계를 결과를 기다리지 않고 라우터로 바로
+    # 보내는 통로(streaming.py). 결과 큐와 따로 둔다 — 조각이 수백 개라 최종 결과가 그 뒤에
+    # 줄을 서면 안 되고, decode 가 둘을 가려낼 필요도 없어진다.
+    stream_queue = Queue()
+    gwexecutor = StreamExecutor(stream_queue, max_workers=EXECUTOR_THREADS)
     gwexecutor.start()
 
     # 모델을 미리 올린다. get_controller() 는 실행부 프로세스 안에서만 불려야 해서
@@ -225,8 +231,10 @@ if __name__ == "__main__":
         gateway.TIMEOUT_SEC = GATEWAY_TIMEOUT
 
         # 설계대로 라우터 → 컨트롤러 입력 큐, 실행부 결과 큐 → 라우터로 바로 잇는다.
+        # 스트리밍 큐도 라우터로 바로 간다(실행부 → LLM → 라우터).
         gateway.connect(gwcontroller.task_queue, gwexecutor.get_result_queue(),
-                        encode=to_controller, decode=from_executor)
+                        encode=to_controller, decode=from_executor,
+                        stream_queue=stream_queue)
 
         # 이미지와 원본 문서를 브라우저가 열 수 있게 내보낸다. 라우터는 /api/task·/api/ws 만
         # 갖고 있어서 파일을 줄 통로가 없다 — 라우터 패키지를 고치는 대신 여기서
