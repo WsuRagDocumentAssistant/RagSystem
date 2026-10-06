@@ -33,6 +33,7 @@ from ragmodul import RagController, chunk, parse
 from ragmodul.util import (context_mark, document_to_payload, external_mark,
                            to_plain_sparse, to_plain_vector)
 from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
+from functions.notification_functions import notify
 import streaming
 from utils import from_jsonb, static_url, resolve_image_path, image_summaries, IMAGE_DIR, UNPACK_DIR, timer
 
@@ -1498,6 +1499,7 @@ def user_query_output(*args, **kwargs):
     req, answers, sources = value[:3]
     images = value[3] if len(value) > 3 else []
     sources = sources or []
+    _notify_answered(req)              # 응답보다 먼저 — 클라이언트가 답을 받고 목록을 다시 읽을 때 보이게
     yield {
         "reply": answers[0]["answer"] if answers else "",
         "answers": [{"provider": a["provider"], "content": a["answer"],
@@ -1510,6 +1512,20 @@ def user_query_output(*args, **kwargs):
         "turn": _turn_info(req),
     }
     _compact_after_reply(req)          # 응답이 나간 뒤
+
+
+def _notify_answered(req: dict) -> None:
+    """질의 완료 알림. 질문한 사람에게 남긴다(서버 DB — notification_functions.notify).
+
+    답변을 기다리다 다른 화면으로 갔거나 창을 닫았어도 종 아이콘에서 알 수 있게 한다.
+    링크에 세션 id 를 실어 누르면 그 대화로 간다. 실패해도 답변은 그대로 나간다(notify 가 삼킨다).
+    """
+    query = " ".join(((req.get("payload") or {}).get("query") or "").split())
+    if len(query) > 30:
+        query = query[:30] + "…"
+    session_id = req.get("session_id")
+    notify(req.get("token"), f"질문에 대한 답변이 완료되었습니다: \"{query}\"", "success",
+           f"/chat?session={session_id}" if session_id else "/chat")
 
 
 @work_regist("save_merged")
