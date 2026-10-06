@@ -73,7 +73,7 @@ tasks["IMAGE_VECTORIZE"] = ["image_vectorize_input", "vectorize_image",
 
 # 색인 체인. 업무 분류값(meta)은 UploadStep 에 실려 단계 사이를 통과한다(rag_functions).
 # 접수 work(file_upload_job)이 안에서 순서대로 부른다 — 통신부 task 로 직접 걸지 않는다.
-_FILE_UPLOAD_CHAIN = ["parse_function", "chunk_function",
+_FILE_UPLOAD_CHAIN = ["parse_function", "chunk_function", "save_viewer_sections",
                       "vocab_function", "filter_vocab_function", "save_vocab_function",
                       "embed_function", "save_function", "register_images",
                       "describe_images_function", "embed_images_function",
@@ -308,6 +308,7 @@ def delete_document_files(*args, **kwargs):
             logger.info(f"[delete_document_files] 원본 삭제: {path.name}")
         except OSError as e:
             logger.warning(f"[delete_document_files] 원본 삭제 실패: {type(e).__name__} - {e}")
+        _viewer_file(path).unlink(missing_ok=True)
 
     stem = Path((row.get("source_path") or row.get("filename") or "").strip()).stem
     if not stem:
@@ -639,22 +640,59 @@ def file_download_output(*args, **kwargs):
 
 #------------------------------------------------┌> 문서 뷰어
 
-# 문서 뷰어 내용 캐시. (경로, 수정 시각) -> 단락 목록. 파싱이 몇 초 걸리는데 같은 답변의
-# 출처를 여러 번 열어보는 일이 흔하다. 파일이 바뀌면 수정 시각이 달라져 다시 파싱한다.
+# 문서 뷰어 내용. 원본을 열 때마다 파싱하면 큰 문서는 수십 초가 걸린다(실측: 뷰어가 한참
+# 비어 있었다). 그래서 나눈 단락을 원본 옆 파일(documents/.viewer/<원본이름>.json)로 남긴다.
+#   - 업로드: 청킹 직후 만든다(save_viewer_sections) — 색인과 같은 단락이고 파싱을 다시 안 한다
+#   - 그 전에 올라온 문서: 기동 때 한 번 채운다(warm_viewer_sections). 그래도 없으면 처음 열 때 만든다
+# 파일에 원본 수정 시각을 적어 두고, 원본이 바뀌었으면 다시 만든다.
+# 메모리 캐시는 같은 답변의 출처를 여러 번 열 때 파일도 안 읽으려고 둔다.
 _CONTENT_CACHE_SIZE = 16
 _content_cache: dict = {}
 _content_lock = threading.Lock()
+VIEWER_DIR = ".viewer"
 
 # 파서가 읽을 수 있는 형식. 나머지(docx·pdf 등)는 아직 색인도 못 하므로 뷰어도 못 연다.
 _VIEWABLE_SUFFIXES = (".hwpx",)
 
 
+def _viewer_file(path):
+    """원본 경로 -> 뷰어 파일 경로 (documents/.viewer/<원본이름>.json)"""
+    return path.parent / VIEWER_DIR / f"{path.name}.json"
+
+
+def _to_sections(document) -> list:
+    """청킹 결과 -> [{heading, breadcrumb, content}] (문서 순서)"""
+    return [{"heading": p.heading or "", "breadcrumb": p.breadcrumb or "", "content": p.content}
+            for p in document.parents]
+
+
+def _write_sections(path, sections: list) -> None:
+    import json
+
+    target = _viewer_file(path)
+    target.parent.mkdir(exist_ok=True)
+    temp = target.with_suffix(".tmp")               # 쓰다 만 파일을 읽지 않게 다 쓴 뒤 바꿔 넣는다
+    temp.write_text(json.dumps({"mtime": path.stat().st_mtime, "sections": sections},
+                               ensure_ascii=False), encoding="utf-8")
+    temp.replace(target)
+
+
+def _read_sections(path):
+    """뷰어 파일의 단락. 없거나 원본이 그 뒤에 바뀌었으면 None."""
+    import json
+
+    try:
+        saved = json.loads(_viewer_file(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return saved["sections"] if saved.get("mtime") == path.stat().st_mtime else None
+
+
 def _document_sections(path) -> list:
     """원본 문서 -> [{heading, breadcrumb, content}] (문서 순서).
 
-    DB 의 단락 테이블을 읽지 않고 원본을 다시 나눈다. 색인할 때와 같은 parse·chunk 라 같은
-    단락이 나오고, 단락 테이블 구조에 기대지 않아도 된다. 그림은 이미 색인 때 뽑아 뒀으므로
-    다시 뽑지 않는다(image_dir 없음).
+    메모리 → 뷰어 파일 → 원본 파싱 순으로 찾는다. 파싱은 색인할 때와 같은 parse·chunk 라 같은
+    단락이 나온다. 그림은 색인 때 이미 뽑아 뒀으므로 다시 뽑지 않는다(image_dir 없음).
     """
     from ragmodul import chunk, parse
 
@@ -663,15 +701,62 @@ def _document_sections(path) -> list:
         if key in _content_cache:
             return _content_cache[key]
 
-    document = chunk(parse(str(path), unpack_dir=UNPACK_DIR))
-    sections = [{"heading": p.heading or "", "breadcrumb": p.breadcrumb or "", "content": p.content}
-                for p in document.parents]
+    sections = _read_sections(path)
+    if sections is None:
+        sections = _to_sections(chunk(parse(str(path), unpack_dir=UNPACK_DIR)))
+        try:
+            _write_sections(path, sections)
+        except OSError as e:
+            logger.warning(f"[viewer] 뷰어 파일 저장 실패 {path.name}: {type(e).__name__} - {e}")
 
     with _content_lock:
         if len(_content_cache) >= _CONTENT_CACHE_SIZE:
             _content_cache.pop(next(iter(_content_cache)))      # 가장 먼저 넣은 것부터 버린다
         _content_cache[key] = sections
     return sections
+
+
+@work_regist("save_viewer_sections")
+def save_viewer_sections(*args, **kwargs):
+    """업로드 체인: 청킹 결과로 뷰어 파일을 만든다. 값은 그대로 다음 단계로 넘긴다.
+
+    실패해도 업로드를 멈추지 않는다 — 뷰어는 처음 열 때 다시 만든다.
+    """
+    from pathlib import Path
+
+    meta, document = _step_in(args)
+    try:
+        path = Path((meta or {})["source_path"])
+        _write_sections(path, _to_sections(document))
+        logger.info(f"[save_viewer_sections] {path.name}: 단락 {len(document.parents)}개")
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning(f"[save_viewer_sections] 건너뜀: {type(e).__name__} - {e}")
+    return args[0]
+
+
+@work_regist("warm_viewer_sections")
+def warm_viewer_sections(*args, **kwargs):
+    """기동 때 한 번: 뷰어 파일이 없는(또는 원본이 바뀐) 문서의 뷰어 파일을 만든다.
+
+    업로드 때 만드는 것은 이 기능 이전에 올라온 문서에 없다. 그 문서를 사용자가 처음 열 때
+    기다리지 않게 미리 채운다. 하나씩 순서대로 — 실행부 스레드 하나만 쓴다.
+    """
+    from pathlib import Path
+
+    folder = Path(DOCUMENT_DIR)
+    if not folder.is_dir():
+        return "문서 폴더 없음"
+    made = 0
+    for path in sorted(folder.iterdir()):
+        if not (path.is_file() and path.suffix.lower() in _VIEWABLE_SUFFIXES) or _read_sections(path) is not None:
+            continue
+        try:
+            _document_sections(path)
+            made += 1
+        except Exception as e:                               # noqa: BLE001
+            logger.warning(f"[warm_viewer_sections] {path.name} 실패: {type(e).__name__} - {e}")
+    logger.info(f"[warm_viewer_sections] 뷰어 파일 {made}개 생성")
+    return f"뷰어 파일 {made}개 생성"
 
 
 @work_regist("file_content_output")

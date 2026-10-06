@@ -213,6 +213,8 @@ if __name__ == "__main__":
     gwexecutor.task_queue.put(Task(["warmup_function"], None))
     # 재시작으로 끊긴 업로드(processing 으로 남은 행)를 error 로. warmup 뒤에 돈다.
     gwexecutor.task_queue.put(Task(["mark_stale_uploads"], None))
+    # 문서 뷰어 파일이 없는 옛 문서를 미리 채운다(document_functions). 처음 여는 사람이 기다리지 않게.
+    gwexecutor.task_queue.put(Task(["warm_viewer_sections"], None))
 
     gwcontroller = TaskController(gwexecutor.get_task_queue())
     gwcontroller.start()
