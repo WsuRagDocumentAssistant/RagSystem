@@ -830,6 +830,8 @@ def _search_images(req, query: str, vector) -> list:
 # 대화 기록(messages.sources)에 그대로 저장되므로 맥락 전체(수천 자)를 싣지 않는다.
 SOURCE_TEXT_CHARS = 300
 SOURCE_CONTENT_CHARS = 3000
+# 뷰어가 강조할 조각(quotes) 개수. 검색에 걸린 조각(child, 하나에 500자 이하)을 점수순으로.
+SOURCE_QUOTES = 3
 
 # 외부 링크에서 뺄 쿼리 파라미터. 인증값이 url 에 박혀 등록된 API 도 있다.
 _SECRET_PARAM = re.compile(r"key|token|secret|auth|passw", re.IGNORECASE)
@@ -883,10 +885,17 @@ def _format_api_ref(ref: dict) -> str:
 {data}"""
 
 
+def _without_breadcrumb(text: str, breadcrumb: str) -> str:
+    """검색 조각 앞의 '제목 경로 + 줄바꿈' 을 뗀다(청커가 검색용으로 붙인 것 — chunker _with_context)."""
+    if breadcrumb and text.startswith(breadcrumb + "\n"):
+        return text[len(breadcrumb) + 1:]
+    return text
+
+
 def _to_sources(contexts, refs=()) -> list:
     """맥락·외부 데이터 -> 화면 각주 목록.
 
-    [{mark, kind, id, name, heading, text, content?, url?}]
+    [{mark, kind, id, name, heading, text, content?, quotes?, url?}]
       mark    : 답변 문장 끝의 표시. 내부 문서 a, b, ... / 외부 데이터 1, 2, ...
                 프롬프트가 붙인 번호와 같은 함수(ragmodul context_mark / external_mark)로
                 만들고, 순번도 프롬프트에 넣은 목록 그대로 센다 — 어긋나면 각주가 엉뚱한
@@ -895,6 +904,8 @@ def _to_sources(contexts, refs=()) -> list:
       id      : 내부는 문서 id(뷰어가 원본을 연다), 외부는 링크
       text    : 툴팁에 띄울 근거 문장 — 리랭커가 고른 조각
       content : 뷰어에 띄울 원문 단락 (내부만)
+      quotes  : 검색에 걸린 조각 원문들 (내부만). 뷰어가 문서 안에서 이 부분만 강조한다.
+                조각 앞에 붙은 제목 경로(검색용)는 뗀다
       url     : 외부 링크 (인증값 제거)
 
     맥락은 문서가 같아도 단락마다 따로 둔다. 표시가 단락 단위로 붙기 때문이다.
@@ -910,6 +921,8 @@ def _to_sources(contexts, refs=()) -> list:
             "heading": c.breadcrumb or c.heading or "",
             "text": _excerpt(c.rerank_text if c.children else c.content, SOURCE_TEXT_CHARS),
             "content": _excerpt(c.content, SOURCE_CONTENT_CHARS),
+            "quotes": [_without_breadcrumb(child.content, c.breadcrumb)
+                       for child in c.children[:SOURCE_QUOTES]],
         }
         for i, c in enumerate(contexts) if c.document_id is not None
     ]
