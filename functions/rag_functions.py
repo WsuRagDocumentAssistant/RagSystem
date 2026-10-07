@@ -1528,14 +1528,18 @@ def _notify_answered(req: dict) -> None:
     """질의 완료 알림. 질문한 사람에게 남긴다(서버 DB — notification_functions.notify).
 
     답변을 기다리다 다른 화면으로 갔거나 창을 닫았어도 종 아이콘에서 알 수 있게 한다.
-    링크에 세션 id 를 실어 누르면 그 대화로 간다. 실패해도 답변은 그대로 나간다(notify 가 삼킨다).
+    링크에 세션 id 와 차례 번호(save_conversation 이 적은 turn_index)를 실어, 누르면 그 대화의
+    그 질문으로 간다. 비교 질의는 아직 저장 전이라 차례 번호가 없어 대화만 연다.
+    실패해도 답변은 그대로 나간다(notify 가 삼킨다).
     """
     query = " ".join(((req.get("payload") or {}).get("query") or "").split())
     if len(query) > 30:
         query = query[:30] + "…"
-    session_id = req.get("session_id")
-    notify(req.get("token"), f"질문에 대한 답변이 완료되었습니다: \"{query}\"", "success",
-           f"/chat?session={session_id}" if session_id else "/chat")
+    session_id, turn = req.get("session_id"), req.get("turn_index")
+    link = "/chat"
+    if session_id:
+        link += f"?session={session_id}" + (f"&turn={turn}" if turn is not None else "")
+    notify(req.get("token"), f"질문에 대한 답변이 완료되었습니다: \"{query}\"", "success", link)
 
 
 @work_regist("save_merged")
