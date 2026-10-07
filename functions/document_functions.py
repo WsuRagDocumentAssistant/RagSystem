@@ -9,6 +9,7 @@ from functions.data_functions import db_call, _to_millis   # DB 호출은 예외
 from functions.rag_functions import UploadStep, _step_in       # 업로드 체인이 meta 를 나르는 방법
 from functions.notification_functions import notify
 from utils import static_url as _static_url, local_path, resolve_image_path, IMAGE_DIR, DOCUMENT_DIR, UNPACK_DIR
+from ragmodul import SUPPORTED_SUFFIXES
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +381,12 @@ def file_upload_input(*args, **kwargs):
     """
     payload = args[0].get("payload") or {}
     name = _safe_name(payload.get("name"))
+    # 파서가 못 읽는 형식은 저장 전에 거절한다. 그냥 받으면 색인 단계에서야 실패하고,
+    # 그때는 응답이 이미 나가서 사용자는 알림으로만 알게 된다.
+    suffix = os.path.splitext(name)[1].lower()
+    if suffix not in SUPPORTED_SUFFIXES:
+        raise ValueError(f"지원하지 않는 문서 형식입니다: {suffix or '(확장자 없음)'}. "
+                         f"{', '.join(SUPPORTED_SUFFIXES)} 만 등록할 수 있습니다.")
     content = payload.get("content")
     if not content:
         raise ValueError("파일 내용(content)이 비어 있습니다.")
@@ -651,8 +658,8 @@ _content_cache: dict = {}
 _content_lock = threading.Lock()
 VIEWER_DIR = ".viewer"
 
-# 파서가 읽을 수 있는 형식. 나머지(docx·pdf 등)는 아직 색인도 못 하므로 뷰어도 못 연다.
-_VIEWABLE_SUFFIXES = (".hwpx",)
+# 뷰어로 열 수 있는 형식 = 파서가 읽는 형식(색인과 같은 단락으로 나눠 보여준다).
+_VIEWABLE_SUFFIXES = SUPPORTED_SUFFIXES
 
 
 def _viewer_file(path):

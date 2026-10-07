@@ -10,7 +10,8 @@ task-executor @ git+https://github.com/WsuRagDocumentAssistant/TaskExecutor.git
 
 # RAG 처리 (파싱·청킹·임베딩·검색)
 ragmodul @ git+https://github.com/WsuRagDocumentAssistant/RagModuls.git
-hwpx @ git+https://github.com/WsuRagDocumentAssistant/HwpxParser_sub.git
+# 문서 파서(hwpx·docx·xlsx·pdf). ragmodul 이 부른다. 예전 hwpx 전용 HwpxParser_sub 를 대체했다
+wsu-document-parser @ git+https://github.com/WsuRagDocumentAssistant/Parser.git
 
 # DB / 세션 / 외부 API / LLM 호출
 db-manager @ git+https://github.com/WsuRagDocumentAssistant/DBManager.git

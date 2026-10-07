@@ -297,16 +297,13 @@ def warmup_function(*args, **kwargs):
 
 @work_regist("parse_function")
 def parse_function(*args, **kwargs):
-    """hwpx -> DocumentModel.
+    """문서(hwpx·docx·xlsx·pdf) -> DocumentModel.
 
     FILE_UPLOAD 는 앞 work 이 방금 저장한 경로를 넘겨준다. 메뉴로 돌리는 test_ 태스크는
     params 가 None 이라 args 가 비고, 그때는 상수로 떨어진다. 문자열만 경로로 인정한다.
 
-    압축을 푼 자리는 parse 가 스스로 치운다(cleanup=True 기본). 파서가 자기가 푼
-    unpacked/<문서명>/ 만 지우므로, 같은 순간에 다른 문서를 파싱하는 스레드의 산출물은
-    건드리지 않는다. 전에는 여기서 UNPACK_DIR 을 통째로 비웠는데, 실행부가 스레드 풀이
-    되면 남의 파싱 중간 산출물까지 지우게 되어 없앴다. 실패했을 때는 parse 가 남긴다 —
-    무엇을 받았는지 열어봐야 하는 경우가 그때다.
+    그림을 잠깐 받아 두는 임시 폴더는 parse 가 UNPACK_DIR 안에 이 문서 몫으로만 만들고
+    끝나면 지운다. 같은 순간에 다른 문서를 파싱하는 스레드의 산출물은 건드리지 않는다.
     """
     meta, value = _step_in(args)
     file_path = value if isinstance(value, str) and value else HWPX_FILE_PATH
