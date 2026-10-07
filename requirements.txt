@@ -11,7 +11,8 @@ task-executor @ git+https://github.com/WsuRagDocumentAssistant/TaskExecutor.git
 # RAG 처리 (파싱·청킹·임베딩·검색)
 ragmodul @ git+https://github.com/WsuRagDocumentAssistant/RagModuls.git
 # 문서 파서(hwpx·docx·xlsx·pdf). ragmodul 이 부른다. 예전 hwpx 전용 HwpxParser_sub 를 대체했다
-wsu-document-parser @ git+https://github.com/WsuRagDocumentAssistant/Parser.git
+# [ocr]: 스캔 PDF 용 PaddleOCR(CPU). 패키지만 설치되고 모델은 처음 쓸 때 내려받는다(PVC 캐시)
+wsu-document-parser[ocr] @ git+https://github.com/WsuRagDocumentAssistant/Parser.git
 
 # DB / 세션 / 외부 API / LLM 호출
 db-manager @ git+https://github.com/WsuRagDocumentAssistant/DBManager.git

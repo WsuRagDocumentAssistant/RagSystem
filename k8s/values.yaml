@@ -16,6 +16,9 @@ env:
   DB_HOST: rag-postgres.rag-system.svc.cluster.local
   DB_PORT: "5432"
   TZ: "Asia/Seoul"
+  # 스캔 PDF OCR 모델(korean / server / off). 모델은 아래 ocrCacheMountPath 에 받아 둔다
+  RAG_PDF_OCR: korean
+  PADDLE_PDX_CACHE_HOME: /app/.cache/paddlex
 
 envFromSecrets:
   - rag-postgres-secret
@@ -26,6 +29,9 @@ storage:
   pvcName: rag-storage-pvc
   documentMountPath: /app/documents
   imageMountPath: /app/images
+  # PaddleOCR 모델 캐시. 처음 OCR 할 때 외부(Baidu BOS)에서 받아 여기 둔다 — 파드가 다시 떠도 다시 받지 않는다.
+  # env.PADDLE_PDX_CACHE_HOME 과 같은 경로여야 한다
+  ocrCacheMountPath: /app/.cache/paddlex
 
 gpu:
   enabled: true
