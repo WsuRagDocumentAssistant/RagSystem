@@ -21,10 +21,12 @@ DB 는 RagController 를 거치지 않는다(use_db=False). 저장 프로시저�
 넘어가지 않는다. 환경변수는 spawn 시점에 상속되므로 넘어간다.
 """
 
+import functools
 import logging
 import os
 import re
 import threading
+import time
 import typing
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -561,7 +563,7 @@ def embed_query_function(*args, **kwargs):
     if not query or not query.strip():
         raise ValueError("질의가 비어 있습니다. payload.query 를 보내주세요.")
 
-    streaming.stage(req, "search", "관련 문서를 찾는 중")
+    streaming.start(req, "search", "관련 문서 검색")
     with timer("질의 임베딩", req):
         vocab = load_vocab()
         vector, weights = get_controller().embed_query(query, vocab)
@@ -649,7 +651,21 @@ def rerank_function(*args, **kwargs):
     for rank, context in enumerate(ordered, 1):
         logger.info(f"[rerank_function] {rank}. score={context.rerank_score:.4f} "
               f"merged={context.merged} {context.breadcrumb[:60]}")
+    documents = _step_documents(ordered)
+    streaming.finish(req, "search", f"관련 문서 {len(documents)}건 확인" if documents else "관련 문서 검색",
+                     detail=f"단락 {len(ordered)}개 선택" if ordered else "관련 문서를 찾지 못했습니다",
+                     items=documents)
     return req, query, ordered, vector
+
+
+def _step_documents(contexts) -> list:
+    """처리 과정에 보일 문서 목록. 같은 문서의 단락은 하나로 묶고 처음 나온 단락의 제목 경로를 쓴다."""
+    seen: dict = {}
+    for c in contexts:
+        name = c.document_title or ""
+        if name and name not in seen:
+            seen[name] = {"name": name, "heading": c.breadcrumb or c.heading or ""}
+    return list(seen.values())
 
 #------------------------------------------------┌> 답변
 
@@ -714,6 +730,9 @@ def history_function(*args, **kwargs):
 
     logger.info(f"[history_function] 이전 대화 {len(history)}/{len(rows)}차례 "
                 f"({sum(_turn_chars(r) for r in history):,}자), 요약 {len(summary)}자")
+    if history or summary:
+        streaming.step(req, "history", "이전 대화 참고",
+                       detail=f"최근 {len(history)}차례" + (" + 대화 요약" if summary else ""))
     return req, query, contexts, refs, {"history": history, "summary": summary}, vector
 
 
@@ -757,6 +776,10 @@ def search_images_function(*args, **kwargs):
     except Exception as e:                                   # noqa: BLE001
         logger.warning(f"[search_images_function] 건너뜀: {type(e).__name__} - {e}")
         images = []
+    if images:
+        streaming.step(req, "images", f"관련 그림 {len(images)}장 찾음",
+                       items=[{"name": i.get("document_title") or "", "heading": i.get("ai_summary") or ""}
+                              for i in images])
     return req, query, contexts, refs, session, images
 
 
@@ -973,6 +996,29 @@ def _image_shortcut(req: dict, images: list) -> bool:
     return bool(images) and not (req.get("attachments") or req.get("attach_image"))
 
 
+# 처리 과정에 보일 provider 이름
+PROVIDER_LABELS = {"gpt": "GPT", "claude": "Claude", "gemini": "Gemini", "local_llm": "로컬 LLM"}
+
+
+@functools.lru_cache(maxsize=None)
+def _model_names() -> dict:
+    """provider -> 모델 이름. config.json 이 단일 출처다(get_controller 와 같은 설정)."""
+    from ai_rag_comm import load_config
+
+    cfg = load_config()
+    return {"local_llm": cfg.local_llm.model, **(cfg.llm_api.default_models or {})}
+
+
+def _llm_label(provider: str) -> str:
+    """처리 과정에 보일 모델 표시. 예: 'GPT (gpt-5.5)', '로컬 LLM (gemma-4-12B-it)'"""
+    try:
+        model = _model_names().get(provider)
+    except Exception:                                        # noqa: BLE001 — 표시용이라 설정을 못 읽어도 이름만 쓴다
+        model = None
+    name = PROVIDER_LABELS.get(provider, provider)
+    return f"{name} ({model})" if model else name
+
+
 def _chosen_providers(req: dict) -> list:
     """클라이언트가 고른 모델들. 배열로 온다 — 비교 화면에서 여러 개를 고르면 여럿,
     하나만 고르면 하나짜리 배열이다. 문자열도 받아준다.
@@ -1029,10 +1075,16 @@ def draft_function(*args, **kwargs):
     # 그림·첨부도 초안에는 주지 않는다. 검색으로 찾은 그림은 화면에만 쓰고, 사용자가
     # 첨부한 문서·그림은 ragmodul 이 클라우드 셋에만 보낸다(로컬은 지원하지 않는다).
     # 그래서 초안은 첨부를 못 본 채로 나오고, 첨부를 근거로 한 내용은 다듬기가 채운다.
-    streaming.stage(req, "draft", "답변 초안을 작성하는 중")
-    with timer("초안", req):
-        draft = get_controller().answer(query, contexts, provider=DRAFT_PROVIDER,
-                                        history=session["history"], summary=session["summary"])
+    label = f"내부 LLM 초안 작성 · {_llm_label(DRAFT_PROVIDER)}"
+    streaming.start(req, "draft", label)
+    try:
+        with timer("초안", req):
+            draft = get_controller().answer(query, contexts, provider=DRAFT_PROVIDER,
+                                            history=session["history"], summary=session["summary"])
+    except Exception:
+        streaming.finish(req, "draft", label, "error", detail="초안 작성 실패")
+        raise
+    streaming.finish(req, "draft", label, detail=f"{len(draft):,}자")
     logger.info(f"[draft_function] 초안 {DRAFT_PROVIDER} {len(draft):,}자 (내부용)")
     return req, query, contexts, refs, session, images, draft
 
@@ -1056,6 +1108,7 @@ def refine_function(*args, **kwargs):
     req, query, contexts, refs, session, images, draft = args[0]
 
     if _image_shortcut(req, images):
+        streaming.step(req, "answer", "그림 설명으로 답변", detail="LLM 을 부르지 않고 색인된 그림 설명을 씀")
         return req, _image_answer(images), _to_sources(contexts), images
 
     providers = _chosen_providers(req)
@@ -1072,7 +1125,22 @@ def refine_function(*args, **kwargs):
     # 최종 답이 이것이라 여기만 스트리밍한다 — 초안은 내부용이라 보내지 않는다.
     # 각주 목록도 먼저 보낸다. 조각에 [a] 표시가 섞여 오므로 그때부터 위첨자로 그릴 수 있다.
     streaming.emit(req, "sources", sources=_to_sources(contexts, refs))
-    streaming.stage(req, "answer", "답변을 작성하는 중")
+    labels = {name: f"외부 LLM 답변 작성 · {_llm_label(name)}" for name in providers}
+    for name in providers:
+        streaming.start(req, f"refine:{name}", labels[name])
+
+    # 첫 글자까지 걸린 시간(TTFT). 질의를 받은 때부터 잰다 — 사용자가 기다린 시간이다.
+    # 모델을 바꿀 때 비교할 지표라 로그에도 남긴다.
+    ttft: dict[str, float] = {}
+
+    def on_delta(provider, text):
+        if provider not in ttft:
+            ttft[provider] = streaming.since_query(req) or 0.0
+            logger.info(f"[refine_function] TTFT {provider} {ttft[provider]:.2f}s")
+            streaming.step(req, f"refine:{provider}", labels.get(provider, provider), "running",
+                           detail=f"첫 글자 {ttft[provider]:.1f}초")
+        streaming.emit(req, "delta", provider=provider, text=text)
+
     # 첨부는 고른 모델 전부에게 같은 것이 간다. images 자리에는 검색으로 찾은 문서 그림이
     # 아니라 사용자가 올린 그림만 싣는다 — 찾은 그림은 응답에만 실어 사용자가 본다.
     with timer("다듬기", req):
@@ -1081,10 +1149,13 @@ def refine_function(*args, **kwargs):
             external=external, history=session["history"], summary=session["summary"],
             images=[attach_image] if attach_image else None,
             attachments=attachments,
-            on_delta=lambda provider, text: streaming.emit(req, "delta", provider=provider, text=text))
+            on_delta=on_delta)
     for name in providers:
         mark = f"{len(answers[name]):,}자" if name in answers else "실패"
         logger.info(f"[refine_function] 다듬기 {name} {mark}")
+        first = f" · 첫 글자 {ttft[name]:.1f}초" if name in ttft else ""
+        streaming.finish(req, f"refine:{name}", labels[name], "done" if name in answers else "error",
+                         detail=f"{len(answers[name]):,}자{first}" if name in answers else "답변 실패")
 
     if not answers:
         raise RuntimeError(f"다듬기가 전부 실패했습니다: {providers}")
@@ -1438,6 +1509,9 @@ def search_api_function(*args, **kwargs):
               f"({ref['source']}) sim={ref['similarity']:.4f}")
     if not refs:
         logger.info("[search_api_function] 관련 외부 데이터 없음")
+    else:
+        streaming.step(req, "external", f"외부 데이터 {len(refs)}건 확인",
+                       items=[{"name": r.get("title") or "", "heading": r.get("source") or ""} for r in refs])
     return req, query, contexts, refs, vector
 
 @work_regist("embed_api_function")

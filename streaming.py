@@ -23,6 +23,7 @@ emit(req, ...) 만 부르면 된다. Router 는 그 job_id 를 기다리는 WebS
 """
 
 import logging
+import time
 
 from taskexecutor import TaskExecutor
 
@@ -52,9 +53,57 @@ def emit(req, type_: str, **data) -> None:
         logger.warning(f"[stream] 보내기 실패: {type(e).__name__} - {e}")
 
 
-def stage(req, name: str, message: str) -> None:
-    """진행 단계를 알린다. 예: stage(req, "draft", "초안 작성 중")"""
-    emit(req, "stage", stage=name, message=message)
+#------------------------------------------------┌> 처리 과정(단계)
+
+# 화면의 "처리 과정" 목록. Claude·ChatGPT 의 생각 단계처럼 질의가 지금 무엇을 하는지(어떤 문서를
+# 보는지, 내부·외부 LLM 중 무엇이 쓰는지)를 단계마다 보여준다. 단계는 key 로 구분하고 같은 key 로
+# 다시 보내면 화면이 그 줄을 고친다(running → done / error).
+#
+#   {"type": "step", "key": "search", "label": "관련 문서 검색", "status": "running" | "done" | "error",
+#    "detail": "단락 5개 선택", "items": [{"name": 문서명, "heading": 제목 경로}], "ms": 걸린 시간}
+#
+# 시작 시각은 요청 봉투(req)에 적어 둔다(_STARTED). 단계가 work 여러 개에 걸쳐도(검색은 임베딩 →
+# 하이브리드 검색 → 리랭킹) 시작한 work 과 끝내는 work 이 같은 req 를 보므로 걸린 시간을 잴 수 있다.
+# 질의 전체 시작 시각(_T0)도 함께 적는다 — 첫 글자까지 걸린 시간(TTFT)의 기준이다.
+
+_STARTED = "_step_started"
+_T0 = "_query_started"
+
+
+def step(req, key: str, label: str, status: str = "done", *, detail: str | None = None,
+         items: list | None = None, ms: float | None = None) -> None:
+    """처리 과정 한 줄을 보낸다. 시작·끝을 잴 필요가 없는 단계(외부 데이터 확인 등)는 이것만 부른다."""
+    event = {"key": key, "label": label, "status": status}
+    if detail:
+        event["detail"] = detail
+    if items:
+        event["items"] = items
+    if ms is not None:
+        event["ms"] = int(ms)
+    emit(req, "step", **event)
+
+
+def start(req, key: str, label: str, detail: str | None = None) -> None:
+    """단계를 시작한다(running). finish 가 걸린 시간을 잰다."""
+    if isinstance(req, dict):
+        now = time.monotonic()
+        req.setdefault(_T0, now)
+        req.setdefault(_STARTED, {})[key] = now
+    step(req, key, label, "running", detail=detail)
+
+
+def finish(req, key: str, label: str, status: str = "done", *, detail: str | None = None,
+           items: list | None = None) -> None:
+    """start 한 단계를 끝낸다(done / error). 걸린 시간을 함께 보낸다."""
+    started = (req.get(_STARTED) or {}).get(key) if isinstance(req, dict) else None
+    ms = (time.monotonic() - started) * 1000 if started is not None else None
+    step(req, key, label, status, detail=detail, items=items, ms=ms)
+
+
+def since_query(req) -> float | None:
+    """질의를 받은 뒤 지난 초. 첫 단계(start)가 기준이다. 기록이 없으면 None."""
+    t0 = req.get(_T0) if isinstance(req, dict) else None
+    return time.monotonic() - t0 if t0 is not None else None
 
 
 class StreamExecutor(TaskExecutor):
