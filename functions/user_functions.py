@@ -4,6 +4,7 @@
 #================================================
 
 import os
+import secrets
 
 from dotenv import load_dotenv
 
@@ -97,9 +98,38 @@ def test_account_input(*args, **kwargs):
 # 로그인 검증. 일치하면 사용자 정보, 아니면 None
 @work_regist("login_user")
 def login_user(*args, **kwargs):
+    """학교 계정(학번/교번 + 학교 비밀번호)을 먼저, 안 맞으면 우리 DB 계정을 본다.
+
+    학교 비밀번호는 학교 DB 가 자기 암호화 함수로 대조한다(DBManager school_login) — 우리 서버는
+    비밀번호를 저장하지도, 학교 DB 의 비밀번호 값을 가져오지도 않는다.
+
+    우리 계정을 뒤에 보는 이유: 관리자·테스트 계정처럼 학교 DB 에 없는 계정이 있고, 학교 DB 가
+    꺼지거나 접속이 안 될 때도(db_call 이 None) 그 계정으로는 들어갈 수 있어야 한다.
+    """
     login_id, password = args[0]
-    logined_user = db_call("login", login_id=login_id, password=password)
-    return logined_user
+    person = db_call("school_login", user_id=login_id, password=password)
+    if person:
+        return _school_account(person)
+    return db_call("login", login_id=login_id, password=password)
+
+
+def _school_account(person) -> dict:
+    """학교 DB 로 확인된 사람 -> 우리 DB 의 계정 행. 처음 들어오면 계정을 만든다.
+
+    역할·권한·대화 기록이 우리 계정(users.id)에 붙으므로 계정은 있어야 한다. 예전 계정은
+    login_id 가 이메일이라 학번/교번과 이메일 둘 다로 찾는다(_school_index 와 같은 규칙).
+    새 계정의 비밀번호는 아무도 모르는 임의 값이다 — 학교 계정은 늘 학교 DB 로만 확인한다.
+    """
+    index = {}
+    for row in db_call_or_raise("list_users") or []:
+        index.setdefault((row.get("login_id") or "").lower(), row)
+    school_id, email = str(person["user_id"]), (person.get("email") or "").lower()
+    row = index.get(school_id.lower()) or (index.get(email) if email else None)
+    if row is None:
+        row = db_call_or_raise("create_user_account", name=person.get("name") or school_id,
+                               login_id=school_id, password=secrets.token_urlsafe(32),
+                               role="user")
+    return {**row, "provider": "school"}
 
 # 계정 생성. 비밀번호 암호화는 DB 프로시저가 한다
 @work_regist("create_account")
@@ -159,7 +189,7 @@ def login_output(*args, **kwargs):
     """
     row = args[0]
     if not row:
-        raise ValueError("이메일 또는 비밀번호가 올바르지 않습니다.")
+        raise ValueError("학번/교번 또는 비밀번호가 올바르지 않습니다.")
 
     user_id = str(row["user_id"])
     return {
@@ -170,7 +200,7 @@ def login_output(*args, **kwargs):
             "name": row.get("name"),
             "role": row.get("role"),
             "permissions": sorted(_permissions_by_user(user_id).get(user_id, ())),
-            "provider": "local",
+            "provider": row.get("provider", "local"),
             "created_at": None,
         },
     }
