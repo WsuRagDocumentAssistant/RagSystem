@@ -34,7 +34,7 @@ from taskcontroller import work_regist, tasks
 from ragmodul import RagController, chunk, parse
 from ragmodul.util import (context_mark, document_to_payload, external_mark,
                            to_plain_sparse, to_plain_vector)
-from functions.data_functions import db_call   # DB 호출은 예외처리까지 묶여 있다
+from functions.data_functions import api_meta_by_url, db_call   # DB 호출은 예외처리까지 묶여 있다
 from functions.notification_functions import notify
 import streaming
 from utils import from_jsonb, static_url, resolve_image_path, image_summaries, IMAGE_DIR, UNPACK_DIR, timer
@@ -931,11 +931,16 @@ def _to_sources(contexts, refs=()) -> list:
     맥락은 문서가 같아도 단락마다 따로 둔다. 표시가 단락 단위로 붙기 때문이다.
     document_id 가 없는 맥락은 버린다 — 문서에 붙지 않은 조각이라 출처로 띄울 게 없다.
     번호는 버리기 전 순번이라 건너뛴 자리는 비어 있다.
+
+    scope 는 내부 문서 / 외부 문서(외부 문서 등록 화면으로 올린 것) 구분이다. 둘 다 등록 문서라
+    kind 는 internal 이고(뷰어로 연다), 화면이 출처에 "외부 문서" 표시를 붙인다.
     """
+    external_docs = set(db_call("list_external_documents") or []) if contexts else set()
     internal = [
         {
             "mark": context_mark(i),
             "kind": "internal",
+            "scope": "external" if c.document_id in external_docs else "internal",
             "id": str(c.document_id),
             "name": c.document_title or "",
             "heading": c.breadcrumb or c.heading or "",
@@ -1504,6 +1509,12 @@ def search_api_function(*args, **kwargs):
     except Exception as e:
         logger.warning(f"[search_api_function] 건너뜀: {type(e).__name__} - {e}")
 
+    # 추가 정보(기준 연도·설명 등)를 붙인다 — 프롬프트의 외부 데이터 목록이 제목만으로는
+    # 어느 해·어떤 데이터인지 알 수 없다(ragmodul _format_external).
+    if refs:
+        metas = api_meta_by_url()
+        refs = [{**ref, **{k: v for k, v in (metas.get(ref.get("url")) or {}).items()
+                           if k in ("provider", "base_year", "description")}} for ref in refs]
     for ref in refs:
         logger.info(f"[search_api_function] {ref['title']} "
               f"({ref['source']}) sim={ref['similarity']:.4f}")
@@ -1521,7 +1532,9 @@ def embed_api_function(*args, **kwargs):
     api_insert 체인에서 insert_db_api_data 다음에 붙는다. 앞 단계가 방금 넣은 행
     하나를 준다 — title, url, source, key, data, data_type, date.
 
-    임베딩 대상은 title 과 source 뿐이다. data 는 API 응답 원문이라 길고 자주 바뀌고,
+    임베딩 대상은 title·source 와 추가 정보(제공 기관·기준 연도·설명 — save_external_api 가
+    행에 붙여 준다)다. "2025년 취업 현황" 처럼 연도·주제로 묻는 질의가 걸리게 한다.
+    data 는 API 응답 원문이라 길고 자주 바뀌고,
     key 는 인증키다 — 둘 다 벡터에 들어가면 안 된다. 그래서 update_api_data_date 로
     data 만 갱신될 때는 이 work 가 다시 돌 필요가 없다. 삭제도 마찬가지다 —
     url FK 에 ON DELETE CASCADE 가 걸려 있어 delete_api_data 가 벡터까지 지운다.
@@ -1539,7 +1552,9 @@ def embed_api_function(*args, **kwargs):
         logger.warning("[embed_api_function] 등록된 행이 없어 건너뜁니다")
         return None
 
-    text = f"{row['title']} · {row['source']}"
+    text = " · ".join(str(v) for v in (row.get("title"), row.get("source"), row.get("provider"),
+                                        f"{row['base_year']}년 기준" if row.get("base_year") else None,
+                                        row.get("description")) if v)
     vector = get_controller().embed_texts([text])[0]
     db_call("save_api_data_vector", url=row["url"], embedding=vector)
 

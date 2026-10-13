@@ -5,7 +5,7 @@
 
 import logging
 from taskcontroller import work_regist, tasks, works
-from functions.data_functions import db_call, _to_millis   # DB 호출은 예외처리까지 묶여 있다
+from functions.data_functions import db_call, db_call_or_raise, _to_millis   # DB 호출은 예외처리까지 묶여 있다
 from functions.rag_functions import UploadStep, _step_in       # 업로드 체인이 meta 를 나르는 방법
 from functions.notification_functions import notify
 from utils import static_url as _static_url, local_path, resolve_image_path, IMAGE_DIR, DOCUMENT_DIR, UNPACK_DIR
@@ -231,6 +231,8 @@ def file_list_output(*args, **kwargs):
     files 상태에 넣고 map 을 돌린다(AppState.fetchFiles).
     """
     rows = args[0] or []
+    # 외부 문서(외부 문서 등록 화면으로 올린 것). 두 등록 화면이 이 값으로 자기 문서만 보인다.
+    external = set(db_call("list_external_documents") or [])
 
     # DB 의 filename 은 hwpx 내부 이름이라 확장자가 없다(실측). 그대로 내보내면
     # 클라이언트가 그 이름으로 파일을 저장해 확장자 없는 파일이 떨어진다.
@@ -240,6 +242,7 @@ def file_list_output(*args, **kwargs):
     return [
         {
             "id": str(row.get("id")),
+            "scope": "external" if row.get("id") in external else "internal",
             "name": _display_name(row, disk),
             "workCategory": row.get("work_category"),
             "task": row.get("task_name"),
@@ -378,8 +381,15 @@ def file_upload_input(*args, **kwargs):
 
     행을 먼저 만들어 두면 색인이 도는 동안에도 목록에 'processing' 으로 보이고, 색인이
     끝날 때 프로시저가 document_id 로 그 행의 RAG 컬럼만 채우므로 분류값이 보존된다.
+
+    payload.scope 가 "external" 이면 외부 문서다(외부 문서 등록 화면). 메타데이터 입력란이 없는
+    화면이라 분류값을 받지 않고, 문서 행에 외부 표시를 붙인다(external_documents).
     """
     payload = args[0].get("payload") or {}
+    external = payload.get("scope") == "external"
+    if external:
+        payload = {k: v for k, v in payload.items()
+                   if k not in ("productionYear", "workCategory", "task", "department", "reportType")}
     name = _safe_name(payload.get("name"))
     # 파서가 못 읽는 형식은 저장 전에 거절한다. 그냥 받으면 색인 단계에서야 실패하고,
     # 그때는 응답이 이미 나가서 사용자는 알림으로만 알게 된다.
@@ -424,6 +434,12 @@ def file_upload_input(*args, **kwargs):
     if not document_id:
         raise ValueError("문서를 등록하지 못했습니다. 잠시 후 다시 시도해주세요.")
     meta["document_id"] = int(document_id)
+    # 외부 표시. 같은 파일을 내부 문서로 다시 올리면 떼야 해서 내부일 때도 부른다. 외부인데
+    # 표시가 실패하면 내부 문서로 섞여 들어가므로 멈춘다(표가 없으면 sql/external_documents.sql 적용).
+    if external:
+        db_call_or_raise("set_external_document", document_id=meta["document_id"], external=True)
+    else:
+        db_call("set_external_document", document_id=meta["document_id"], external=False)
 
     # 요청 dict 에도 남긴다. 실행부는 실패해도 이 dict 를 결과와 함께 돌려주므로,
     # 브릿지가 어느 문서를 error 로 표시해야 하는지 여기서 알 수 있다.

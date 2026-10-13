@@ -230,6 +230,23 @@ def _refresh_minutes(payload) -> int | None:
     return int(value) if value not in (None, "") and str(value).isdigit() else None
 
 
+def _save_api_meta(row: dict, payload: dict) -> dict:
+    """추가 정보(제공 기관·기준 연도·설명)를 저장하고 행에 붙여 돌려준다.
+
+    api_datas 와 따로 둔 표(api_data_meta)라 저장이 실패해도(표가 아직 없는 등) 등록은 그대로
+    둔다 — db_call 이 None 을 주면 입력값을 그대로 붙인다. 뒤 단계(embed_api_function)가
+    이 값으로 검색 벡터를 만든다.
+    """
+    year = payload.get("baseYear")
+    meta = {
+        "provider": (payload.get("provider") or "").strip() or None,
+        "base_year": int(year) if year not in (None, "") and str(year).isdigit() else None,
+        "description": (payload.get("description") or "").strip() or None,
+    }
+    db_call("save_api_data_meta", url=row["url"], **meta)
+    return {**row, **meta}
+
+
 @work_regist("save_external_api")
 def save_external_api(*args, **kwargs):
     """EXTERNAL_API_SAVE 의 첫 단계. 수정이면 메타만 고치고, 신규면 수집해서 넣는다. DB 행을 돌려준다.
@@ -257,7 +274,7 @@ def save_external_api(*args, **kwargs):
         if not row:
             raise ValueError(f"등록되지 않은 외부 API 입니다: {api_id}")
         logger.info(f"[save_external_api] 수정: {row.get('title')} (주기 {refresh}분)")
-        return row
+        return _save_api_meta(row, payload)
 
     request = ApiEntity(
         title=payload.get("title"),
@@ -274,7 +291,7 @@ def save_external_api(*args, **kwargs):
     if not row:
         raise ValueError("외부 API 를 등록하지 못했습니다. 같은 url 이 이미 등록되어 있는지 확인해주세요.")
     logger.info(f"[save_external_api] 등록: {entity.title} ({entity.url[:60]}, 주기 {refresh}분)")
-    return row
+    return _save_api_meta(row, payload)
 
 
 # DB에 저장, API 결과 리스트 반환 (api_insert 테스트 task 용. 통신부는 save_external_api 를 쓴다)
@@ -517,18 +534,30 @@ def dictionary_list_output(*args, **kwargs):
 def external_api_list_output(*args, **kwargs):
     """외부 API 행 -> {apis:[...]}. 키 이름을 클라이언트 쪽(camelCase)으로 바꾼다."""
     rows = args[0] or []
-    return {"apis": [
-        {
-            "id": row.get("url"),          # url 이 PK 다. 삭제·갱신이 이 값으로 걸린다
-            "title": row.get("title"),
-            "url": row.get("url"),
-            "source": row.get("source"),
-            "apiKey": row.get("key") or row.get("api_key"),
-            "fetchedAt": str(row.get("date") or row.get("fetched_at") or "") or None,
-            "refreshIntervalMinutes": row.get("refresh_interval_minutes"),
-        }
-        for row in rows
-    ]}
+    metas = api_meta_by_url()
+    return {"apis": [_api_out(row, metas.get(row.get("url"))) for row in rows]}
+
+
+def api_meta_by_url() -> dict:
+    """{url: 추가 정보 행}. 표가 아직 없거나 조회가 실패하면 빈 dict — 목록은 그대로 보인다."""
+    return {m["url"]: m for m in db_call("list_api_data_meta") or []}
+
+
+def _api_out(row: dict, meta: dict | None) -> dict:
+    """외부 API 행(+ 추가 정보) -> 클라이언트가 읽는 한 건."""
+    meta = meta or {}
+    return {
+        "id": row.get("url"),          # url 이 PK 다. 삭제·갱신이 이 값으로 걸린다
+        "title": row.get("title"),
+        "url": row.get("url"),
+        "source": row.get("source"),
+        "apiKey": row.get("key") or row.get("api_key"),
+        "fetchedAt": str(row.get("date") or row.get("fetched_at") or "") or None,
+        "refreshIntervalMinutes": row.get("refresh_interval_minutes"),
+        "provider": meta.get("provider") or "",
+        "baseYear": meta.get("base_year"),
+        "description": meta.get("description") or "",
+    }
 
 
 @work_regist("api_id_input")
@@ -614,15 +643,7 @@ def external_api_save_output(*args, **kwargs):
     if row is None:
         raise ValueError("등록된 외부 API 를 찾지 못했습니다.")
 
-    return {"api": {
-        "id": row.get("url"),               # url 이 PK 다
-        "title": row.get("title"),
-        "url": row.get("url"),
-        "source": row.get("source"),
-        "apiKey": row.get("key") or row.get("api_key"),
-        "fetchedAt": str(row.get("date") or row.get("fetched_at") or "") or None,
-        "refreshIntervalMinutes": row.get("refresh_interval_minutes"),
-    }}
+    return {"api": _api_out(row, api_meta_by_url().get(url))}
 
 
 #────────────────────────────────────────────────┌> 대화 세션 (USER_QUERY 체인에 끼움)
