@@ -233,6 +233,9 @@ def file_list_output(*args, **kwargs):
     rows = args[0] or []
     # 외부 문서(외부 문서 등록 화면으로 올린 것). 두 등록 화면이 이 값으로 자기 문서만 보인다.
     external = set(db_call("list_external_documents") or [])
+    # 올린 사람·등록 묶음. 내부 문서 등록 화면이 "내가 마지막으로 등록한 문서"만 보인다.
+    # 기록 전에 올린 문서(또는 표가 아직 없음)는 비어 있다 — 그 화면에는 안 보이고 문서 목록에는 보인다.
+    uploads = {row["document_id"]: row for row in db_call("list_document_uploads") or []}
 
     # DB 의 filename 은 hwpx 내부 이름이라 확장자가 없다(실측). 그대로 내보내면
     # 클라이언트가 그 이름으로 파일을 저장해 확장자 없는 파일이 떨어진다.
@@ -243,6 +246,11 @@ def file_list_output(*args, **kwargs):
         {
             "id": str(row.get("id")),
             "scope": "external" if row.get("id") in external else "internal",
+            "uploadedBy": _str_or_none((uploads.get(row.get("id")) or {}).get("user_id")),
+            "batchId": (uploads.get(row.get("id")) or {}).get("batch_id"),
+            # 마지막으로 올린 시각. 같은 파일을 다시 올리면 문서 행(registered_at)은 그대로라
+            # "마지막 등록 묶음"은 이 값으로 고른다.
+            "lastUploadedAt": _to_millis((uploads.get(row.get("id")) or {}).get("uploaded_at")),
             "name": _display_name(row, disk),
             "workCategory": row.get("work_category"),
             "task": row.get("task_name"),
@@ -355,6 +363,7 @@ def file_delete_output(*args, **kwargs):
 import base64
 import os
 import re
+import uuid
 
 
 
@@ -369,6 +378,25 @@ def _safe_name(name: str) -> str:
     if not name:
         raise ValueError("파일 이름이 비어 있습니다.")
     return name
+
+
+def _str_or_none(value):
+    return str(value) if value is not None else None
+
+
+def _save_upload(req: dict, document_id: int, batch_id) -> None:
+    """올린 사람(토큰 = user_id)과 등록 묶음을 남긴다. 내부 문서 등록 화면이 이걸로
+    "내가 마지막으로 등록한 문서"만 보인다.
+
+    실패해도 업로드는 계속한다(db_call 이 삼킨다) — 화면 표시용 기록이라 이것 때문에 문서를
+    못 올리면 안 된다. 토큰이 user_id(UUID)가 아니면(더미 로그인 등) 남기지 않는다.
+    """
+    try:
+        user_id = str(uuid.UUID(str(req.get("token"))))
+    except (ValueError, TypeError):
+        logger.warning(f"[file_upload_input] 올린 사람을 알 수 없어 기록하지 않음: id={document_id}")
+        return
+    db_call("save_document_upload", document_id=document_id, user_id=user_id, batch_id=batch_id)
 
 
 @work_regist("file_upload_input")
@@ -440,6 +468,8 @@ def file_upload_input(*args, **kwargs):
         db_call_or_raise("set_external_document", document_id=meta["document_id"], external=True)
     else:
         db_call("set_external_document", document_id=meta["document_id"], external=False)
+    _save_upload(args[0] if args and isinstance(args[0], dict) else {}, meta["document_id"],
+                 payload.get("batchId"))
 
     # 요청 dict 에도 남긴다. 실행부는 실패해도 이 dict 를 결과와 함께 돌려주므로,
     # 브릿지가 어느 문서를 error 로 표시해야 하는지 여기서 알 수 있다.
