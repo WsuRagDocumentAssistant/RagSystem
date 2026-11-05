@@ -48,9 +48,6 @@ spec:
             - name: storage
               mountPath: {{ .Values.storage.imageMountPath }}
               subPath: images
-            - name: storage
-              mountPath: {{ .Values.storage.ocrCacheMountPath }}
-              subPath: ocr-cache
           {{- end }}
       {{- if .Values.logs.enabled }}
       volumes:
