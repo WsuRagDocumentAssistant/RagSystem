@@ -24,20 +24,18 @@ DB 는 RagController 를 거치지 않는다(use_db=False). 저장 프로시저�
 import functools
 import logging
 import os
-import re
 import threading
 import time
 import typing
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from taskcontroller import work_regist, tasks
 from ragmodul import RagController, chunk, parse
 from ragmodul.util import (context_mark, document_to_payload, external_mark,
                            to_plain_sparse, to_plain_vector)
-from functions.data_functions import api_meta_by_url, db_call   # DB 호출은 예외처리까지 묶여 있다
+from functions.data_functions import api_meta_by_url, db_call, require_own_session   # DB 호출은 예외처리까지 묶여 있다
 from functions.notification_functions import notify
 import streaming
-from utils import from_jsonb, static_url, resolve_image_path, image_summaries, IMAGE_DIR, UNPACK_DIR, timer
+from utils import from_jsonb, public_url, static_url, resolve_image_path, image_summaries, IMAGE_DIR, UNPACK_DIR, timer
 
 logger = logging.getLogger(__name__)
 
@@ -853,8 +851,6 @@ SOURCE_CONTENT_CHARS = 3000
 # 뷰어가 강조할 조각(quotes) 개수. 검색에 걸린 조각(child, 하나에 500자 이하)을 점수순으로.
 SOURCE_QUOTES = 3
 
-# 외부 링크에서 뺄 쿼리 파라미터. 인증값이 url 에 박혀 등록된 API 도 있다.
-_SECRET_PARAM = re.compile(r"key|token|secret|auth|passw", re.IGNORECASE)
 
 
 def _excerpt(text, limit: int) -> str:
@@ -863,14 +859,7 @@ def _excerpt(text, limit: int) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
 
-def _public_url(url) -> str | None:
-    """화면에 띄울 외부 링크. 인증값으로 보이는 쿼리 파라미터는 빼고 돌려준다."""
-    if not url:
-        return None
-    parts = urlsplit(url)
-    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
-             if not _SECRET_PARAM.search(k)]
-    return urlunsplit(parts._replace(query=urlencode(query)))
+_public_url = public_url   # utils.convert 로 옮겼다(외부 API 관리 응답도 같은 규칙을 쓴다)
 
 
 def _source_key(source: dict) -> str:
@@ -1285,9 +1274,7 @@ def _compact_after_reply(req: dict) -> None:
 def session_compact_status(*args, **kwargs):
     """payload {sessionId} -> {status: compacting | done}. 모르는 세션은 done."""
     payload = (args[0].get("payload") or {}) if args and isinstance(args[0], dict) else {}
-    session_id = payload.get("sessionId")
-    if not session_id:
-        raise ValueError("payload 에 sessionId 가 없습니다.")
+    session_id = require_own_session(args[0], payload.get("sessionId"))
     with _compress_lock:
         return {"status": _compact_state.get(session_id, "done")}
 
@@ -1653,6 +1640,7 @@ def save_merged(*args, **kwargs):
     if not session_id:
         logger.warning("[save_merged] sessionId 가 없어 저장 건너뜀")
         return req, merged
+    session_id = require_own_session(req, session_id)    # 남의 대화에 답변을 끼워 넣지 못하게
 
     try:
         saved = db_call("insert_message", session_id=session_id,

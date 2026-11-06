@@ -10,24 +10,31 @@ work 이 예외를 그대로 올리면 TaskExecutor 가 TaskExecutionError 로 �
 """
 import logging
 
+from utils import redact_urls
+
 logger = logging.getLogger(__name__)
 
 #────────────────────────────────────────────────
 
 def error_message(e: Exception) -> str:
-    """예외를 사람이 읽을 한 줄로 바꾼다."""
+    """예외를 사람이 읽을 한 줄로 바꾼다.
+
+    메시지 안의 링크는 인증값 파라미터를 뺀다 — httpx 의 HTTPStatusError 는 요청 url 전체
+    (serviceKey=... 포함)를 메시지에 넣어서, 외부 API 갱신이 실패할 때마다 키가 로그에 남았다.
+    """
     name = type(e).__name__
+    text = redact_urls(str(e))
     if name == "UniqueViolationError":
         return "중복된 값 — 이미 등록되어 있음"
     if name == "RaiseError":
-        return f"DB 거절 — {e}"
+        return f"DB 거절 — {text}"
     if name in ("InvalidTextRepresentationError", "DataError", "ValueError"):
-        return f"올바르지 않은 값 — {e}"
+        return f"올바르지 않은 값 — {text}"
     if name in ("KeyError", "IndexError"):
-        return f"입력값 없음 — {e}"
+        return f"입력값 없음 — {text}"
     if name in ("ConnectError", "ConnectTimeout", "ReadTimeout", "HTTPStatusError"):
-        return f"연결 실패 — {e}"
-    return f"{name} — {e}"
+        return f"연결 실패 — {text}"
+    return f"{name} — {text}"
 
 
 def safe_call(func, *args, label="", **kwargs):

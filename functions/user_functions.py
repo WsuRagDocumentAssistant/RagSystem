@@ -6,6 +6,8 @@
 import os
 import secrets
 
+import auth
+
 from dotenv import load_dotenv
 
 from taskcontroller import work_regist, tasks
@@ -105,11 +107,17 @@ def login_user(*args, **kwargs):
 
     우리 계정을 뒤에 보는 이유: 관리자·테스트 계정처럼 학교 DB 에 없는 계정이 있고, 학교 DB 가
     꺼지거나 접속이 안 될 때도(db_call 이 None) 그 계정으로는 들어갈 수 있어야 한다.
+
+    학교 구성원(사본 school_users 에 있는 학번/교번·이메일)은 우리 DB 비밀번호로 들어올 수 없다.
+    누군가 그 사람의 교번으로 미리 만들어 둔 로컬 계정(예전 공개 회원가입)이 있으면, 그 비밀번호로
+    본인 계정에 들어갈 수 있었다(보안 점검 account-linking.unverified-local-identity).
     """
     login_id, password = args[0]
     person = db_call("school_login", user_id=login_id, password=password)
     if person:
         return _school_account(person)
+    if db_call("get_school_users", user_ids=[login_id]):
+        return None
     return db_call("login", login_id=login_id, password=password)
 
 
@@ -183,23 +191,24 @@ def login_output(*args, **kwargs):
     실패는 예외로 올린다. 성공 status 에 null 을 실어 보내면 클라이언트가 그걸
     더미 계정 로그인으로 흘려버려서, 비밀번호가 틀렸는데 들어가진 것처럼 보인다.
 
-    [임시] access_token 에 user_id 를 그대로 쓴다. 토큰 발급이 정해지기 전까지의
-    자리표시자다. 남의 user_id 를 Authorization 헤더에 넣으면 그 사람으로 행세할 수
-    있으므로, 토큰을 검증하는 work 이 생기기 전에 배포되면 안 된다.
+    access_token 은 서버가 서명한 만료 있는 토큰이다(auth.py). 예전처럼 user_id 를 그대로 쓰면
+    사용자 목록에서 본 UUID 로 남을 행세할 수 있었다. 역할·권한을 토큰에 실어 요청마다 DB 를
+    보지 않고 첫 관문(access.py)에서 거른다.
     """
     row = args[0]
     if not row:
         raise ValueError("학번/교번 또는 비밀번호가 올바르지 않습니다.")
 
     user_id = str(row["user_id"])
+    permissions = sorted(_permissions_by_user(user_id).get(user_id, ()))
     return {
-        "access_token": user_id,
+        "access_token": auth.issue(user_id, row.get("role"), permissions),
         "user": {
             "id": user_id,
             "email": row.get("login_id"),
             "name": row.get("name"),
             "role": row.get("role"),
-            "permissions": sorted(_permissions_by_user(user_id).get(user_id, ())),
+            "permissions": permissions,
             "provider": row.get("provider", "local"),
             "created_at": None,
         },

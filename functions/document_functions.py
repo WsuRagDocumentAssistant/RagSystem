@@ -399,6 +399,10 @@ def _save_upload(req: dict, document_id: int, batch_id) -> None:
     db_call("save_document_upload", document_id=document_id, user_id=user_id, batch_id=batch_id)
 
 
+# 등록 문서 크기 상한(디코딩한 바이트). 웹소켓 메시지 상한(라우터 ws_max_size 100MB)보다 작게.
+UPLOAD_MAX_BYTES = int(os.environ.get("RAG_UPLOAD_MAX_BYTES", str(70 * 1024 * 1024)))
+
+
 @work_regist("file_upload_input")
 def file_upload_input(*args, **kwargs):
     """payload 의 base64 를 파일로 떨구고, 문서 행을 'processing' 으로 만든다.
@@ -428,6 +432,10 @@ def file_upload_input(*args, **kwargs):
     content = payload.get("content")
     if not content:
         raise ValueError("파일 내용(content)이 비어 있습니다.")
+    # 디코딩·저장하기 전에 크기부터 본다(base64 는 원본의 4/3). 예전에는 얼마든 받아 디스크에
+    # 쓴 뒤에야 파서가 크기를 봤다(보안 점검 resource-exhaustion.upload-persistence).
+    if len(content) > UPLOAD_MAX_BYTES * 4 // 3 + 4:
+        raise ValueError(f"문서가 너무 큽니다. {UPLOAD_MAX_BYTES // 1048576}MB 이하만 등록할 수 있습니다.")
 
     os.makedirs(DOCUMENT_DIR, exist_ok=True)
     path = os.path.join(DOCUMENT_DIR, name)
@@ -536,8 +544,9 @@ def file_upload_job(*args, **kwargs):
 
     value = works["file_upload_input"](req)          # 검사·파일 저장·processing 행. 실패면 즉시 오류
     name = (req.get("payload") or {}).get("name") or "문서"
+    owner = req.get("token")                          # JOB_STATUS 는 올린 사람만 조회한다
     with _jobs_lock:
-        _jobs[job_id] = {"status": "processing"}
+        _jobs[job_id] = {"status": "processing", "owner": owner}
     yield {"jobId": job_id, "status": "processing"}  # ── 여기까지가 응답
 
     try:
@@ -556,6 +565,7 @@ def file_upload_job(*args, **kwargs):
             db_call("set_document_status", id=int(document_id), status="error")
         notify(req.get("token"), f"{name} 색인에 실패했습니다: {entry['error']}", "error", "/documents")
     entry["done_at"] = time.time()
+    entry["owner"] = owner
     with _jobs_lock:
         _jobs[job_id] = entry
 
@@ -567,8 +577,8 @@ def job_status(*args, **kwargs):
     processing | ready(+result) | error(+error) | unknown(모르는 id — 만료 또는 재시작).
     확인하러 오지 않은 완료 항목은 조회 때마다 곁들여 정리하므로 타이머가 필요 없다.
     """
-    payload = (args[0].get("payload") or {}) if args and isinstance(args[0], dict) else {}
-    job_id = payload.get("jobId")
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    job_id = (req.get("payload") or {}).get("jobId")
     if not job_id:
         raise ValueError("payload 에 jobId 가 없습니다.")
 
@@ -578,7 +588,7 @@ def job_status(*args, **kwargs):
                     if v.get("done_at") and now - v["done_at"] > JOB_TTL]:
             del _jobs[key]
         job = _jobs.get(job_id)
-        if job is None:
+        if job is None or job.get("owner") != req.get("token"):   # 남의 작업은 모르는 것으로
             return {"status": "unknown"}
         if job["status"] != "processing":
             del _jobs[job_id]                        # 클라이언트가 확인했다
@@ -980,8 +990,10 @@ def file_image_upload_input(*args, **kwargs):
     파일은 아직 안 쓴다. 어디에 쓸지는 기존 행의 image_path 를 봐야 알 수 있고,
     그건 다음 단계(get_document_image)가 읽어온다.
 
-    확장자만 올린 파일에서 가져온다. 이름 전체를 쓰면 경로 문자·중복·한글이 섞여
-    들어오는데, 폴더 안 다른 이미지와 충돌하면 남의 그림을 덮어쓴다.
+    올린 바이트를 그대로 쓰지 않는다. 그림으로 열어 본 뒤 PNG(또는 JPEG)로 다시 저장하고
+    확장자도 서버가 정한다 — 예전에는 확장자를 파일명에서 가져와 .html·.svg 를 올리면 그대로
+    공개 주소에 놓였고, 그 주소를 열면 스크립트가 우리 사이트 권한으로 돌았다(보안 점검
+    upload.active-content-image-replacement).
     """
     payload = (args[0].get("payload") or {}) if args and isinstance(args[0], dict) else {}
 
@@ -994,14 +1006,63 @@ def file_image_upload_input(*args, **kwargs):
     content = payload.get("content")
     if not content:
         raise ValueError("이미지 내용(content)이 비어 있습니다.")
+    data, suffix = _reencode_image(content)
 
     return {
         "id": int(image_id),
         "document_id": int(document_id),
         # 다음 단계들이 쓰는 값. DB 로는 안 넘어간다(save_document_image 가 걸러낸다).
-        "_content": base64.b64decode(content),
-        "_suffix": os.path.splitext(_safe_name(payload.get("name")))[1].lower(),
+        "_content": data,
+        "_suffix": suffix,
     }
+
+
+# 바꿔 올리는 그림의 크기 상한(디코딩한 바이트).
+IMAGE_UPLOAD_MAX_BYTES = int(os.environ.get("RAG_IMAGE_UPLOAD_MAX_BYTES", str(20 * 1024 * 1024)))
+
+
+def _reencode_image(content: str) -> tuple[bytes, str]:
+    """base64 그림 -> (다시 저장한 바이트, 확장자). 그림이 아니거나 너무 크면 ValueError.
+
+    base64 길이로 먼저 거른다 — 디코딩하기 전에 메모리를 잡지 않게. JPEG 는 JPEG 로,
+    나머지(PNG·GIF·BMP·WEBP 등)는 PNG 로 다시 저장한다. SVG·HTML 은 그림으로 열리지 않아 거절된다.
+    """
+    import binascii
+    import io
+
+    from PIL import Image, UnidentifiedImageError
+
+    if len(content) > IMAGE_UPLOAD_MAX_BYTES * 4 // 3 + 4:
+        raise ValueError(f"그림이 너무 큽니다. {IMAGE_UPLOAD_MAX_BYTES // 1048576}MB 이하로 올려주세요.")
+    try:
+        raw = base64.b64decode(content, validate=True)
+        with Image.open(io.BytesIO(raw)) as image:
+            image.load()
+            is_jpeg = image.format == "JPEG"
+            if is_jpeg and image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+            out = io.BytesIO()
+            image.save(out, format="JPEG" if is_jpeg else "PNG")
+    except (binascii.Error, ValueError, UnidentifiedImageError, OSError, Image.DecompressionBombError):
+        raise ValueError("그림 파일(PNG·JPG·GIF·BMP·WEBP)만 올릴 수 있습니다.")
+    return out.getvalue(), ".jpg" if is_jpeg else ".png"
+
+
+def _image_file_in_root(image_path: str):
+    """DB 의 image_path -> IMAGE_DIR 안의 파일 경로. 밖을 가리키면 ValueError."""
+    from pathlib import Path
+
+    root = Path(IMAGE_DIR).resolve()
+    found = resolve_image_path(image_path, IMAGE_DIR)
+    if found is None:
+        parts = Path(image_path.replace("\\", "/")).parts
+        found = root.joinpath(*parts[1:]) if len(parts) > 1 else root / parts[-1]
+    found = Path(found).resolve()
+    try:
+        found.relative_to(root)
+    except ValueError:
+        raise ValueError("이미지 경로가 올바르지 않습니다.")
+    return found
 
 
 @work_regist("replace_image_file")
@@ -1020,10 +1081,10 @@ def replace_image_file(*args, **kwargs):
         raise ValueError("기존 이미지 경로를 찾지 못했습니다.")
 
     # 파일이 없어도 그 자리에 새로 쓴다 — 잃어버린 그림을 교체로 복구하는 셈이다.
-    from pathlib import Path
-    old = resolve_image_path(old_path, IMAGE_DIR) or Path(old_path)
-    suffix = fields.pop("_suffix", "") or old.suffix
-    new = old.with_suffix(suffix)
+    # 쓸 자리는 반드시 IMAGE_DIR 안이다. 예전에는 못 찾으면 DB 의 경로를 그대로 써서, 조작된
+    # 문서가 남긴 "../" 경로로 서버 파일을 덮어쓸 수 있었다(보안 점검 path-traversal).
+    old = _image_file_in_root(old_path)
+    new = old.with_suffix(fields.pop("_suffix", "") or ".png")
 
     new.parent.mkdir(parents=True, exist_ok=True)
     with open(new, "wb") as f:

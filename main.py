@@ -10,6 +10,8 @@ import os
 import threading
 import time
 
+import access   # 로그인·권한 확인. auth 를 불러 비밀키를 정한다 — 실행부를 띄우기 전이어야 한다
+import files    # /api/images · /api/documents 파일 전달(로그인 필요)
 from rag_router.task.task_result import TaskResult
 from taskcontroller import work_lst, TaskController,tasks, Task
 from taskexecutor import TaskExecutor
@@ -108,6 +110,11 @@ def to_controller(task):
         logger.warning("등록되지 않은 task_type: %s", task.task_type)
         raise ValueError(f"아직 지원하지 않는 task_type 입니다: {task.task_type}")
 
+    # 로그인·권한 확인(access.py). 통과하면 token 자리에 검증된 user_id 를 넣는다 — work 들은
+    # token 을 user_id 로 읽는다. 공개 task(LOGIN)는 토큰이 없다.
+    claims = access.authorize(task.task_type, task.token, task.payload)
+    user_id = claims["sub"] if claims else None
+
     logger.info("수신 job_id=%s task_type=%s", task.job_id, task.task_type)
 
     # payload 만 보내면 session_id 와 token 을 되찾을 방법이 없다. 요청을 통째로
@@ -119,7 +126,8 @@ def to_controller(task):
         "task_type": task.task_type,
         "payload": task.payload or {},
         "session_id": task.session_id,
-        "token": task.token,
+        "token": user_id,
+        "role": claims.get("role") if claims else None,
     }
 
 
@@ -240,18 +248,16 @@ if __name__ == "__main__":
 
         # 이미지와 원본 문서를 브라우저가 열 수 있게 내보낸다. 라우터는 /api/task·/api/ws 만
         # 갖고 있어서 파일을 줄 통로가 없다 — 라우터 패키지를 고치는 대신 여기서
-        # 그쪽 FastAPI 앱에 정적 경로만 얹는다.
+        # 그쪽 FastAPI 앱에 경로만 얹는다.
         #
         # /api 아래에 둔다. 게이트웨이가 /api 프리픽스만 이 서버로 보내기 때문에,
         # 그 밖의 경로로 두면 요청이 프론트엔드로 흘러가 index.html 이 내려온다
         # (다운로드가 .html 로 받아진다).
-        from fastapi.staticfiles import StaticFiles
-
         os.makedirs(IMAGE_DIR, exist_ok=True)
         os.makedirs(DOCUMENT_DIR, exist_ok=True)
-        gateway.app.mount("/api/images", StaticFiles(directory=IMAGE_DIR), name="api/images")
-        gateway.app.mount("/api/documents", StaticFiles(directory=DOCUMENT_DIR), name="api/documents")
-        logger.info("정적 경로 연결: /api/images -> %s, /api/documents -> %s",
+        files.mount(gateway.app, "/api/images", IMAGE_DIR)
+        files.mount(gateway.app, "/api/documents", DOCUMENT_DIR)
+        logger.info("파일 경로 연결(로그인 필요): /api/images -> %s, /api/documents -> %s",
                     IMAGE_DIR, DOCUMENT_DIR)
 
         gateway.run()          # uvicorn. 블로킹이다

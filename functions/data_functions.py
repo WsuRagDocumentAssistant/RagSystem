@@ -17,7 +17,7 @@ from session_data import build_session, Session
 from api_data import collect, ApiEntity
 import db_manager
 from functions.exception_functions import error_message, safe_call
-from utils import from_jsonb, image_summaries, IMAGE_DIR, timer
+from utils import api_public_id, from_jsonb, image_summaries, public_url, IMAGE_DIR, timer
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +221,7 @@ def api_data(*args, **kwargs) -> ApiEntity:
     )
     if not request.url:
         raise ValueError("payload 에 url 이 없습니다.")
-    logger.info(f"[create_api_data] 수집: {request.title} ({request.url[:60]})")
+    logger.info(f"[create_api_data] 수집: {request.title} ({(public_url(request.url) or '')[:60]})")
     return asyncio.run(collect(request))
 
 def _refresh_minutes(payload) -> int | None:
@@ -265,14 +265,16 @@ def save_external_api(*args, **kwargs):
     api_id = payload.get("id")
 
     if api_id:
-        if payload.get("url") and payload["url"] != api_id:
-            raise ValueError("url 은 바꿀 수 없습니다. 삭제 후 다시 등록해주세요.")
-        row = db_call("update_api_data_meta", url=api_id,
+        # 화면용 id(api_public_id)로 실제 url 을 찾는다. url 은 PK 라 못 바꾸고, 화면에는 인증값을
+        # 뺀 url 만 보이므로 payload.url 은 보지 않는다. API 키는 새로 입력했을 때만 바꾼다 —
+        # 비워 보내면 None 이라 DB 함수가 기존 값을 유지한다(목록이 키를 돌려주지 않는다).
+        url = resolve_api_url(api_id)
+        row = db_call("update_api_data_meta", url=url,
                       title=payload.get("title"), source=payload.get("source"),
-                      key=payload.get("apiKey") or payload.get("key"),
+                      key=(payload.get("apiKey") or payload.get("key") or "").strip() or None,
                       refresh_interval_minutes=refresh)
         if not row:
-            raise ValueError(f"등록되지 않은 외부 API 입니다: {api_id}")
+            raise ValueError("등록되지 않은 외부 API 입니다.")
         logger.info(f"[save_external_api] 수정: {row.get('title')} (주기 {refresh}분)")
         return _save_api_meta(row, payload)
 
@@ -290,7 +292,7 @@ def save_external_api(*args, **kwargs):
                   refresh_interval_minutes=refresh)
     if not row:
         raise ValueError("외부 API 를 등록하지 못했습니다. 같은 url 이 이미 등록되어 있는지 확인해주세요.")
-    logger.info(f"[save_external_api] 등록: {entity.title} ({entity.url[:60]}, 주기 {refresh}분)")
+    logger.info(f"[save_external_api] 등록: {entity.title} ({(public_url(entity.url) or '')[:60]}, 주기 {refresh}분)")
     return _save_api_meta(row, payload)
 
 
@@ -444,9 +446,12 @@ def chat_session_list_output(*args, **kwargs):
 
 @work_regist("session_id_input")
 def session_id_input(*args, **kwargs):
-    """payload {sessionId} -> session_id. 인자가 없으면 상수로 떨어진다(메뉴 실행)."""
-    payload = (args[0].get("payload") or {}) if args and isinstance(args[0], dict) else {}
-    return payload.get("sessionId") or TEST_SESSION_ID
+    """payload {sessionId} -> session_id. 내 대화가 아니면 ValueError(require_own_session).
+
+    예전에는 sessionId 가 없으면 테스트 상수로 떨어졌다 — 아무나 그 대화를 읽을 수 있어 뺐다.
+    """
+    req = args[0] if args and isinstance(args[0], dict) else {}
+    return require_own_session(req, (req.get("payload") or {}).get("sessionId"))
 
 
 @work_regist("get_recent_db_messages")
@@ -544,14 +549,21 @@ def api_meta_by_url() -> dict:
 
 
 def _api_out(row: dict, meta: dict | None) -> dict:
-    """외부 API 행(+ 추가 정보) -> 클라이언트가 읽는 한 건."""
+    """외부 API 행(+ 추가 정보) -> 클라이언트가 읽는 한 건.
+
+    저장된 API 키와 url 에 박힌 인증값(serviceKey=...)은 내보내지 않는다(보안 점검
+    information-disclosure.external-api-keys). 키는 있는지와 끝 4자리만 알려 주고, id 는
+    url 대신 url 의 해시(api_public_id)를 쓴다 — 삭제·수정은 resolve_api_url 로 되찾는다.
+    """
     meta = meta or {}
+    key = row.get("key") or row.get("api_key") or ""
     return {
-        "id": row.get("url"),          # url 이 PK 다. 삭제·갱신이 이 값으로 걸린다
+        "id": api_public_id(row.get("url")),
         "title": row.get("title"),
-        "url": row.get("url"),
+        "url": public_url(row.get("url")),
         "source": row.get("source"),
-        "apiKey": row.get("key") or row.get("api_key"),
+        "hasApiKey": bool(key),
+        "apiKeyLast4": key[-4:] if len(key) >= 8 else "",
         "fetchedAt": str(row.get("date") or row.get("fetched_at") or "") or None,
         "refreshIntervalMinutes": row.get("refresh_interval_minutes"),
         "provider": meta.get("provider") or "",
@@ -562,17 +574,25 @@ def _api_out(row: dict, meta: dict | None) -> dict:
 
 @work_regist("api_id_input")
 def api_id_input(*args, **kwargs):
-    """payload {id} -> 외부 API 식별자.
+    """payload {id} -> 외부 API 의 url.
 
     api_datas 는 url 이 PK 다 — delete_api_data / update_api_data_date /
-    save_api_data_vector 가 전부 url 로 건다. 그래서 목록(external_api_list_output)이
-    id 자리에 url 을 내보내고, 클라이언트는 그걸 그대로 돌려준다.
+    save_api_data_vector 가 전부 url 로 건다. 목록은 url 대신 그 해시를 id 로 내보내므로
+    (url 에 인증값이 박혀 있을 수 있다) 여기서 url 로 되찾는다.
     """
     payload = (args[0].get("payload") or {}) if args and isinstance(args[0], dict) else {}
-    api_id = payload.get("id")
+    return resolve_api_url(payload.get("id"))
+
+
+def resolve_api_url(api_id) -> str:
+    """화면용 id(api_public_id) -> 실제 url. 없으면 ValueError."""
     if not api_id:
         raise ValueError("payload 에 id 가 없습니다.")
-    return api_id
+    url = next((row["url"] for row in db_call("select_all_api_data") or []
+                if api_public_id(row.get("url")) == api_id), None)
+    if url is None:
+        raise ValueError("등록되지 않은 외부 API 입니다.")
+    return url
 
 
 @work_regist("delete_db_api_data_by_id")
@@ -657,6 +677,22 @@ def _is_uuid(value) -> bool:
         return False
 
 
+def require_own_session(req: dict, session_id) -> str:
+    """session_id 가 요청한 사람(token = 검증된 user_id)의 대화인지 확인하고 문자열로 돌려준다.
+
+    예전에는 대화 id 만 알면 남의 대화를 읽고, 지우고, 답변을 끼워 넣을 수 있었다(보안 점검
+    authorization.chat-session-owner). 내 대화 목록(list_sessions)에 있는 것만 통과시킨다.
+    목록 조회가 실패하면(db_call 이 None) 통과시키지 않는다.
+    """
+    if not _is_uuid(session_id):
+        raise ValueError(f"올바른 sessionId 가 아닙니다: {session_id!r}")
+    user_id = req.get("token") if isinstance(req, dict) else None
+    owned = {str(row.get("session_id")) for row in db_call("list_sessions", user_id=user_id) or []}         if _is_uuid(user_id) else set()
+    if str(uuid.UUID(str(session_id))) not in owned:
+        raise ValueError("대화를 찾을 수 없습니다.")
+    return str(session_id)
+
+
 @work_regist("ensure_session")
 def ensure_session(*args, **kwargs):
     """대화 세션을 확보해 요청에 담는다. 질의 체인의 첫 단계다.
@@ -679,8 +715,9 @@ def ensure_session(*args, **kwargs):
 
 
 def _ensure_session(req: dict) -> dict:
-    """ensure_session 의 본문."""
-    if _is_uuid(req.get("session_id")):
+    """ensure_session 의 본문. 이어가는 대화는 내 대화인지 먼저 본다(require_own_session)."""
+    if req.get("session_id"):
+        req["session_id"] = require_own_session(req, req["session_id"])
         return req
 
     user_id = req.get("token")
@@ -722,9 +759,7 @@ def delete_session(*args, **kwargs):
     세션은 FK 제약으로 삭제되지 않는다.
     """
     req = args[0] if args and isinstance(args[0], dict) else {}
-    session_id = (req.get("payload") or {}).get("sessionId")
-    if not _is_uuid(session_id):
-        raise ValueError(f"올바른 sessionId 가 아닙니다: {session_id!r}")
+    session_id = require_own_session(req, (req.get("payload") or {}).get("sessionId"))
 
     deleted = db_call("delete_session", session_id=session_id)
     logger.info(f"[delete_session] {session_id} 삭제 결과: {deleted}")
@@ -744,9 +779,7 @@ def answer_save_input(*args, **kwargs):
     req = args[0] if args and isinstance(args[0], dict) else {}
     payload = req.get("payload") or {}
 
-    session_id = req.get("session_id") or payload.get("sessionId")
-    if not _is_uuid(session_id):
-        raise ValueError(f"올바른 sessionId 가 아닙니다: {session_id!r}")
+    session_id = require_own_session(req, req.get("session_id") or payload.get("sessionId"))
 
     content = (payload.get("content") or "").strip()
     if not content:
@@ -884,7 +917,7 @@ def sync_db_api_data(*args, **kwargs):
     rows = db_call("select_all_api_data") or []
     row = next((r for r in rows if r.get("url") == url), None)
     if row is None:
-        raise ValueError(f"등록되지 않은 외부 API 입니다: {url}")
+        raise ValueError("등록되지 않은 외부 API 입니다.")
 
     entity = asyncio.run(collect(ApiEntity(
         title=row.get("title"), url=row.get("url"),

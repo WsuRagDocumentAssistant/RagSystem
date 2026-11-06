@@ -7,7 +7,33 @@ work 이 아니고, DB·모델·통신부에 의존하지 않는다. 다른 모�
 functions 안의 어느 파일에서 가져다 써도 순환이 생기지 않는다.
 """
 
+import hashlib
 import json
+import re
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+# 링크에서 뺄 쿼리 파라미터. 인증값이 url 에 박혀 등록된 API 도 있다(serviceKey=...).
+_SECRET_PARAM = re.compile(r"key|token|secret|auth|passw", re.IGNORECASE)
+
+
+def public_url(url) -> str | None:
+    """화면·로그에 띄울 링크. 인증값으로 보이는 쿼리 파라미터는 빼고 돌려준다."""
+    if not url:
+        return None
+    parts = urlsplit(url)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if not _SECRET_PARAM.search(k)]
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def redact_urls(text: str) -> str:
+    """문장 안의 http(s) 링크마다 인증값 파라미터를 뺀다(예외 메시지를 로그에 남길 때)."""
+    return re.sub(r"https?://[^\s'\"<>]+", lambda m: public_url(m.group(0)) or "", text or "")
+
+
+def api_public_id(url: str) -> str:
+    """외부 API 의 화면용 id. url 이 PK 지만 그대로 내보내면 url 에 박힌 인증값이 샌다."""
+    return hashlib.sha256((url or "").encode("utf-8")).hexdigest()[:24]
 
 
 def from_jsonb(value, default):
