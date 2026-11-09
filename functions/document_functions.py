@@ -236,6 +236,10 @@ def file_list_output(*args, **kwargs):
     # 올린 사람·등록 묶음. 내부 문서 등록 화면이 "내가 마지막으로 등록한 문서"만 보인다.
     # 기록 전에 올린 문서(또는 표가 아직 없음)는 비어 있다 — 그 화면에는 안 보이고 문서 목록에는 보인다.
     uploads = {row["document_id"]: row for row in db_call("list_document_uploads") or []}
+    # 올린 사람 표시 이름. 이름이 없는 계정(학교 계정 일부)은 교번으로 보인다.
+    # 계정이 지워졌으면 None — 화면은 "-" 로 둔다.
+    uploaders = {str(u.get("user_id")): u.get("name") or u.get("login_id")
+                 for u in db_call("list_users") or []}
 
     # DB 의 filename 은 hwpx 내부 이름이라 확장자가 없다(실측). 그대로 내보내면
     # 클라이언트가 그 이름으로 파일을 저장해 확장자 없는 파일이 떨어진다.
@@ -247,6 +251,7 @@ def file_list_output(*args, **kwargs):
             "id": str(row.get("id")),
             "scope": "external" if row.get("id") in external else "internal",
             "uploadedBy": _str_or_none((uploads.get(row.get("id")) or {}).get("user_id")),
+            "uploaderName": uploaders.get(_str_or_none((uploads.get(row.get("id")) or {}).get("user_id"))),
             "batchId": (uploads.get(row.get("id")) or {}).get("batch_id"),
             # 마지막으로 올린 시각. 같은 파일을 다시 올리면 문서 행(registered_at)은 그대로라
             # "마지막 등록 묶음"은 이 값으로 고른다.
