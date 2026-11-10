@@ -621,34 +621,23 @@ def hybrid_search_function(*args, **kwargs):
 
 @work_regist("rerank_function")
 def rerank_function(*args, **kwargs):
-    """검색된 조각을 맥락으로 묶고 재정렬해 상위 몇 개만 남긴다.
+    """검색된 조각을 리랭크해 상위 조각의 부모 몇 개만 남긴다.
 
-    묶기와 재정렬을 한 work 로 둔다. 둘은 항상 붙어 다니고 — 묶지 않고 재정렬할
-    일도, 묶어놓고 재정렬 안 할 일도 없다 — 떼어놓으면 그 사이에 미리 자르는 코드가
-    끼어들 자리가 생긴다.
+    조각마다 리랭크하고, 점수순으로 내려가며 서로 다른 부모 TOP_K_FINAL 개를 고른다.
+    맥락은 부모 본문 전체이고, 같은 부모의 조각이 여럿 걸려도 하나로 모인다.
 
-    묶기: 조각이 절반 넘게 걸린 섹션만 본문으로 승격한다. 조금 걸린 섹션은 조각
-    그대로 둔다 — 같은 본문이 여러 번 실려가는 걸 막는다.
-
-    여기서 limit 을 걸지 않는다. 약한 신호(유사도)로 미리 자른 뒤 강한 신호(리랭커)
-    에게 남은 것만 주는 건 순서가 거꾸로다 — 실측으로 recall 이 93%에서 83%로
-    떨어졌다. 후보를 다 넘기고 리랭커가 top_k 로 줄이게 한다.
-
-    재정렬: 한 부모의 조각이 최종 자리를 독점하지 못하게 개수를 제한한다. 조각들이
-    표 머리글을 공유해서 LLM 이 거의 같은 글을 여러 번 보게 된다.
+    여기서 hits 를 미리 자르지 않는다. 약한 신호(유사도)로 미리 자른 뒤 강한 신호
+    (리랭커)에게 남은 것만 주는 건 순서가 거꾸로다 — 실측으로 recall 이 93%에서
+    83%로 떨어졌다. 후보를 다 넘기고 리랭커가 고르게 한다.
     """
     req, query, hits, vector = args[0]
     rag = get_controller()
 
-    contexts = rag.build_contexts(hits)
-    logger.info(f"[rerank_function] 맥락 {len(contexts)}개 "
-          f"(승격 {sum(1 for c in contexts if c.merged)})")
-
     with timer("리랭킹", req):
-        ordered = rag.rerank(query, contexts, top_k=TOP_K_FINAL)
+        ordered = rag.rerank(query, hits, top_k=TOP_K_FINAL)
     for rank, context in enumerate(ordered, 1):
         logger.info(f"[rerank_function] {rank}. score={context.rerank_score:.4f} "
-              f"merged={context.merged} {context.breadcrumb[:60]}")
+              f"조각 {context.hit_count}개 {context.breadcrumb[:60]}")
     documents = _step_documents(ordered)
     streaming.finish(req, "search", f"관련 문서 {len(documents)}건 확인" if documents else "관련 문서 검색",
                      detail=f"단락 {len(ordered)}개 선택" if ordered else "관련 문서를 찾지 못했습니다",
