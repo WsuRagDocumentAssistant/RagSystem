@@ -10,6 +10,7 @@ import os
 import threading
 import time
 
+from log_helper import LoggingProcess, setup_logging
 import access   # 로그인·권한 확인. auth 를 불러 비밀키를 정한다 — 실행부를 띄우기 전이어야 한다
 import files    # /api/images · /api/documents 파일 전달(로그인 필요)
 from rag_router.task.task_result import TaskResult
@@ -89,6 +90,15 @@ EXECUTOR_THREADS = int(os.environ.get("RAG_EXECUTOR_THREADS", "4"))
 from utils import IMAGE_DIR, DOCUMENT_DIR
 
 logger = logging.getLogger("bridge")
+
+
+# 자식 프로세스들도 같은 로그 형식으로(log_helper). spawn 자식이 이 클래스를 찾을 수 있게 모듈 최상위에 둔다.
+class Controller(LoggingProcess, TaskController):
+    """요청 큐 -> 실행부. 로그 설정만 더한 TaskController."""
+
+
+class TimerExecutor(LoggingProcess, TaskExecutor):
+    """타이머 작업 실행부. 로그 설정만 더한 TaskExecutor."""
 
 
 def _unwrap(outcome):
@@ -196,8 +206,7 @@ if __name__ == "__main__":
     # 기본 컨텍스트를 쓰므로 여기서 바꾸면 그대로 따라온다 — 라이브러리는 손댈 필요 없다.
     multiprocessing.set_start_method("spawn", force=True)
 
-    logging.basicConfig(level=logging.INFO,
-                        format="[%(name)s] %(levelname)s %(message)s")
+    setup_logging()
 
     # ── 통신부(HTTP) 전용 ─────────────────────────────
     # 배포는 이 파일이 진입점이다(Dockerfile CMD, containerPort 8000).
@@ -224,17 +233,19 @@ if __name__ == "__main__":
     # 문서 뷰어 파일이 없는 옛 문서를 미리 채운다(document_functions). 처음 여는 사람이 기다리지 않게.
     gwexecutor.task_queue.put(Task(["warm_viewer_sections"], None))
 
-    gwcontroller = TaskController(gwexecutor.get_task_queue())
+    gwcontroller = Controller(gwexecutor.get_task_queue())
     gwcontroller.start()
 
     # ── 타이머 전용 ───────────────────────────────────
-    timerexecutor = TaskExecutor()   # 타이머는 작업이 하나뿐이라 순차(기본 1)
+    timerexecutor = TimerExecutor()   # 타이머는 작업이 하나뿐이라 순차(기본 1)
     timerexecutor.start()
     stop_timer = threading.Event()
     threading.Thread(target=timer_loop, args=(timerexecutor, stop_timer), daemon=True).start()
 
     try:
         from rag_router.gateway import gateway
+        # 라우터는 import 될 때 루트 로거를 자기 형식으로 덮는다. 우리 형식으로 다시 맞춘다.
+        setup_logging()
 
         # 라우터 기본값 60초로는 질의가 끊긴다(GATEWAY_TIMEOUT 설명 참고). 그대로 두면
         # 작업은 계속 도는데 응답만 timeout 으로 나간다.

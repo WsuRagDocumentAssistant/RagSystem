@@ -23,6 +23,8 @@ emit(req, ...) 만 부르면 된다. Router 는 그 job_id 를 기다리는 WebS
 """
 
 import logging
+
+from log_helper import setup_logging
 import time
 
 from taskexecutor import TaskExecutor
@@ -114,5 +116,8 @@ class StreamExecutor(TaskExecutor):
         self.stream_queue = stream_queue
 
     def run(self) -> None:
+        # spawn 자식은 메인의 로깅 설정을 받지 못한다. TaskExecutor.run 의 basicConfig 보다
+        # 먼저 잡는다(핸들러가 있으면 그쪽은 건너뛴다).
+        setup_logging()
         bind(self.stream_queue)
         super().run()
